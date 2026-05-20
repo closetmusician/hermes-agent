@@ -4964,6 +4964,12 @@ class GatewayRunner:
                         del self._failed_platforms[platform]
                         continue
 
+                    # Carry over backoff state from the old adapter so
+                    # reconnection doesn't reset adapter-level backoff.
+                    old_adapter = self.adapters.get(platform)
+                    if old_adapter and hasattr(old_adapter, "_consecutive_errors"):
+                        adapter._consecutive_errors = old_adapter._consecutive_errors
+
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)

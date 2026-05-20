@@ -373,10 +373,13 @@ class EmailAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 await self._check_inbox()
+                self._consecutive_errors = 0
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[Email] Poll error: %s", e)
+                self._consecutive_errors += 1
+                logger.error("[Email] Poll error (%d consecutive): %s",
+                             self._consecutive_errors, e)
             delay = self._backoff_delay()
             await asyncio.sleep(delay)
 
