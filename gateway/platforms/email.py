@@ -435,6 +435,12 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             imap.login(self._address, self._password)
             _send_imap_id(imap)
+            # Set socket timeout for all subsequent I/O (IDLE send/recv).
+            # The IMAP4_SSL constructor timeout only covers the initial
+            # connection; we need an explicit timeout for readline/send
+            # during the IDLE session.
+            if hasattr(imap, 'socket'):
+                imap.socket().settimeout(300)  # 5 minutes
             imap.select("INBOX")
 
             # Reset errors on successful connection

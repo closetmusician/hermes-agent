@@ -941,6 +941,22 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
+
+    # When no workdir is configured, the terminal tool runs from a
+    # non-project directory (typically ~/.hermes or /).  Git and GitHub
+    # CLI commands will fail with "not a git repository" unless the
+    # agent explicitly specifies the repo.  Inject guidance so the LLM
+    # uses the correct flags instead of hitting an avoidable error.
+    _job_wd = (job.get("workdir") or "").strip()
+    if not _job_wd:
+        cron_hint += (
+            "[NOTE: This cron job has no working directory configured. "
+            "You are NOT inside a git repository. If you need to run "
+            "git or gh commands, you MUST specify the repo explicitly "
+            "(e.g. `gh pr list -R owner/repo`). Bare `gh pr list` or "
+            "`git status` will fail with 'not a git repository'.]\n\n"
+        )
+
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")

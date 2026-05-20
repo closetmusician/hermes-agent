@@ -1809,6 +1809,33 @@ class TestBuildJobPromptSilentHint:
         assert system_pos < prompt_pos
 
 
+class TestNoWorkdirGitHint:
+    """Verify _build_job_prompt injects git-context guidance when no workdir is set."""
+
+    def test_no_workdir_injects_git_hint(self):
+        """Jobs without workdir get a note about not being in a git repo."""
+        job = {"prompt": "Check PRs"}
+        result = _build_job_prompt(job)
+        assert "NOT inside a git repository" in result
+        assert "gh pr list -R owner/repo" in result
+
+    def test_no_workdir_explicit_none(self):
+        job = {"prompt": "Run git status", "workdir": None}
+        result = _build_job_prompt(job)
+        assert "NOT inside a git repository" in result
+
+    def test_no_workdir_empty_string(self):
+        job = {"prompt": "Run git status", "workdir": ""}
+        result = _build_job_prompt(job)
+        assert "NOT inside a git repository" in result
+
+    def test_workdir_set_no_git_hint(self, tmp_path):
+        """Jobs WITH a workdir should NOT get the no-git-repo hint."""
+        job = {"prompt": "Check PRs", "workdir": str(tmp_path)}
+        result = _build_job_prompt(job)
+        assert "NOT inside a git repository" not in result
+
+
 class TestParseWakeGate:
     """Unit tests for _parse_wake_gate — pure function, no side effects."""
 

@@ -4977,6 +4977,12 @@ class GatewayRunner:
                     old_adapter = self.adapters.get(platform)
                     if old_adapter and hasattr(old_adapter, "_consecutive_errors"):
                         adapter._consecutive_errors = old_adapter._consecutive_errors
+                        # Ensure old adapter isn't still running alongside the new one.
+                        if getattr(old_adapter, "_running", False):
+                            try:
+                                await old_adapter.disconnect()
+                            except Exception:
+                                pass
 
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
@@ -5023,6 +5029,11 @@ class GatewayRunner:
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message or "failed to reconnect",
                         )
+                        # Clean up the failed adapter's resources
+                        try:
+                            await adapter.disconnect()
+                        except Exception:
+                            pass
                         backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                         info["attempts"] = attempt
                         info["next_retry"] = time.monotonic() + backoff
@@ -5045,6 +5056,11 @@ class GatewayRunner:
                         error_code=None,
                         error_message=str(e),
                     )
+                    # Clean up the failed adapter's resources
+                    try:
+                        await adapter.disconnect()
+                    except Exception:
+                        pass
                     backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
