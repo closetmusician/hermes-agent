@@ -2,7 +2,9 @@
 Email platform adapter for the Hermes gateway.
 
 Allows users to interact with Hermes by sending emails.
-Uses IMAP to receive and SMTP to send messages.
+Uses IMAP IDLE (RFC 2177) for push-based new-mail notifications when
+the server supports it, falling back to periodic polling otherwise.
+SMTP is used to send replies.
 
 Environment variables:
     EMAIL_IMAP_HOST     — IMAP server host (e.g., imap.gmail.com)
@@ -21,6 +23,7 @@ import imaplib
 import logging
 import os
 import re
+import select
 import smtplib
 import ssl
 import uuid
@@ -263,6 +266,11 @@ class EmailAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Consecutive IMAP poll errors for exponential backoff
+        self._consecutive_errors = 0
+        # Whether the IMAP server advertises IDLE (RFC 2177)
+        self._idle_supported = False
+
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
@@ -308,7 +316,22 @@ class EmailAdapter(BasePlatformAdapter):
                     self._seen_uids.add(uid)
             # Keep only the most recent UIDs to prevent unbounded growth
             self._trim_seen_uids()
+
+            # Check IDLE capability (RFC 2177)
+            caps = imap.capability()
+            if caps[0] == "OK":
+                cap_str = caps[1][0].decode().upper() if isinstance(caps[1][0], bytes) else str(caps[1][0]).upper()
+                self._idle_supported = "IDLE" in cap_str.split()
+            else:
+                self._idle_supported = False
+
+            if self._idle_supported:
+                logger.info("[Email] IMAP IDLE supported — using push notifications")
+            else:
+                logger.info("[Email] IMAP IDLE not supported — falling back to polling")
+
             imap.logout()
+            self._consecutive_errors = 0
             logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
@@ -326,7 +349,10 @@ class EmailAdapter(BasePlatformAdapter):
             return False
 
         self._running = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
+        if self._idle_supported:
+            self._poll_task = asyncio.create_task(self._idle_loop())
+        else:
+            self._poll_task = asyncio.create_task(self._poll_loop())
         print(f"[Email] Connected as {self._address}")
         return True
 
@@ -351,7 +377,170 @@ class EmailAdapter(BasePlatformAdapter):
                 break
             except Exception as e:
                 logger.error("[Email] Poll error: %s", e)
-            await asyncio.sleep(self._poll_interval)
+            delay = self._backoff_delay()
+            await asyncio.sleep(delay)
+
+    # Stepped backoff schedule: after N consecutive errors, wait this many
+    # seconds before the next attempt.  Ramps quickly to 10 minutes so a
+    # rate-limited server has time to forgive us.
+    _BACKOFF_STEPS = (15, 30, 180, 600)  # 15s, 30s, 3min, 10min
+
+    def _backoff_delay(self) -> float:
+        """Compute poll delay with stepped backoff on consecutive errors.
+
+        Returns normal poll interval on success, escalating through
+        _BACKOFF_STEPS on repeated failures (capped at 10 minutes).
+        """
+        if self._consecutive_errors == 0:
+            return self._poll_interval
+        idx = min(self._consecutive_errors, len(self._BACKOFF_STEPS)) - 1
+        return self._BACKOFF_STEPS[idx]
+
+    async def _idle_loop(self) -> None:
+        """Persistent IMAP IDLE loop — server pushes new-message notifications.
+
+        Runs as an asyncio task. Delegates blocking IDLE I/O to an executor
+        thread via _idle_and_fetch, then dispatches any returned messages on
+        the event loop. Reconnects with exponential backoff on errors.
+        """
+        while self._running:
+            try:
+                loop = asyncio.get_running_loop()
+                messages = await loop.run_in_executor(None, self._idle_and_fetch)
+                for msg in messages:
+                    await self._dispatch_message(msg)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._consecutive_errors += 1
+                delay = self._backoff_delay()
+                logger.error("[Email] IDLE loop error (%d consecutive, next retry in %ds): %s",
+                             self._consecutive_errors, delay, e)
+                await asyncio.sleep(delay)
+
+    def _idle_and_fetch(self) -> List[Dict[str, Any]]:
+        """Maintain persistent IMAP IDLE connection. Runs in executor thread.
+
+        Connects to IMAP, enters IDLE mode, and waits for server push
+        notifications. Returns fetched messages on new mail, or empty list
+        on heartbeat timeout. Raises on connection errors for retry by caller.
+        """
+        results: List[Dict[str, Any]] = []
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=60)
+        try:
+            imap.login(self._address, self._password)
+            _send_imap_id(imap)
+            imap.select("INBOX")
+
+            # Reset errors on successful connection
+            if self._consecutive_errors > 0:
+                logger.info("[Email] IMAP recovered after %d consecutive errors", self._consecutive_errors)
+            self._consecutive_errors = 0
+
+            while self._running:
+                # Send IDLE command (raw protocol — imaplib has no native IDLE)
+                tag = imap._new_tag()  # returns bytes, e.g. b'ABCD1'
+                imap.send(tag + b" IDLE\r\n")
+
+                # Read the continuation response ("+ idling" or similar)
+                response = imap.readline()
+                if not response.startswith(b"+"):
+                    logger.warning("[Email] IDLE rejected by server: %s",
+                                   response.decode(errors="replace").strip())
+                    break
+
+                # Wait for server notification or 25-min heartbeat timeout
+                sock = imap.socket()
+                readable, _, _ = select.select([sock], [], [], 1500)  # 25 minutes
+
+                # Send DONE to exit IDLE (must precede any other IMAP command)
+                imap.send(b"DONE\r\n")
+
+                # Drain responses until we see the tagged completion for our IDLE
+                got_exists = False
+                while True:
+                    line = imap.readline()
+                    if b"EXISTS" in line:
+                        got_exists = True
+                        logger.debug("[Email] IDLE notification: %s",
+                                     line.decode(errors="replace").strip())
+                    if line.startswith(tag):
+                        break
+
+                if not self._running:
+                    break
+
+                if readable or got_exists:
+                    # Server sent a notification — fetch new messages
+                    results = self._fetch_unseen(imap)
+                    if results:
+                        break  # Return messages to the async loop for dispatch
+                # else: heartbeat timeout, re-enter IDLE
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+        return results
+
+    def _fetch_unseen(self, imap: "imaplib.IMAP4") -> List[Dict[str, Any]]:
+        """Fetch unseen messages from an already-connected IMAP session.
+
+        Reusable by both polling (_fetch_new_messages) and IDLE
+        (_idle_and_fetch) paths. Does NOT open or close the connection —
+        caller manages the IMAP lifecycle.
+        """
+        results = []
+        status, data = imap.uid("search", None, "UNSEEN")
+        if status != "OK" or not data or not data[0]:
+            return results
+
+        for uid in data[0].split():
+            if uid in self._seen_uids:
+                continue
+            self._seen_uids.add(uid)
+            if len(self._seen_uids) > self._seen_uids_max:
+                self._trim_seen_uids()
+
+            status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+
+            raw_email = msg_data[0][1]
+            msg = email_lib.message_from_bytes(raw_email)
+
+            sender_raw = msg.get("From", "")
+            sender_addr = _extract_email_address(sender_raw)
+            sender_name = _decode_header_value(sender_raw)
+            if "<" in sender_name:
+                sender_name = sender_name.split("<")[0].strip().strip('"')
+
+            subject_raw = msg.get("Subject", "(no subject)")
+            subject = _decode_header_value(subject_raw)
+            message_id = msg.get("Message-ID", "")
+            in_reply_to = msg.get("In-Reply-To", "")
+
+            # Skip automated/noreply senders
+            msg_headers = dict(msg.items())
+            if _is_automated_sender(sender_addr, msg_headers):
+                logger.debug("[Email] Skipping automated sender: %s", sender_addr)
+                continue
+
+            body = _extract_text_body(msg)
+            attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
+
+            results.append({
+                "uid": uid,
+                "sender_addr": sender_addr,
+                "sender_name": sender_name,
+                "subject": subject,
+                "message_id": message_id,
+                "in_reply_to": in_reply_to,
+                "body": body,
+                "attachments": attachments,
+                "date": msg.get("Date", ""),
+            })
+        return results
 
     async def _check_inbox(self) -> None:
         """Check INBOX for unseen messages and dispatch them."""
@@ -362,8 +551,12 @@ class EmailAdapter(BasePlatformAdapter):
             await self._dispatch_message(msg_data)
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
-        """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
-        results = []
+        """Fetch new (unseen) messages from IMAP. Runs in executor thread.
+
+        Used when IDLE is not supported. Delegates actual message parsing
+        to _fetch_unseen which is shared with the IDLE path.
+        """
+        results: List[Dict[str, Any]] = []
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             try:
@@ -371,61 +564,21 @@ class EmailAdapter(BasePlatformAdapter):
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
-                status, data = imap.uid("search", None, "UNSEEN")
-                if status != "OK" or not data or not data[0]:
-                    return results
+                results = self._fetch_unseen(imap)
 
-                for uid in data[0].split():
-                    if uid in self._seen_uids:
-                        continue
-                    self._seen_uids.add(uid)
-                    # Trim periodically to prevent unbounded memory growth
-                    if len(self._seen_uids) > self._seen_uids_max:
-                        self._trim_seen_uids()
-
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
-                    if status != "OK":
-                        continue
-
-                    raw_email = msg_data[0][1]
-                    msg = email_lib.message_from_bytes(raw_email)
-
-                    sender_raw = msg.get("From", "")
-                    sender_addr = _extract_email_address(sender_raw)
-                    sender_name = _decode_header_value(sender_raw)
-                    # Remove email from name if present
-                    if "<" in sender_name:
-                        sender_name = sender_name.split("<")[0].strip().strip('"')
-
-                    subject = _decode_header_value(msg.get("Subject", "(no subject)"))
-                    message_id = msg.get("Message-ID", "")
-                    in_reply_to = msg.get("In-Reply-To", "")
-                    # Skip automated/noreply senders before any processing
-                    msg_headers = dict(msg.items())
-                    if _is_automated_sender(sender_addr, msg_headers):
-                        logger.debug("[Email] Skipping automated sender: %s", sender_addr)
-                        continue
-                    body = _extract_text_body(msg)
-                    attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
-
-                    results.append({
-                        "uid": uid,
-                        "sender_addr": sender_addr,
-                        "sender_name": sender_name,
-                        "subject": subject,
-                        "message_id": message_id,
-                        "in_reply_to": in_reply_to,
-                        "body": body,
-                        "attachments": attachments,
-                        "date": msg.get("Date", ""),
-                    })
+                if self._consecutive_errors > 0:
+                    logger.info("[Email] IMAP recovered after %d consecutive errors", self._consecutive_errors)
+                self._consecutive_errors = 0
             finally:
                 try:
                     imap.logout()
                 except Exception:
                     pass
         except Exception as e:
-            logger.error("[Email] IMAP fetch error: %s", e)
+            self._consecutive_errors += 1
+            delay = self._backoff_delay()
+            logger.error("[Email] IMAP fetch error (%d consecutive, next retry in %ds): %s",
+                         self._consecutive_errors, delay, e)
         return results
 
     async def _dispatch_message(self, msg_data: Dict[str, Any]) -> None:
