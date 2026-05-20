@@ -373,7 +373,9 @@ class EmailAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 await self._check_inbox()
-                self._consecutive_errors = 0
+                # _consecutive_errors is managed inside _fetch_new_messages:
+                # incremented on IMAP failure, reset on success.  We only
+                # handle executor-level errors that escape _check_inbox.
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -459,16 +461,21 @@ class EmailAdapter(BasePlatformAdapter):
                 # Send DONE to exit IDLE (must precede any other IMAP command)
                 imap.send(b"DONE\r\n")
 
-                # Drain responses until we see the tagged completion for our IDLE
+                # Drain any untagged responses until we see the tagged
+                # completion for the DONE command.
                 got_exists = False
-                while True:
+                for _ in range(50):
                     line = imap.readline()
+                    if not line:
+                        raise ConnectionError("IMAP server closed connection during IDLE drain")
                     if b"EXISTS" in line:
                         got_exists = True
                         logger.debug("[Email] IDLE notification: %s",
                                      line.decode(errors="replace").strip())
                     if line.startswith(tag):
                         break
+                else:
+                    raise ConnectionError("IMAP IDLE drain exceeded 50 response lines")
 
                 if not self._running:
                     break

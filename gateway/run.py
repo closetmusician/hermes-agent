@@ -2185,7 +2185,7 @@ class GatewayRunner:
     # watcher when a retryable failure recurs past a threshold, and by the
     # /platform pause|resume slash command for manual control.
     # ------------------------------------------------------------------
-    def _pause_failed_platform(self, platform, *, reason: str = "") -> None:
+    async def _pause_failed_platform(self, platform, *, reason: str = "") -> None:
         """Mark a queued platform as paused — keep it in ``_failed_platforms``
         but stop the reconnect watcher from hammering it.
 
@@ -2201,6 +2201,14 @@ class GatewayRunner:
             return
         info["paused"] = True
         info["pause_reason"] = reason or "auto-paused after repeated failures"
+        # Stop the old adapter's poll/idle loop so it doesn't
+        # keep retrying in the background while paused.
+        old_adapter = self.adapters.pop(platform, None)
+        if old_adapter:
+            try:
+                await old_adapter.disconnect()
+            except Exception:
+                pass
         # Push next_retry far enough out that even if "paused" is missed
         # by a stale code path, the watcher won't fire on it.
         info["next_retry"] = float("inf")
@@ -5023,7 +5031,7 @@ class GatewayRunner:
                             platform.value, backoff,
                         )
                         if attempt >= _PAUSE_AFTER_FAILURES:
-                            self._pause_failed_platform(
+                            await self._pause_failed_platform(
                                 platform,
                                 reason=(
                                     adapter.fatal_error_message
@@ -5045,7 +5053,7 @@ class GatewayRunner:
                         platform.value, e, backoff,
                     )
                     if attempt >= _PAUSE_AFTER_FAILURES:
-                        self._pause_failed_platform(platform, reason=str(e))
+                        await self._pause_failed_platform(platform, reason=str(e))
 
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):
@@ -8979,7 +8987,7 @@ class GatewayRunner:
                     )
                 if failed[platform].get("paused"):
                     return f"{platform.value} is already paused."
-                self._pause_failed_platform(platform, reason="paused via /platform pause")
+                await self._pause_failed_platform(platform, reason="paused via /platform pause")
                 return (
                     f"✓ {platform.value} paused. "
                     f"Resume with `/platform resume {platform.value}` or "
