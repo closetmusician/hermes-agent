@@ -388,6 +388,200 @@ preconditions:
 
 ---
 
+## Phase 2a: Tool Registry Guard Plugin (pre_tool_call enforcement)
+
+**What**: A Hermes plugin that deterministically forces the agent to use registered tools instead of reimplementing their functionality. Blocks tool calls that install banned packages, import banned modules, or write files importing banned modules — pointing to the correct registered tool.
+
+**Why this works**: Same mechanism as Phase 1. `pre_tool_call` fires before execution, and `pre_llm_call` injects the registry into context so the agent always knows what tools exist before planning. The agent cannot bypass this — it's pattern matching on tool arguments, not instructions.
+
+### File Layout
+
+```
+~/.hermes/plugins/tool-registry-guard/
+├── plugin.yaml
+├── __init__.py          # hooks: pre_llm_call, pre_tool_call, post_tool_call
+└── ...
+~/.hermes/tool-registry.yaml   # user-configurable registry of available tools
+```
+
+### plugin.yaml
+
+```yaml
+name: tool-registry-guard
+version: "0.1.0"
+description: Deterministic tool routing enforcement — blocks code that reimplements registered tool functionality.
+author: yklin
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+```
+
+### Registry Format (~/.hermes/tool-registry.yaml)
+
+```yaml
+version: 1
+tools:
+  - name: graph-workbook
+    path: ~/Code/pm_os/bin/graph-workbook.js
+    description: "Excel read/write (ALL: read, write, format, formulas, ranges)"
+    operations: [excel-read, excel-write, excel-format]
+    banned_alternatives:
+      packages: [pandas, openpyxl, xlrd, xlsxwriter]
+      imports: [pandas, openpyxl, xlrd, xlsxwriter]
+
+  - name: ooxml-surgery
+    path: ~/Code/pm_os/bin/ooxml-surgery.py
+    description: "Word/PPT package operations"
+    operations: [word-read, word-write, pptx-read]
+    banned_alternatives:
+      packages: [python-docx, docx, mammoth, docx2txt, textract]
+      imports: [docx, mammoth, docx2txt, textract]
+
+  - name: graph-file-ops
+    path: ~/Code/pm_os/bin/graph-file-ops.js
+    description: "File download/upload from SharePoint/OneDrive"
+    operations: [sharepoint-download, sharepoint-upload]
+    banned_alternatives:
+      packages: []
+      imports: []
+
+  - name: graph-edit-pptx
+    path: ~/Code/pm_os/bin/graph-edit-pptx.js
+    description: "Complex PPT edits (charts, images, tables)"
+    operations: [pptx-chart, pptx-image, pptx-table]
+    banned_alternatives:
+      packages: [python-pptx, pptx]
+      imports: [pptx]
+
+  - name: graph-list-crud
+    path: ~/Code/pm_os/bin/graph-list-crud.js
+    description: "SharePoint list CRUD"
+    operations: [sharepoint-list]
+    banned_alternatives:
+      packages: []
+      imports: []
+```
+
+### Hooks
+
+**1. `pre_llm_call` — Registry context injection**
+
+Before every LLM call, appends a condensed `TOOL REGISTRY` block to the system prompt listing available tools and their operations. This ensures the agent always knows what exists before planning.
+
+```python
+def pre_llm_call(messages, **kw):
+    """Inject condensed registry into system prompt context."""
+    registry = _load_registry()
+    if not registry:
+        return None
+
+    lines = ["## TOOL REGISTRY — Use these instead of writing custom code\n"]
+    for tool in registry.get("tools", []):
+        banned = tool.get("banned_alternatives", {})
+        pkgs = banned.get("packages", [])
+        lines.append(f"- **{tool['name']}**: {tool['description']}")
+        lines.append(f"  Path: `{tool['path']}`")
+        if pkgs:
+            lines.append(f"  BANNED alternatives: {', '.join(pkgs)}")
+    return {"system_suffix": "\n".join(lines)}
+```
+
+**2. `pre_tool_call` — Banned pattern blocking**
+
+Blocks tool calls matching banned patterns:
+- `bash` commands containing `pip install <banned_package>` or `pip3 install <banned_package>`
+- `bash` commands containing `import <banned_module>` in inline Python (`python -c "..."`)
+- `write_file` where the content imports banned modules
+
+Returns a block message pointing to the correct registered tool with its `--help` command.
+
+```python
+def pre_tool_call(tool_name, args, **kw):
+    """Block tool calls that reimplements registered tool functionality."""
+    registry = _load_registry()
+    if not registry:
+        return None
+
+    if tool_name == "bash":
+        cmd = str(args.get("command", ""))
+        for tool in registry.get("tools", []):
+            banned = tool.get("banned_alternatives", {})
+            for pkg in banned.get("packages", []):
+                if f"pip install {pkg}" in cmd or f"pip3 install {pkg}" in cmd:
+                    return {
+                        "action": "block",
+                        "message": (
+                            f"REGISTRY VIOLATION: {pkg} is banned. "
+                            f"Use {tool['name']} instead: "
+                            f"`{tool['path']} --help`"
+                        ),
+                    }
+            for mod in banned.get("imports", []):
+                if f"import {mod}" in cmd:
+                    return {
+                        "action": "block",
+                        "message": (
+                            f"REGISTRY VIOLATION: import {mod} is banned. "
+                            f"Use {tool['name']} instead: "
+                            f"`{tool['path']} --help`"
+                        ),
+                    }
+
+    if tool_name == "write_file":
+        content = str(args.get("content", ""))
+        for tool in registry.get("tools", []):
+            banned = tool.get("banned_alternatives", {})
+            for mod in banned.get("imports", []):
+                if f"import {mod}" in content:
+                    return {
+                        "action": "block",
+                        "message": (
+                            f"REGISTRY VIOLATION: File imports {mod}. "
+                            f"Use {tool['name']} instead: "
+                            f"`{tool['path']} --help`"
+                        ),
+                    }
+
+    return None
+```
+
+**3. `post_tool_call` — Audit logging**
+
+Audits code-generation tool calls (`write_file`, `bash`) for retrospective analysis. Logs any near-misses or patterns that should be added to the registry.
+
+```python
+def post_tool_call(tool_name, args, result, **kw):
+    """Audit code-generation tool calls for retrospective analysis."""
+    if tool_name not in ("write_file", "bash"):
+        return None
+    # Log to stderr or structured log for offline review
+    _audit_log(tool_name, args, result)
+```
+
+### Enforcement Behavior Examples
+
+| Tool Call | Result |
+|---|---|
+| `bash: "pip install openpyxl"` | Block: "REGISTRY VIOLATION: openpyxl is banned. Use graph-workbook.js instead: `node ~/Code/pm_os/bin/graph-workbook.js --help`" |
+| `write_file: content="import openpyxl\n..."` | Block: "REGISTRY VIOLATION: File imports openpyxl. Use graph-workbook.js instead." |
+| `bash: "python -c 'import docx; ...'"` | Block: "REGISTRY VIOLATION: import docx is banned. Use ooxml-surgery.py instead." |
+| `pre_llm_call` | Injects condensed registry so agent knows available tools before planning |
+
+### State
+
+Stateless — registry is read-only config, blocking is pattern-based. No state machine needed.
+
+### Separation of Concerns
+
+Phase 2a handles tool routing enforcement. Phase 2 (Control Room) handles audit logging. When both are active, Phase 2a blocks violations and Phase 2 logs them.
+
+### ~LOC
+
+~200 Python
+
+---
+
 ## Phase 3: gbrain Memory Integration
 
 **What**: A Hermes memory provider that uses the existing gbrain CLI (`~/.bun/bin/gbrain`) as the durable knowledge store.
@@ -517,7 +711,8 @@ def register(ctx):
 
 1. **Phase 1** — email-send-guard plugin. Immediate, self-contained, ~150 lines of Python.
 2. **Phase 2** — control-room plugin with SQLite audit + policy engine. Migrate email-send-guard state into it.
-3. **Phase 3** — gbrain memory provider. Independent of phases 1-2.
+3. **Phase 2a** — tool-registry-guard plugin. Stateless pattern-based enforcement, ~200 lines of Python. Independent of Phase 2 but complementary (2a blocks, 2 logs).
+4. **Phase 3** — gbrain memory provider. Independent of phases 1-2.
 
 ---
 
