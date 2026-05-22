@@ -1,660 +1,620 @@
-"""control-room plugin — governance audit trail + policy engine + monitoring.
-
-ABOUTME: Phase 2 governance plugin for Hermes. Provides three capabilities:
-1. SQLite audit trail for ALL tool calls (pre/post/blocked).
-2. YAML-based policy engine for declarative enforcement via preconditions.
-3. Localhost HTTP monitoring UI with JSON API endpoints.
-
-The plugin hooks into ``pre_tool_call`` (audit + policy evaluation) and
-``post_tool_call`` (audit with result/duration). Policies are loaded from
-``plugins/control-room/policies/`` and ``~/.hermes/control-room/policies/``
-at startup. The monitoring server runs on ``localhost:8787`` in a daemon
-thread.
+"""
+ABOUTME: Control-room plugin -- audit logging and policy enforcement for tool calls.
+ABOUTME: Tracks all tool invocations in SQLite, evaluates YAML-defined policies
+ABOUTME: with preconditions and workflow state, and exposes HTTP monitoring
+ABOUTME: endpoints for real-time observability.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import re
 import sqlite3
 import threading
 import time
-from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Callable, Dict, List, Optional, Set
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# AuditDB — SQLite audit trail + workflow state + policy log
+# SQLite audit database
 # ---------------------------------------------------------------------------
 
-_SCHEMA_SQL = """\
-CREATE TABLE IF NOT EXISTS tool_audit (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    phase TEXT NOT NULL,
-    session_id TEXT,
-    tool_name TEXT NOT NULL,
-    args_json TEXT,
-    result_json TEXT,
-    blocked INTEGER DEFAULT 0,
-    reason TEXT,
-    duration_ms INTEGER
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    tool_name   TEXT    NOT NULL,
+    args_json   TEXT    NOT NULL DEFAULT '{}',
+    phase       TEXT    NOT NULL,  -- 'pre', 'post', 'blocked'
+    result      TEXT,
+    duration_ms REAL,
+    task_id     TEXT    NOT NULL DEFAULT '',
+    session_id  TEXT    NOT NULL DEFAULT ''
 );
-CREATE TABLE IF NOT EXISTS workflow_state (
-    key TEXT PRIMARY KEY,
-    value_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-);
+
 CREATE TABLE IF NOT EXISTS policy_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    policy_name TEXT NOT NULL,
-    tool_name TEXT NOT NULL,
-    decision TEXT NOT NULL,
-    reason TEXT
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    policy_name TEXT    NOT NULL,
+    tool_name   TEXT    NOT NULL,
+    decision    TEXT    NOT NULL,  -- 'allow', 'block'
+    reason      TEXT    NOT NULL DEFAULT '',
+    args_json   TEXT    NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON tool_audit(ts);
-CREATE INDEX IF NOT EXISTS idx_audit_tool ON tool_audit(tool_name);
+
+CREATE TABLE IF NOT EXISTS workflow_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    ts    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_phase ON audit_log(phase);
+CREATE INDEX IF NOT EXISTS idx_audit_tool  ON audit_log(tool_name);
+CREATE INDEX IF NOT EXISTS idx_policy_decision ON policy_log(decision);
 """
 
 
 class AuditDB:
-    """SQLite-backed audit trail, workflow state store, and policy log.
+    """Thread-safe SQLite wrapper for audit, policy, and workflow state.
 
-    Manages all persistence for the control-room plugin. Thread-safe
-    via check_same_thread=False and a dedicated lock for writes.
-    Creates parent directories and tables on init.
+    All public methods acquire _lock to serialise writes. Reads use
+    the same lock for simplicity -- the database is small and local.
     """
 
-    def __init__(self, db_path: Path | str) -> None:
-        self._path = Path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: Path) -> None:
+        self._db_path = db_path
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
-            str(self._path), check_same_thread=False,
-        )
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        self._conn.executescript(_DB_SCHEMA)
 
-    # -- tool audit ----------------------------------------------------------
+    # -- audit log ----------------------------------------------------------
 
-    def log_tool_call(
+    def log_audit(
         self,
-        phase: str,
         tool_name: str,
-        args: Dict[str, Any],
+        args: dict,
+        phase: str,
         *,
-        result: str = "",
-        blocked: bool = False,
-        reason: str = "",
-        duration_ms: int = 0,
+        result: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+        task_id: str = "",
         session_id: str = "",
-    ) -> None:
-        """Insert a row into the tool_audit table.
-
-        Called by pre/post hooks. phase is 'pre', 'post', or 'blocked'.
-        args are serialised to JSON. Thread-safe via internal lock.
-        """
+    ) -> int:
+        """Insert an audit row and return its rowid."""
         with self._lock:
-            self._conn.execute(
-                """INSERT INTO tool_audit
-                   (ts, phase, session_id, tool_name, args_json,
-                    result_json, blocked, reason, duration_ms)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            cur = self._conn.execute(
+                "INSERT INTO audit_log (ts, tool_name, args_json, phase, result, duration_ms, task_id, session_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    int(time.time()),
-                    phase,
-                    session_id,
+                    time.time(),
                     tool_name,
-                    json.dumps(args, ensure_ascii=False, default=str),
+                    json.dumps(args, default=str),
+                    phase,
                     result,
-                    1 if blocked else 0,
-                    reason,
                     duration_ms,
+                    task_id,
+                    session_id,
                 ),
             )
             self._conn.commit()
+            return cur.lastrowid  # type: ignore[return-value]
 
-    def get_recent_calls(
-        self, limit: int = 50, tool_name: str = "",
-    ) -> List[Dict[str, Any]]:
-        """Return recent audit rows, newest first.
-
-        Optionally filters by tool_name. Returns list of dicts.
-        """
+    def get_audit_rows(
+        self, *, phase: Optional[str] = None, tool_name: Optional[str] = None, limit: int = 100
+    ) -> List[dict]:
+        """Fetch audit rows with optional filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if phase:
+            clauses.append("phase = ?")
+            params.append(phase)
         if tool_name:
-            rows = self._conn.execute(
-                "SELECT * FROM tool_audit WHERE tool_name = ? "
-                "ORDER BY id DESC LIMIT ?",
-                (tool_name, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM tool_audit ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_blocked_calls(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return only blocked audit entries, newest first."""
-        rows = self._conn.execute(
-            "SELECT * FROM tool_audit WHERE blocked = 1 "
-            "ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    # -- workflow state -------------------------------------------------------
-
-    def set_workflow_state(self, key: str, value: Any) -> None:
-        """Upsert a key/value pair in the workflow_state table.
-
-        Value is JSON-serialised. Uses INSERT OR REPLACE for upsert.
-        """
+            clauses.append("tool_name = ?")
+            params.append(tool_name)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._lock:
-            self._conn.execute(
-                """INSERT OR REPLACE INTO workflow_state
-                   (key, value_json, updated_at) VALUES (?, ?, ?)""",
-                (key, json.dumps(value, ensure_ascii=False, default=str), int(time.time())),
-            )
-            self._conn.commit()
-
-    def get_workflow_state(self, key: str) -> Any:
-        """Read a workflow state value by key. Returns None if missing."""
-        row = self._conn.execute(
-            "SELECT value_json FROM workflow_state WHERE key = ?",
-            (key,),
-        ).fetchone()
-        if row is None:
-            return None
-        return json.loads(row["value_json"])
-
-    def get_all_workflow_states(self) -> List[Dict[str, Any]]:
-        """Return all workflow state entries."""
-        rows = self._conn.execute(
-            "SELECT key, value_json, updated_at FROM workflow_state "
-            "ORDER BY updated_at DESC"
-        ).fetchall()
+            rows = self._conn.execute(
+                f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
         return [dict(r) for r in rows]
 
-    # -- policy log -----------------------------------------------------------
+    # -- policy log ---------------------------------------------------------
 
-    def log_policy_decision(
+    def log_policy(
         self,
         policy_name: str,
         tool_name: str,
         decision: str,
         reason: str = "",
-    ) -> None:
-        """Log a policy evaluation decision (allow/block/ask)."""
+        args: Optional[dict] = None,
+    ) -> int:
+        """Insert a policy decision row and return its rowid."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO policy_log (ts, policy_name, tool_name, decision, reason, args_json)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    time.time(),
+                    policy_name,
+                    tool_name,
+                    decision,
+                    reason,
+                    json.dumps(args or {}, default=str),
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid  # type: ignore[return-value]
+
+    def get_policy_rows(
+        self, *, decision: Optional[str] = None, limit: int = 100
+    ) -> List[dict]:
+        """Fetch policy log rows."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if decision:
+            clauses.append("decision = ?")
+            params.append(decision)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM policy_log{where} ORDER BY id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -- workflow state -----------------------------------------------------
+
+    def set_state(self, key: str, value: str) -> None:
+        """Upsert a workflow state key."""
         with self._lock:
             self._conn.execute(
-                """INSERT INTO policy_log
-                   (ts, policy_name, tool_name, decision, reason)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (int(time.time()), policy_name, tool_name, decision, reason),
+                "INSERT INTO workflow_state (key, value, ts) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
+                (key, value, time.time()),
             )
             self._conn.commit()
 
-    def get_policy_log(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Return recent policy decisions, newest first."""
-        rows = self._conn.execute(
-            "SELECT * FROM policy_log ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def get_state(self, key: str) -> Optional[str]:
+        """Return a workflow state value or None if missing."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM workflow_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else None
+
+    def delete_state(self, key: str) -> bool:
+        """Delete a workflow state key. Returns True if it existed."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM workflow_state WHERE key = ?", (key,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def list_states(self) -> Dict[str, str]:
+        """Return all workflow state key/value pairs."""
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM workflow_state ORDER BY key").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self._conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Safe condition evaluator — NO eval()
+# Condition evaluator
 # ---------------------------------------------------------------------------
 
-# Patterns:
-#   args.<key>.startswith('<value>')
-#   args.<key> == '<value>'
-#   args.<key> contains '<value>'
+def evaluate_condition(operator: str, actual: str, expected: str) -> bool:
+    """Evaluate a single condition.
 
-_RE_STARTSWITH = re.compile(
-    r"^args\.(\w+)\.startswith\(['\"](.+?)['\"]\)$"
-)
-_RE_EQUALITY = re.compile(
-    r"^args\.(\w+)\s*==\s*['\"](.+?)['\"]$"
-)
-_RE_CONTAINS = re.compile(
-    r"^args\.(\w+)\s+contains\s+['\"](.+?)['\"]$"
-)
-
-
-def safe_eval_condition(condition: str, args: Dict[str, Any]) -> bool:
-    """Evaluate a condition string against tool args safely.
-
-    Supports three patterns (no eval):
-      - args.<key>.startswith('<value>')
-      - args.<key> == '<value>'
-      - args.<key> contains '<value>'
-
-    Returns False for missing keys, unsupported patterns, or errors.
+    Supported operators: '==', '!=', 'startswith', 'endswith', 'contains'.
+    All comparisons are case-sensitive on the string representation.
     """
-    condition = condition.strip()
-
-    m = _RE_STARTSWITH.match(condition)
-    if m:
-        key, prefix = m.group(1), m.group(2)
-        val = args.get(key)
-        return isinstance(val, str) and val.startswith(prefix)
-
-    m = _RE_EQUALITY.match(condition)
-    if m:
-        key, expected = m.group(1), m.group(2)
-        val = args.get(key)
-        return val == expected
-
-    m = _RE_CONTAINS.match(condition)
-    if m:
-        key, substr = m.group(1), m.group(2)
-        val = args.get(key)
-        return isinstance(val, str) and substr in val
-
-    # Unsupported pattern — safe default is deny (False).
+    actual_s = str(actual) if actual is not None else ""
+    expected_s = str(expected)
+    if operator == "==":
+        return actual_s == expected_s
+    if operator == "!=":
+        return actual_s != expected_s
+    if operator == "startswith":
+        return actual_s.startswith(expected_s)
+    if operator == "endswith":
+        return actual_s.endswith(expected_s)
+    if operator == "contains":
+        return expected_s in actual_s
+    logger.warning("Unknown condition operator '%s', treating as False", operator)
     return False
 
 
 # ---------------------------------------------------------------------------
-# Body hash + state key interpolation
+# Policy engine
 # ---------------------------------------------------------------------------
 
-def compute_body_hash(body: str) -> str:
-    """SHA256 hash of message body, truncated to 12 chars.
+class Policy:
+    """Parsed representation of a single YAML policy file.
 
-    Used as a correlation key in policy preconditions. Deterministic
-    for the same body text.
+    A policy specifies:
+      - triggers: list of dicts with 'tool_name' and optional 'args' matchers
+      - preconditions: list of workflow-state requirements
+      - action: 'allow' or 'block'
     """
-    return hashlib.sha256(body.encode()).hexdigest()[:12]
+
+    def __init__(self, data: dict, name: str = "") -> None:
+        self.name: str = data.get("name", name or "unnamed")
+        self.description: str = data.get("description", "")
+        self.triggers: List[dict] = data.get("triggers", [])
+        self.preconditions: List[dict] = data.get("preconditions", [])
+        self.action: str = data.get("action", "block")
+
+    def matches_trigger(self, tool_name: str, args: dict) -> bool:
+        """Return True if any trigger matches the tool call."""
+        for trigger in self.triggers:
+            if trigger.get("tool_name") != tool_name:
+                continue
+            # Check arg matchers if present
+            arg_matchers = trigger.get("args", {})
+            if self._match_args(arg_matchers, args):
+                return True
+        return False
+
+    def _match_args(self, matchers: dict, args: dict) -> bool:
+        """Evaluate arg-level matchers against actual args.
+
+        Each matcher key is an arg name. The value can be:
+          - a plain string: exact match
+          - a dict with {operator, value}: uses evaluate_condition
+        """
+        for arg_name, matcher in matchers.items():
+            actual = args.get(arg_name, "")
+            if isinstance(actual, (list, dict)):
+                actual = json.dumps(actual, default=str)
+            else:
+                actual = str(actual)
+            if isinstance(matcher, dict):
+                op = matcher.get("operator", "==")
+                val = str(matcher.get("value", ""))
+                if not evaluate_condition(op, actual, val):
+                    return False
+            else:
+                if actual != str(matcher):
+                    return False
+        return True
+
+    def check_preconditions(self, db: AuditDB) -> tuple[bool, str]:
+        """Check all preconditions against workflow state.
+
+        Returns (all_met, first_failing_reason).
+        """
+        for pre in self.preconditions:
+            key = pre.get("state_key", "")
+            required = pre.get("required", True)
+            if required:
+                value = db.get_state(key)
+                if value is None:
+                    reason = pre.get("message", f"Missing required state: {key}")
+                    return False, reason
+                # Optional value check
+                if "value" in pre:
+                    op = pre.get("operator", "==")
+                    expected = str(pre["value"])
+                    if not evaluate_condition(op, value, expected):
+                        reason = pre.get(
+                            "message",
+                            f"State '{key}' failed check: {value} {op} {expected}",
+                        )
+                        return False, reason
+        return True, ""
 
 
-def interpolate_state_key(template: str, args: Dict[str, Any]) -> str:
-    """Substitute {body_hash} in a state_key template.
+def load_policies(policy_dir: Path) -> List[Policy]:
+    """Load all .yaml/.yml policy files from a directory.
 
-    Extracts the 'body' field from args and computes its hash.
-    If 'body' is missing or template has no placeholder, returns as-is.
+    Returns an empty list if the directory doesn't exist or yaml is unavailable.
     """
-    if "{body_hash}" not in template:
-        return template
-    body = args.get("body", "")
-    if not isinstance(body, str):
-        body = str(body)
-    bh = compute_body_hash(body)
-    return template.replace("{body_hash}", bh)
+    if yaml is None:
+        logger.warning("PyYAML not installed -- cannot load policies")
+        return []
+    if not policy_dir.is_dir():
+        return []
+    policies: List[Policy] = []
+    for p in sorted(policy_dir.iterdir()):
+        if p.suffix not in (".yaml", ".yml"):
+            continue
+        try:
+            data = yaml.safe_load(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            policies.append(Policy(data, name=p.stem))
+        except Exception as exc:
+            logger.warning("Failed to load policy %s: %s", p, exc)
+    return policies
 
-
-# ---------------------------------------------------------------------------
-# PolicyEngine — load YAML policies and evaluate triggers/preconditions
-# ---------------------------------------------------------------------------
 
 class PolicyEngine:
-    """Declarative policy evaluation engine.
+    """Evaluate tool calls against loaded policies.
 
-    Loads policies from one or more directories. Each YAML file
-    defines triggers (tool name + optional condition) and preconditions
-    (workflow state keys that must exist). Evaluation returns the first
-    failing precondition error or None if all pass.
+    Evaluation order: all matching policies are checked. If ANY matching
+    policy has action='block' and its preconditions are not met, the call
+    is blocked. A policy with action='block' whose preconditions ARE all
+    met means the block condition is satisfied, so it ALLOWS the call.
+
+    Put differently: a block-policy says "block UNLESS preconditions are met".
+    An allow-policy says "allow WHEN triggers match" (preconditions optional).
+
+    If multiple policies match and at least one results in a block decision,
+    block wins.
     """
 
-    def __init__(self, policy_dirs: List[Path]) -> None:
-        self.policies: List[Dict[str, Any]] = []
-        for d in policy_dirs:
-            self._load_dir(d)
+    def __init__(self, policies: List[Policy], db: AuditDB) -> None:
+        self._policies = policies
+        self._db = db
 
-    def _load_dir(self, d: Path) -> None:
-        """Load all *.yaml / *.yml files from a directory."""
-        if not d.is_dir():
-            return
-        for f in sorted(d.iterdir()):
-            if f.suffix not in (".yaml", ".yml"):
-                continue
-            try:
-                data = yaml.safe_load(f.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "name" in data:
-                    self.policies.append(data)
-            except Exception as exc:
-                logger.warning("control-room: failed to load policy %s: %s", f, exc)
+    @property
+    def policies(self) -> List[Policy]:
+        """Return the loaded policy list."""
+        return list(self._policies)
 
-    def find_matching_policies(
-        self, tool_name: str, args: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Return policies whose triggers match the given tool call.
+    def evaluate(self, tool_name: str, args: dict) -> tuple[str, str, Optional[str]]:
+        """Evaluate all policies against a tool call.
 
-        A trigger matches when its 'tool' field equals tool_name AND
-        its optional 'condition' evaluates to True (or is absent).
+        Returns (decision, reason, blocking_policy_name):
+          - ("allow", "", None) if no policy blocks
+          - ("block", reason, policy_name) if blocked
         """
-        matched = []
-        for policy in self.policies:
-            triggers = policy.get("triggers", [])
-            for trigger in triggers:
-                if trigger.get("tool") != tool_name:
-                    continue
-                condition = trigger.get("condition", "")
-                if not condition or safe_eval_condition(condition, args):
-                    matched.append(policy)
-                    break  # One trigger match per policy is enough
-        return matched
+        block_decision: Optional[tuple[str, str]] = None
 
-    def check_preconditions(
-        self,
-        policy: Dict[str, Any],
-        args: Dict[str, Any],
-        db: AuditDB,
-    ) -> Optional[str]:
-        """Check all preconditions for a policy against workflow state.
-
-        Returns the error message of the first failing precondition,
-        or None if all pass.
-        """
-        for precond in policy.get("preconditions", []):
-            state_key = interpolate_state_key(
-                precond.get("state_key", ""), args,
-            )
-            if not state_key:
+        for policy in self._policies:
+            if not policy.matches_trigger(tool_name, args):
                 continue
-            val = db.get_workflow_state(state_key)
-            if not val:
-                return precond.get("error", f"Precondition not met: {state_key}")
-        return None
 
-    def to_dict_list(self) -> List[Dict[str, Any]]:
-        """Return policies as a serialisable list (for the monitoring API)."""
-        return [
-            {
-                "name": p.get("name", ""),
-                "description": p.get("description", ""),
-                "triggers": p.get("triggers", []),
-                "preconditions": p.get("preconditions", []),
-            }
-            for p in self.policies
-        ]
+            if policy.action == "block":
+                met, reason = policy.check_preconditions(self._db)
+                if not met:
+                    # Preconditions not met -> block
+                    self._db.log_policy(policy.name, tool_name, "block", reason, args)
+                    if block_decision is None:
+                        block_decision = (reason, policy.name)
+                else:
+                    # Preconditions met -> this block-policy is satisfied, allow
+                    self._db.log_policy(policy.name, tool_name, "allow", "preconditions met", args)
 
+            elif policy.action == "allow":
+                met, reason = policy.check_preconditions(self._db)
+                if met:
+                    self._db.log_policy(policy.name, tool_name, "allow", "policy allows", args)
+                else:
+                    # Allow policy with unmet preconditions -> block
+                    self._db.log_policy(policy.name, tool_name, "block", reason, args)
+                    if block_decision is None:
+                        block_decision = (reason, policy.name)
 
-# ---------------------------------------------------------------------------
-# Hook handler factories
-# ---------------------------------------------------------------------------
-
-def make_pre_tool_call_handler(
-    db: AuditDB, engine: PolicyEngine,
-) -> Callable:
-    """Build the pre_tool_call hook handler.
-
-    Logs a 'pre' audit entry for every call. Then evaluates matching
-    policies. If any policy blocks, logs a 'blocked' audit entry and
-    a policy_log row, and returns {'action': 'block', 'message': ...}.
-    Returns None to allow the call otherwise.
-    """
-
-    def handler(
-        tool_name: str = "",
-        args: Optional[Dict[str, Any]] = None,
-        task_id: str = "",
-        session_id: str = "",
-        **kw: Any,
-    ) -> Optional[Dict[str, str]]:
-        if args is None:
-            args = {}
-
-        # Always log the pre-call audit entry
-        db.log_tool_call("pre", tool_name, args, session_id=session_id)
-
-        # Evaluate policies
-        matched = engine.find_matching_policies(tool_name, args)
-        for policy in matched:
-            error = engine.check_preconditions(policy, args, db)
-            if error:
-                # Log blocked audit + policy decision
-                db.log_tool_call(
-                    "blocked", tool_name, args,
-                    blocked=True, reason=error, session_id=session_id,
-                )
-                db.log_policy_decision(
-                    policy_name=policy.get("name", "unknown"),
-                    tool_name=tool_name,
-                    decision="block",
-                    reason=error,
-                )
-                return {"action": "block", "message": error}
-            else:
-                # Policy matched but all preconditions passed
-                db.log_policy_decision(
-                    policy_name=policy.get("name", "unknown"),
-                    tool_name=tool_name,
-                    decision="allow",
-                )
-
-        return None
-
-    return handler
-
-
-def make_post_tool_call_handler(db: AuditDB) -> Callable:
-    """Build the post_tool_call hook handler.
-
-    Logs a 'post' audit entry with the tool result and duration.
-    Pure audit — no return value needed.
-    """
-
-    def handler(
-        tool_name: str = "",
-        args: Optional[Dict[str, Any]] = None,
-        result: Any = None,
-        duration_ms: int = 0,
-        session_id: str = "",
-        **kw: Any,
-    ) -> None:
-        if args is None:
-            args = {}
-        result_str = result if isinstance(result, str) else json.dumps(
-            result, ensure_ascii=False, default=str,
-        )
-        db.log_tool_call(
-            "post", tool_name, args,
-            result=result_str,
-            duration_ms=duration_ms,
-            session_id=session_id,
-        )
-
-    return handler
+        if block_decision is not None:
+            return "block", block_decision[0], block_decision[1]
+        return "allow", "", None
 
 
 # ---------------------------------------------------------------------------
-# Monitoring HTTP server
+# HTTP monitoring server
 # ---------------------------------------------------------------------------
 
-class _MonitorHandler(BaseHTTPRequestHandler):
-    """Minimal JSON API handler for the control-room monitoring server.
+class MonitoringHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler exposing audit and policy data as JSON."""
 
-    Endpoints:
-      GET /api/tool-calls?limit=50&tool=<name>  — recent audit rows
-      GET /api/blocked?limit=50                  — blocked attempts
-      GET /api/workflows                         — current workflow states
-      GET /api/policies                          — loaded policies
-    """
-
-    # Set by the server factory — shared across requests.
-    db: AuditDB
-    engine: PolicyEngine
-
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler convention
-        """Route GET requests to the appropriate handler."""
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/")
-        params = parse_qs(parsed.query)
-
-        try:
-            if path == "/api/tool-calls":
-                data = self._handle_tool_calls(params)
-            elif path == "/api/blocked":
-                data = self._handle_blocked(params)
-            elif path == "/api/workflows":
-                data = self._handle_workflows()
-            elif path == "/api/policies":
-                data = self._handle_policies()
-            else:
-                self._send_json({"error": "not found"}, status=404)
-                return
-            self._send_json(data)
-        except Exception as exc:
-            logger.warning("control-room API error: %s", exc)
-            self._send_json({"error": str(exc)}, status=500)
-
-    def _handle_tool_calls(self, params: Dict) -> Any:
-        limit = int(params.get("limit", ["50"])[0])
-        tool = params.get("tool", [""])[0]
-        return self.db.get_recent_calls(limit=limit, tool_name=tool)
-
-    def _handle_blocked(self, params: Dict) -> Any:
-        limit = int(params.get("limit", ["50"])[0])
-        return self.db.get_blocked_calls(limit=limit)
-
-    def _handle_workflows(self) -> Any:
-        return self.db.get_all_workflow_states()
-
-    def _handle_policies(self) -> Any:
-        return self.engine.to_dict_list()
-
-    def _send_json(self, data: Any, status: int = 200) -> None:
-        body = json.dumps(data, ensure_ascii=False, default=str).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    # Set by ControlRoom.start_monitoring() before server.serve_forever()
+    control_room: Optional["ControlRoom"] = None
 
     def log_message(self, format: str, *args: Any) -> None:
-        """Suppress default stderr logging — route through logger instead."""
-        logger.debug("control-room HTTP: %s", format % args)
+        """Suppress default stderr logging."""
+        pass
+
+    def do_GET(self) -> None:
+        """Route GET requests to the appropriate handler."""
+        cr = self.__class__.control_room
+        if cr is None:
+            self._send_json(500, {"error": "control-room not initialised"})
+            return
+
+        path = self.path.split("?")[0].rstrip("/")
+
+        if path == "/api/tool-calls":
+            rows = cr.db.get_audit_rows(limit=50)
+            self._send_json(200, {"tool_calls": rows})
+        elif path == "/api/blocked":
+            rows = cr.db.get_audit_rows(phase="blocked", limit=50)
+            self._send_json(200, {"blocked": rows})
+        elif path == "/api/workflows":
+            states = cr.db.list_states()
+            self._send_json(200, {"workflows": states})
+        elif path == "/api/policies":
+            policies = [
+                {"name": p.name, "description": p.description, "action": p.action}
+                for p in cr.engine.policies
+            ]
+            self._send_json(200, {"policies": policies})
+        else:
+            self._send_json(404, {"error": f"not found: {path}"})
+
+    def _send_json(self, status: int, body: dict) -> None:
+        """Send a JSON response."""
+        payload = json.dumps(body, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
-def _start_monitor_server(
-    db: AuditDB, engine: PolicyEngine, port: int = 8787,
-) -> Optional[HTTPServer]:
-    """Start the monitoring HTTP server in a daemon thread.
+class ControlRoom:
+    """Orchestrates audit logging, policy evaluation, and monitoring.
 
-    Binds to localhost only. Returns the server instance (or None on
-    failure). The server is started in a daemon thread so it shuts down
-    with the main process.
+    Holds references to AuditDB and PolicyEngine. Hook callbacks are
+    closures that capture this instance.
     """
-    handler_cls = type(
-        "_BoundMonitorHandler",
-        (_MonitorHandler,),
-        {"db": db, "engine": engine},
-    )
-    try:
-        server = HTTPServer(("127.0.0.1", port), handler_cls)
-    except OSError as exc:
-        logger.warning(
-            "control-room: could not bind monitoring server on port %d: %s",
-            port, exc,
+
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        policy_dir: Optional[Path] = None,
+    ) -> None:
+        if db_path is None:
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "control-room" / "audit.db"
+        if policy_dir is None:
+            from hermes_constants import get_hermes_home
+            policy_dir = get_hermes_home() / "control-room" / "policies"
+
+        self.db = AuditDB(db_path)
+        policies = load_policies(policy_dir)
+        self.engine = PolicyEngine(policies, self.db)
+
+        # Track in-flight tool calls for duration calculation
+        self._inflight: Dict[str, float] = {}
+        self._inflight_lock = threading.Lock()
+
+        # Monitoring server
+        self._server: Optional[HTTPServer] = None
+        self._server_thread: Optional[threading.Thread] = None
+
+    # -- hook callbacks -----------------------------------------------------
+
+    def pre_tool_call(
+        self, tool_name: str, args: dict, task_id: str = "", session_id: str = "", **kwargs: Any
+    ) -> Optional[dict]:
+        """pre_tool_call hook: audit + policy check.
+
+        Returns {"action": "block", "message": ...} if blocked, else None.
+        """
+        # Evaluate policies first
+        decision, reason, policy_name = self.engine.evaluate(tool_name, args)
+
+        if decision == "block":
+            self.db.log_audit(
+                tool_name, args, "blocked",
+                result=reason, task_id=task_id, session_id=session_id,
+            )
+            return {"action": "block", "message": f"[control-room] {reason}"}
+
+        # Record pre-phase audit
+        self.db.log_audit(
+            tool_name, args, "pre", task_id=task_id, session_id=session_id,
         )
+        # Track start time for duration
+        call_key = f"{tool_name}:{task_id}:{time.monotonic()}"
+        with self._inflight_lock:
+            self._inflight[f"{tool_name}:{task_id}"] = time.monotonic()
+
         return None
 
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="hermes-control-room-monitor",
-        daemon=True,
-    )
-    thread.start()
-    logger.info("control-room: monitoring server started on http://127.0.0.1:%d", port)
-    return server
+    def post_tool_call(
+        self,
+        tool_name: str,
+        args: dict,
+        result: str = "",
+        task_id: str = "",
+        session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """post_tool_call hook: record completion audit row with duration."""
+        call_key = f"{tool_name}:{task_id}"
+        duration_ms: Optional[float] = None
+        with self._inflight_lock:
+            start = self._inflight.pop(call_key, None)
+        if start is not None:
+            duration_ms = (time.monotonic() - start) * 1000.0
 
+        # Truncate result for storage (keep first 4KB)
+        stored_result = result[:4096] if isinstance(result, str) else str(result)[:4096]
 
-# ---------------------------------------------------------------------------
-# Slash command handler
-# ---------------------------------------------------------------------------
+        self.db.log_audit(
+            tool_name, args, "post",
+            result=stored_result, duration_ms=duration_ms,
+            task_id=task_id, session_id=session_id,
+        )
 
-_SLASH_HELP = """\
-/control-room — governance monitoring
+    # -- monitoring server --------------------------------------------------
 
-The control-room monitoring UI is running at:
-  http://127.0.0.1:{port}
+    def start_monitoring(self, host: str = "127.0.0.1", port: int = 8787) -> int:
+        """Start the HTTP monitoring server on a background thread.
 
-Endpoints:
-  /api/tool-calls?limit=50&tool=<name>  Recent audit entries
-  /api/blocked?limit=50                 Blocked tool calls
-  /api/workflows                        Current workflow states
-  /api/policies                         Loaded policy definitions
-"""
+        Returns the port actually bound (useful when port=0 for random).
+        """
+        if self._server is not None:
+            return self._server.server_address[1]
+
+        # Create a handler class with a reference to this ControlRoom
+        handler_class = type(
+            "BoundHandler",
+            (MonitoringHandler,),
+            {"control_room": self},
+        )
+        self._server = HTTPServer((host, port), handler_class)
+        actual_port = self._server.server_address[1]
+
+        self._server_thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="control-room-monitor",
+            daemon=True,
+        )
+        self._server_thread.start()
+        logger.info("Control-room monitoring on http://%s:%d", host, actual_port)
+        return actual_port
+
+    def stop_monitoring(self) -> None:
+        """Shut down the monitoring server if running."""
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+            self._server_thread = None
 
 
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
-# Module-level references set during register() so the singleton
-# resources survive for the process lifetime.
-_db: Optional[AuditDB] = None
-_engine: Optional[PolicyEngine] = None
-_server: Optional[HTTPServer] = None
+# Module-level reference for tests and slash-command access.
+_instance: Optional[ControlRoom] = None
 
 
-def register(ctx) -> None:
-    """Wire hooks, slash command, and monitoring server.
+def register(ctx: Any) -> None:
+    """Plugin entry point -- called by PluginManager."""
+    global _instance
 
-    Called by the PluginManager during plugin discovery. Sets up:
-    - AuditDB at ~/.hermes/control-room/state.sqlite
-    - PolicyEngine loading from bundled + user policy directories
-    - pre_tool_call + post_tool_call hooks
-    - /control-room slash command
-    - Monitoring HTTP server on localhost:8787
-    """
-    global _db, _engine, _server
+    # Determine paths from env or defaults
+    db_path_env = os.getenv("CONTROL_ROOM_DB")
+    policy_dir_env = os.getenv("CONTROL_ROOM_POLICIES")
 
-    # Resolve DB path — configurable via env, default under HERMES_HOME
-    try:
-        from hermes_constants import get_hermes_home
-        hermes_home = get_hermes_home()
-    except ImportError:
-        hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    db_path = Path(db_path_env) if db_path_env else None
+    policy_dir = Path(policy_dir_env) if policy_dir_env else None
 
-    db_dir = Path(os.environ.get(
-        "CONTROL_ROOM_DB_DIR",
-        str(hermes_home / "control-room"),
-    ))
-    db_path = db_dir / "state.sqlite"
-    _db = AuditDB(db_path)
+    cr = ControlRoom(db_path=db_path, policy_dir=policy_dir)
+    _instance = cr
 
-    # Resolve policy directories
-    plugin_dir = Path(__file__).resolve().parent
-    bundled_policies = plugin_dir / "policies"
-    user_policies = hermes_home / "control-room" / "policies"
-    _engine = PolicyEngine([bundled_policies, user_policies])
+    ctx.register_hook("pre_tool_call", cr.pre_tool_call)
+    ctx.register_hook("post_tool_call", cr.post_tool_call)
+
+    # Start monitoring server if configured
+    monitor_port = os.getenv("CONTROL_ROOM_MONITOR_PORT")
+    if monitor_port:
+        try:
+            cr.start_monitoring(port=int(monitor_port))
+        except Exception as exc:
+            logger.warning("Failed to start monitoring server: %s", exc)
 
     logger.info(
-        "control-room: loaded %d policies, DB at %s",
-        len(_engine.policies), db_path,
-    )
-
-    # Register hooks
-    ctx.register_hook("pre_tool_call", make_pre_tool_call_handler(_db, _engine))
-    ctx.register_hook("post_tool_call", make_post_tool_call_handler(_db))
-
-    # Start monitoring server (best-effort — port conflict is non-fatal)
-    port = int(os.environ.get("CONTROL_ROOM_PORT", "8787"))
-    _server = _start_monitor_server(_db, _engine, port=port)
-
-    # Register slash command
-    def _handle_slash(raw_args: str) -> str:
-        return _SLASH_HELP.format(port=port)
-
-    ctx.register_command(
-        "control-room",
-        handler=_handle_slash,
-        description="Show the control-room monitoring server URL.",
+        "control-room: loaded %d policies, audit db at %s",
+        len(cr.engine.policies),
+        cr.db._db_path,
     )
