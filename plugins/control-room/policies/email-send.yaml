@@ -1,0 +1,12 @@
+name: email-send-guard
+description: Require draft → preview → approval before email send
+triggers:
+  - tool: send_message
+    condition: "args.target.startswith('email')"
+preconditions:
+  - state_key: "draft.{body_hash}.loaded"
+    error: "Load draft first with email_load_draft"
+  - state_key: "draft.{body_hash}.previewed"
+    error: "Preview draft first with email_show_preview"
+  - state_key: "approval.{body_hash}.valid"
+    error: "User approval required: /approve-email {body_hash}"
