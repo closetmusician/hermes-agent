@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import select
+import socket
 import smtplib
 import ssl
 import uuid
@@ -460,9 +461,23 @@ class EmailAdapter(BasePlatformAdapter):
                                    response.decode(errors="replace").strip())
                     break
 
-                # Wait for server notification or 25-min heartbeat timeout
+                # Wait for server notification or 8-min heartbeat timeout.
+                # Yahoo IMAP drops IDLE connections after ~10 minutes, so
+                # we proactively exit before the server kills us.
                 sock = imap.socket()
-                readable, _, _ = select.select([sock], [], [], 1500)  # 25 minutes
+                readable, _, _ = select.select([sock], [], [], 480)  # 8 minutes
+
+                # If select says readable, verify the socket is still alive.
+                # A server-side close makes select return readable, but the
+                # socket has no data — recv(1, PEEK) returns empty bytes.
+                if readable:
+                    try:
+                        peek = sock.recv(1, socket.MSG_PEEK)
+                    except (OSError, ConnectionError):
+                        peek = b""
+                    if not peek:
+                        logger.info("[Email] IMAP server closed connection during IDLE wait, reconnecting")
+                        break
 
                 # Send DONE to exit IDLE (must precede any other IMAP command)
                 imap.send(b"DONE\r\n")
@@ -470,15 +485,23 @@ class EmailAdapter(BasePlatformAdapter):
                 # Drain any untagged responses until we see the tagged
                 # completion for the DONE command.
                 got_exists = False
+                tagged_ok = False
                 for _ in range(50):
                     line = imap.readline()
                     if not line:
+                        # Server closed connection during drain. If we already
+                        # saw the tagged response or no EXISTS was pending,
+                        # treat as normal disconnect rather than error.
+                        if tagged_ok or not got_exists:
+                            logger.debug("[Email] IMAP connection closed during drain (graceful)")
+                            break
                         raise ConnectionError("IMAP server closed connection during IDLE drain")
                     if b"EXISTS" in line:
                         got_exists = True
                         logger.debug("[Email] IDLE notification: %s",
                                      line.decode(errors="replace").strip())
                     if line.startswith(tag):
+                        tagged_ok = True
                         break
                 else:
                     raise ConnectionError("IMAP IDLE drain exceeded 50 response lines")
