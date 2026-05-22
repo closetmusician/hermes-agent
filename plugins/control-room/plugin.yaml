@@ -1,0 +1,7 @@
+name: control-room
+version: 1.0.0
+description: "Governance plugin — SQLite audit trail for all tool calls, YAML-based policy engine for declarative enforcement, and localhost monitoring UI."
+author: NousResearch
+hooks:
+  - pre_tool_call
+  - post_tool_call
