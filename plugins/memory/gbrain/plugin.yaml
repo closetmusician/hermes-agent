@@ -1,0 +1,5 @@
+name: gbrain-memory
+version: 1.0.0
+description: "Integrates gbrain personal knowledge base as Hermes' durable memory provider. Hybrid vector+keyword search over 790+ pages of work docs."
+author: "Yu-Kuan"
+requires_env: []
