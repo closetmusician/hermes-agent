@@ -1,0 +1,8 @@
+name: tool-registry-guard
+version: 1.0.0
+description: "Deterministic enforcement of registered tools. Blocks pip-install and import of banned packages, injecting registry context into every LLM call."
+author: "NousResearch"
+hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - post_tool_call
