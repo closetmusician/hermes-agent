@@ -154,6 +154,67 @@ class TestEvaluateCondition:
 
 
 # ---------------------------------------------------------------------------
+# evaluate_condition regex operator tests
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateConditionRegex:
+    """Verify the regex operator in evaluate_condition."""
+
+    def test_regex_match(self) -> None:
+        """Simple regex pattern matches target string."""
+        assert evaluate_condition("regex", "import smtplib", "smtplib") is True
+
+    def test_regex_no_match(self) -> None:
+        """Regex returns False when pattern is absent from target."""
+        assert evaluate_condition("regex", "import json", "smtplib") is False
+
+    def test_regex_case_insensitive(self) -> None:
+        """Regex matching is case-insensitive (re.IGNORECASE)."""
+        assert evaluate_condition("regex", "import SMTPLIB", "smtplib") is True
+
+    def test_regex_complex_pattern(self) -> None:
+        """Alternation pattern matches any branch."""
+        assert evaluate_condition(
+            "regex",
+            "nodemailer.createTransport()",
+            "smtplib|nodemailer|sendgrid",
+        ) is True
+
+    def test_regex_invalid_pattern(self) -> None:
+        """Invalid regex pattern returns False instead of raising."""
+        assert evaluate_condition("regex", "some text", "[invalid(") is False
+
+    def test_regex_partial_match(self) -> None:
+        """Regex matches a substring within a longer string."""
+        assert evaluate_condition(
+            "regex",
+            "server = smtplib.SMTP('smtp.gmail.com')",
+            r"SMTP\(",
+        ) is True
+
+    def test_regex_graph_api_pattern(self) -> None:
+        """Real Graph API pattern from policies matches mail endpoints."""
+        pattern = r"graph\.microsoft\.com.*(sendMail|messages)"
+        assert evaluate_condition(
+            "regex",
+            "https://graph.microsoft.com/v1.0/me/sendMail",
+            pattern,
+        ) is True
+        assert evaluate_condition(
+            "regex",
+            "graph.microsoft.com/v1.0/users/a@b.com/messages",
+            pattern,
+        ) is True
+        # Non-mail Graph API call should not match
+        assert evaluate_condition(
+            "regex",
+            "https://graph.microsoft.com/v1.0/me/drive/root",
+            pattern,
+        ) is False
+
+
+# ---------------------------------------------------------------------------
 # Policy tests
 # ---------------------------------------------------------------------------
 
