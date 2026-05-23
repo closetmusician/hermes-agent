@@ -35,6 +35,16 @@ def _body_hash(body: str) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
 
 
+def _approval_hash(recipient: str, body: str) -> str:
+    """Compute SHA256 hex digest binding approval to (recipient, body).
+
+    Mirrors the plugin's _approval_hash. Needed for tests that manipulate
+    the approval state directly (e.g. expiry backdating).
+    """
+    key = f"{recipient.lower()}\0{body}"
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 def _load_plugin_module() -> Any:
     """Import the email-send-guard plugin module from the repo.
 
@@ -206,14 +216,15 @@ class TestHappyPath:
     def test_full_happy_path_returns_none(self, registered, plugin_module):
         manager, ctx = registered
         body = "Fully approved email body"
+        recipient = "happy@example.com"
         draft_id = _body_hash(body)
 
         from tools.registry import registry
         load_entry = registry.get_entry("email_load_draft")
         preview_entry = registry.get_entry("email_show_preview")
 
-        # Step 1: load
-        load_result = json.loads(load_entry.handler(body=body))
+        # Step 1: load (recipient must match the target used in send)
+        load_result = json.loads(load_entry.handler(body=body, recipient=recipient))
         assert load_result["status"] == "draft_loaded"
         assert load_result["draft_id"] == draft_id
 
@@ -231,7 +242,7 @@ class TestHappyPath:
         results = manager.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:happy@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         # All callbacks returned None => no results
         assert results == []
@@ -247,24 +258,26 @@ class TestApprovalExpiry:
     def test_expired_approval_blocks(self, registered, plugin_module):
         manager, ctx = registered
         body = "Expiring email"
+        recipient = "expired@example.com"
         draft_id = _body_hash(body)
+        ah = _approval_hash(recipient, body)
 
         from tools.registry import registry
-        registry.get_entry("email_load_draft").handler(body=body)
+        registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
 
         approve_handler = manager._plugin_commands["approve-email"]["handler"]
         approve_handler(draft_id)
 
-        # Backdate the approval to make it expired
+        # Backdate the approval to make it expired (keyed by approval hash)
         state = plugin_module._load_state()
-        state["approvals"][draft_id]["expires_at"] = time.time() - 1
+        state["approvals"][ah]["expires_at"] = time.time() - 1
         plugin_module._save_state(state)
 
         results = manager.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:expired@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert len(results) == 1
         assert results[0]["action"] == "block"
@@ -315,6 +328,8 @@ class TestMultipleDrafts:
         manager, ctx = registered
         body_a = "Draft A body"
         body_b = "Draft B body"
+        recipient_a = "a@example.com"
+        recipient_b = "b@example.com"
         hash_a = _body_hash(body_a)
         hash_b = _body_hash(body_b)
 
@@ -323,9 +338,9 @@ class TestMultipleDrafts:
         preview = registry.get_entry("email_show_preview").handler
         approve = manager._plugin_commands["approve-email"]["handler"]
 
-        # Load and preview both drafts
-        load(body=body_a)
-        load(body=body_b)
+        # Load and preview both drafts (with recipients for approval binding)
+        load(body=body_a, recipient=recipient_a)
+        load(body=body_b, recipient=recipient_b)
         preview(draft_id=hash_a)
         preview(draft_id=hash_b)
 
@@ -336,7 +351,7 @@ class TestMultipleDrafts:
         results_a = manager.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:a@example.com", "message": body_a},
+            args={"target": f"email:{recipient_a}", "message": body_a},
         )
         assert len(results_a) == 1
         assert results_a[0]["action"] == "block"
@@ -346,7 +361,7 @@ class TestMultipleDrafts:
         results_b = manager.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:b@example.com", "message": body_b},
+            args={"target": f"email:{recipient_b}", "message": body_b},
         )
         assert results_b == []
 
@@ -425,6 +440,7 @@ class TestStatePersistence:
 
     def test_state_survives_re_registration(self, plugin_module):
         body = "Persistent draft"
+        recipient = "persist@example.com"
         draft_id = _body_hash(body)
 
         # First instance: full approval flow
@@ -434,7 +450,7 @@ class TestStatePersistence:
         plugin_module.register(ctx1)
 
         from tools.registry import registry
-        registry.get_entry("email_load_draft").handler(body=body)
+        registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
         mgr1._plugin_commands["approve-email"]["handler"](draft_id)
 
@@ -442,7 +458,7 @@ class TestStatePersistence:
         results1 = mgr1.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:persist@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert results1 == []
 
@@ -455,7 +471,7 @@ class TestStatePersistence:
         results2 = mgr2.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:persist@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert results2 == []
 
@@ -501,10 +517,11 @@ class TestApproveEmailCommand:
     def test_approve_current_when_no_id_given(self, registered, plugin_module):
         manager, _ = registered
         body = "Current draft auto-approve"
+        recipient = "auto@example.com"
         draft_id = _body_hash(body)
 
         from tools.registry import registry
-        registry.get_entry("email_load_draft").handler(body=body)
+        registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
 
         handler = manager._plugin_commands["approve-email"]["handler"]
@@ -515,7 +532,7 @@ class TestApproveEmailCommand:
         results = manager.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
-            args={"target": "email:auto@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert results == []
 
@@ -563,16 +580,17 @@ class TestGlobalSingletonPipeline:
         monkeypatch.setattr(pm_mod, "_plugin_manager", mgr)
 
         body = "Singleton happy path"
+        recipient = "ok@example.com"
         draft_id = _body_hash(body)
 
         from tools.registry import registry
-        registry.get_entry("email_load_draft").handler(body=body)
+        registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
         mgr._plugin_commands["approve-email"]["handler"](draft_id)
 
         msg = get_pre_tool_call_block_message(
             tool_name="send_message",
-            args={"target": "email:ok@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert msg is None
 
