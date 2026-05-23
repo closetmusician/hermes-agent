@@ -2,6 +2,7 @@ name: email-send-guard
 version: 1.0.0
 description: "Deterministic email send guard — blocks send_message(email) until draft is loaded, previewed, and user-approved. State machine: EMPTY -> LOADED -> PREVIEWED -> APPROVED -> ALLOWED."
 author: NousResearch
+mandatory: true
 hooks:
   - pre_tool_call
 provides_tools:
