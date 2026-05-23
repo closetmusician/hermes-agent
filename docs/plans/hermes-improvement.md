@@ -754,3 +754,54 @@ Split operations into preview + confirm phases at the tool level.
 - Hermes config: `~/.hermes/config.yaml` with `plugins.enabled` list
 - gbrain CLI: `~/.bun/bin/gbrain` (query, search, get, put, list, stats)
 - Claude Code hooks (analogous pattern): PreToolUse with deny > defer > ask > allow precedence
+
+---
+
+## Phase 4: Close Email-Sending Loopholes (2026-05-22)
+
+### Context
+
+On 2026-05-20, hermes sent an email from yklin@diligent.com via a custom Node.js script that called the Microsoft Graph API reply endpoint — completely bypassing the send_message email guard. The email-send-guard and control-room plugins only intercept the send_message tool. Four other tools can send email unguarded: terminal, write_file, patch, and execute_code.
+
+### Approach
+
+Extend the control-room policy engine with regex operator support, then add YAML policies blocking email-sending patterns across all four bypass tools. This keeps all email governance in policy files (not scattered across tool implementations) and leverages the existing pre_tool_call hook pipeline.
+
+### Changes
+
+#### 4.1 Add regex operator to control-room policy engine
+
+**File:** `plugins/control-room/__init__.py`
+**Function:** `evaluate_condition()`
+
+Add a regex case that does case-insensitive re.search(). Import re at module top.
+
+#### 4.2 Create email-sending block policies
+
+Control-room semantics: action block means "block UNLESS preconditions are met." Empty preconditions = vacuously met = ALLOW. So for an unconditional block, use a precondition referencing a state key (email.terminal_send_override) that will never be set in normal operation — precondition always fails — always blocked.
+
+Four new policy YAML files, one per tool:
+- `plugins/control-room/policies/terminal-email-block.yaml` — blocks terminal commands with email-sending patterns
+- `plugins/control-room/policies/writefile-email-block.yaml` — blocks write_file with email-sending code in content
+- `plugins/control-room/policies/patch-email-block.yaml` — blocks patch with email-sending code in new_string or patch args
+- `plugins/control-room/policies/execute-code-email-block.yaml` — blocks execute_code with email-sending Python
+
+Patterns matched: smtplib, SMTP(), nodemailer, sendgrid, mailgun, .sendmail(), sendMail, Graph API mail endpoints, createTransport, smtp_connection, curl+smtp, postfix, mutt, mail -s.
+
+#### 4.3 Tests
+
+- Unit tests for regex operator in evaluate_condition()
+- E2e tests for each email block policy (blocked + passthrough)
+
+### Files Modified
+- `plugins/control-room/__init__.py` — add regex operator (~3 lines)
+
+### Files Created
+- `plugins/control-room/policies/terminal-email-block.yaml`
+- `plugins/control-room/policies/writefile-email-block.yaml`
+- `plugins/control-room/policies/patch-email-block.yaml`
+- `plugins/control-room/policies/execute-code-email-block.yaml`
+
+### Files Updated (tests)
+- `tests/plugins/test_control_room_plugin.py` — regex operator unit tests
+- `tests/plugins/test_control_room_e2e.py` — email block policy e2e tests
