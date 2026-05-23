@@ -42,7 +42,7 @@ class TestHandleFunctionCall:
 
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
-            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+            patch("model_tools.registry._dispatch_unchecked", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
         ):
             result = handle_function_call(
@@ -92,7 +92,7 @@ class TestHandleFunctionCall:
         ``duration_ms`` to its PostToolUse hook inputs.
         """
         with (
-            patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
+            patch("model_tools.registry._dispatch_unchecked", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
         ):
             handle_function_call("web_search", {"q": "test"}, task_id="t1")
@@ -151,7 +151,7 @@ class TestPreToolCallBlocking:
             raise AssertionError("dispatch should not run when blocked")
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+        monkeypatch.setattr("model_tools.registry._dispatch_unchecked", fake_dispatch)
 
         result = json.loads(handle_function_call("read_file", {"path": "test.txt"}, task_id="t1"))
         assert result == {"error": "Blocked by policy"}
@@ -166,7 +166,7 @@ class TestPreToolCallBlocking:
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch",
+        monkeypatch.setattr("model_tools.registry._dispatch_unchecked",
                             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
                             lambda task_id: notifications.append(task_id))
@@ -187,7 +187,7 @@ class TestPreToolCallBlocking:
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch",
+        monkeypatch.setattr("model_tools.registry._dispatch_unchecked",
                             lambda *a, **kw: json.dumps({"ok": True}))
 
         result = json.loads(handle_function_call("read_file", {"path": "test.txt"}, task_id="t1"))
@@ -209,7 +209,7 @@ class TestPreToolCallBlocking:
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch",
+        monkeypatch.setattr("model_tools.registry._dispatch_unchecked",
                             lambda *a, **kw: json.dumps({"ok": True}))
 
         handle_function_call("web_search", {"q": "test"}, task_id="t1",
@@ -247,7 +247,7 @@ class TestPreToolCallBlocking:
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
-        monkeypatch.setattr("model_tools.registry.dispatch",
+        monkeypatch.setattr("model_tools.registry._dispatch_unchecked",
                             lambda *a, **kw: json.dumps({"ok": True}))
 
         # Step 1: caller checks for a block directive (this fires pre_tool_call once).

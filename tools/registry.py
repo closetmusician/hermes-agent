@@ -388,7 +388,47 @@ class ToolRegistry:
     # ------------------------------------------------------------------
 
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
-        """Execute a tool handler by name.
+        """Execute a tool handler by name, enforcing pre_tool_call hooks.
+
+        Runs ``get_pre_tool_call_block_message()`` before executing the
+        handler.  If a plugin hook returns a block directive the handler
+        is never called and the block message is returned as an error.
+        Hook failures are logged and treated as non-blocking (fail-open)
+        to avoid breaking tool execution when the plugin system isn't
+        loaded.
+
+        Context kwargs ``task_id``, ``session_id``, and ``tool_call_id``
+        are forwarded to the hook when present.
+
+        Callers that have already run the hook (e.g.
+        ``handle_function_call`` with ``skip_pre_tool_call_hook=True``)
+        should use ``_dispatch_unchecked()`` to avoid double-firing.
+        """
+        # -- pre_tool_call guard ------------------------------------
+        try:
+            from hermes_cli.plugins import get_pre_tool_call_block_message
+            block_message = get_pre_tool_call_block_message(
+                name,
+                args if isinstance(args, dict) else {},
+                task_id=kwargs.get("task_id", ""),
+                session_id=kwargs.get("session_id", ""),
+                tool_call_id=kwargs.get("tool_call_id", ""),
+            )
+        except Exception as _hook_err:
+            logger.debug("pre_tool_call hook error in dispatch: %s", _hook_err)
+            block_message = None
+
+        if block_message is not None:
+            return json.dumps({"error": block_message}, ensure_ascii=False)
+
+        return self._dispatch_unchecked(name, args, **kwargs)
+
+    def _dispatch_unchecked(self, name: str, args: dict, **kwargs) -> str:
+        """Execute a tool handler by name, WITHOUT pre_tool_call checks.
+
+        Use this only when the caller has already run the pre_tool_call
+        hook (e.g. ``handle_function_call`` with skip flag, or
+        ``tool_executor`` which fires hooks before dispatching).
 
         * Async handlers are bridged automatically via ``_run_async()``.
         * All exceptions are caught and returned as ``{"error": "..."}``
