@@ -1,0 +1,23 @@
+# ABOUTME: Policy blocking patch tool when new_string/patch contains email code.
+# ABOUTME: Catches SMTP libs, Graph API mail endpoints, nodemailer, etc.
+# ABOUTME: Prevents patching email-sending code that bypasses send_message guard.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 email loophole closure (2026-05-22).
+name: patch-email-block
+description: "Block patching files with email-sending code patterns"
+action: block
+triggers:
+  - tool_name: patch
+    args:
+      new_string:
+        operator: regex
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages)|/me/(sendMail|messages)|createTransport|smtp_connection"
+  - tool_name: patch
+    args:
+      patch:
+        operator: regex
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages)|/me/(sendMail|messages)|createTransport|smtp_connection"
+preconditions:
+  - state_key: email.terminal_send_override
+    required: true
+    message: "Cannot patch files with email-sending code. Use send_message tool with email-send-guard approval workflow."

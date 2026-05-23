@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -235,6 +236,12 @@ def evaluate_condition(operator: str, actual: str, expected: str) -> bool:
         return actual_s.endswith(expected_s)
     if operator == "contains":
         return expected_s in actual_s
+    if operator == "regex":
+        try:
+            return bool(re.search(expected_s, actual_s, re.IGNORECASE))
+        except re.error:
+            logger.warning("Invalid regex pattern in policy: %s", expected_s)
+            return False
     logger.warning("Unknown condition operator '%s', treating as False", operator)
     return False
 

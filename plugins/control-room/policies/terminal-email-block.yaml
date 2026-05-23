@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking terminal commands that send email directly.
+# ABOUTME: Catches SMTP, Graph API mail endpoints, nodemailer, sendgrid, etc.
+# ABOUTME: Forces all email sends through the guarded send_message tool.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 email loophole closure (2026-05-22).
+name: terminal-email-block
+description: "Block terminal commands that send email directly (bypassing send_message guard)"
+action: block
+triggers:
+  - tool_name: terminal
+    args:
+      command:
+        operator: regex
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s"
+preconditions:
+  - state_key: email.terminal_send_override
+    required: true
+    message: "Direct email sending via terminal is not allowed. Use send_message tool with email-send-guard approval workflow."

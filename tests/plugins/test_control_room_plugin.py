@@ -150,7 +150,7 @@ class TestEvaluateCondition:
 
     def test_unknown_operator(self) -> None:
         """Unknown operators return False."""
-        assert evaluate_condition("regex", "abc", "a.*") is False
+        assert evaluate_condition("like", "abc", "a%") is False
 
 
 # ---------------------------------------------------------------------------

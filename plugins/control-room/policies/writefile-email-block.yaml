@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking write_file when content contains email-sending code.
+# ABOUTME: Catches SMTP libs, Graph API mail endpoints, nodemailer, etc.
+# ABOUTME: Prevents writing scripts that bypass the send_message email guard.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 email loophole closure (2026-05-22).
+name: writefile-email-block
+description: "Block writing files that contain email-sending code patterns"
+action: block
+triggers:
+  - tool_name: write_file
+    args:
+      content:
+        operator: regex
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages)|/me/(sendMail|messages)|createTransport|smtp_connection"
+preconditions:
+  - state_key: email.terminal_send_override
+    required: true
+    message: "Cannot write files containing email-sending code. Use send_message tool with email-send-guard approval workflow."
