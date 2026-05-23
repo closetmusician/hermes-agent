@@ -390,6 +390,55 @@ class TestControlRoom:
         rows = cr.db.get_audit_rows(phase="blocked")
         assert len(rows) == 1
 
+    def test_pre_tool_call_blocks_outlook_send_mail(self, tmp_path: Path) -> None:
+        """Hardcoded block: terminal invoking outlook-send-mail.js is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node outlook-send-mail.js --to foo@bar.com"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "outlook-send-mail" in result["message"].lower() or "send_message" in result["message"].lower()
+        # Verify audit row recorded
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_blocks_outlook_read_mail(self, tmp_path: Path) -> None:
+        """Hardcoded block: terminal invoking outlook-read-mail.js is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node outlook-read-mail.js"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        # Verify audit row recorded
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_allows_normal_terminal(self, tmp_path: Path) -> None:
+        """Hardcoded block does not affect normal terminal commands."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call("terminal", {"command": "ls -la"})
+        assert result is None
+
+    def test_default_policy_dir_loads_bundled_policies(self, tmp_path: Path) -> None:
+        """ControlRoom with no policy_dir loads from plugin's own policies/ dir."""
+        cr = ControlRoom(db_path=tmp_path / "audit.db")
+        assert len(cr.engine._policies) > 0, (
+            "Default policy_dir should load bundled policies from plugin directory"
+        )
+
     def test_post_tool_call_records(self, tmp_path: Path) -> None:
         cr = ControlRoom(
             db_path=tmp_path / "audit.db",
