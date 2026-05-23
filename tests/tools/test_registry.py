@@ -3,7 +3,7 @@
 import json
 import threading
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
 
@@ -544,3 +544,142 @@ class TestThreadSafety:
         toolsets = result_holder["value"]
         assert "gated" in toolsets
         assert toolsets["gated"]["available"] is True
+
+
+class TestDispatchPreToolCallEnforcement:
+    """Verify that registry.dispatch() enforces pre_tool_call hooks.
+
+    These tests prove that a blocking pre_tool_call hook prevents tool
+    execution at the registry level -- so ANY caller (including
+    PluginContext.dispatch_tool) is protected.
+    """
+
+    def test_dispatch_blocked_by_pre_tool_call_hook(self):
+        """A pre_tool_call hook returning block should prevent execution."""
+        reg = ToolRegistry()
+        handler_called = {"value": False}
+
+        def tracking_handler(args, **kw):
+            handler_called["value"] = True
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="dangerous_tool",
+            toolset="core",
+            schema=_make_schema("dangerous_tool"),
+            handler=tracking_handler,
+        )
+
+        # Mock get_pre_tool_call_block_message to block this tool
+        with patch(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            return_value="BLOCKED: dangerous_tool is not allowed",
+        ):
+            result = json.loads(reg.dispatch("dangerous_tool", {}))
+
+        assert "error" in result, "dispatch() should return an error when hook blocks"
+        assert "BLOCKED" in result["error"], "Error should contain the block message"
+        assert handler_called["value"] is False, "Handler must NOT be called when blocked"
+
+    def test_dispatch_allows_when_no_block(self):
+        """When pre_tool_call hooks return None (no block), tool executes normally."""
+        reg = ToolRegistry()
+
+        def ok_handler(args, **kw):
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="safe_tool",
+            toolset="core",
+            schema=_make_schema("safe_tool"),
+            handler=ok_handler,
+        )
+
+        with patch(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            return_value=None,
+        ):
+            result = json.loads(reg.dispatch("safe_tool", {}))
+
+        assert result == {"ok": True}
+
+    def test_dispatch_hook_error_fails_open(self):
+        """If the hook machinery raises, dispatch should fail open (execute tool).
+
+        This matches the existing behavior in handle_function_call where
+        hook errors are caught and logged without blocking execution.
+        """
+        reg = ToolRegistry()
+
+        def ok_handler(args, **kw):
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="tool_with_broken_hook",
+            toolset="core",
+            schema=_make_schema("tool_with_broken_hook"),
+            handler=ok_handler,
+        )
+
+        with patch(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            side_effect=ImportError("plugins not loaded"),
+        ):
+            result = json.loads(reg.dispatch("tool_with_broken_hook", {}))
+
+        assert result == {"ok": True}, "Should fail open when hook raises"
+
+    def test_dispatch_unchecked_bypasses_hooks(self):
+        """_dispatch_unchecked() must skip hook checks (for internal callers)."""
+        reg = ToolRegistry()
+        handler_called = {"value": False}
+
+        def tracking_handler(args, **kw):
+            handler_called["value"] = True
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="internal_tool",
+            toolset="core",
+            schema=_make_schema("internal_tool"),
+            handler=tracking_handler,
+        )
+
+        # Even with a blocking hook, _dispatch_unchecked should execute
+        with patch(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            return_value="BLOCKED: not allowed",
+        ):
+            result = json.loads(reg._dispatch_unchecked("internal_tool", {}))
+
+        assert result == {"ok": True}
+        assert handler_called["value"] is True
+
+    def test_dispatch_passes_context_to_hook(self):
+        """dispatch() should pass tool_name, args, and context kwargs to the hook."""
+        reg = ToolRegistry()
+
+        def echo_handler(args, **kw):
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="ctx_tool",
+            toolset="core",
+            schema=_make_schema("ctx_tool"),
+            handler=echo_handler,
+        )
+
+        mock_block_fn = MagicMock(return_value=None)
+        with patch(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            mock_block_fn,
+        ):
+            reg.dispatch("ctx_tool", {"arg1": "val1"}, task_id="t-123", session_id="s-456")
+
+        mock_block_fn.assert_called_once_with(
+            "ctx_tool",
+            {"arg1": "val1"},
+            task_id="t-123",
+            session_id="s-456",
+            tool_call_id="",
+        )
