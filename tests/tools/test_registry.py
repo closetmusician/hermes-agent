@@ -544,3 +544,73 @@ class TestThreadSafety:
         toolsets = result_holder["value"]
         assert "gated" in toolsets
         assert toolsets["gated"]["available"] is True
+
+
+class TestPluginKwargsDispatch:
+    """Verify dispatch unpacks args dict as **kwargs for plugin-style handlers.
+
+    Plugin handlers (e.g. email-send-guard) define signatures like
+    ``def handler(body: str, recipient: str)`` instead of the built-in
+    convention ``def handler(args: dict, **kw)``. dispatch() must detect
+    this and unpack the args dict as keyword arguments so that
+    ``body.encode()`` inside the handler receives a str, not a dict.
+    """
+
+    def test_dispatch_unpacks_kwargs_for_plugin_handler(self):
+        """Handler with named keyword params receives unpacked args, not dict."""
+        reg = ToolRegistry()
+        received = {}
+
+        def plugin_handler(body: str, recipient: str):
+            received["body"] = body
+            received["recipient"] = recipient
+            # Simulates the real _body_hash(body) call that does body.encode()
+            _ = body.encode("utf-8")
+            return json.dumps({"ok": True, "body_type": type(body).__name__})
+
+        reg.register(
+            name="email_load_draft",
+            toolset="email-send-guard",
+            schema=_make_schema("email_load_draft"),
+            handler=plugin_handler,
+        )
+        result = json.loads(reg.dispatch(
+            "email_load_draft",
+            {"body": "test body", "recipient": "test@example.com"},
+        ))
+        assert result == {"ok": True, "body_type": "str"}
+        assert received["body"] == "test body"
+        assert received["recipient"] == "test@example.com"
+
+    def test_dispatch_still_works_for_builtin_args_dict_handler(self):
+        """Built-in handlers with ``(args, **kw)`` still receive the dict."""
+        reg = ToolRegistry()
+
+        def builtin_handler(args, **kw):
+            return json.dumps({"got": args})
+
+        reg.register(
+            name="builtin",
+            toolset="core",
+            schema=_make_schema("builtin"),
+            handler=builtin_handler,
+        )
+        result = json.loads(reg.dispatch("builtin", {"key": "value"}))
+        assert result == {"got": {"key": "value"}}
+
+    def test_dispatch_kwargs_handler_missing_param_returns_error(self):
+        """Missing required kwarg surfaces as an error, not a crash."""
+        reg = ToolRegistry()
+
+        def strict_handler(body: str, recipient: str):
+            return json.dumps({"ok": True})
+
+        reg.register(
+            name="strict",
+            toolset="plugin",
+            schema=_make_schema("strict"),
+            handler=strict_handler,
+        )
+        # Only provide 'body', missing 'recipient'
+        result = json.loads(reg.dispatch("strict", {"body": "hello"}))
+        assert "error" in result
