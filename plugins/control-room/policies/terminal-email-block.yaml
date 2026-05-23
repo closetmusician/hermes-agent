@@ -11,7 +11,7 @@ triggers:
     args:
       command:
         operator: regex
-        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s"
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s|outlook-send-mail|outlook-read-mail"
 preconditions:
   - state_key: email.terminal_send_override
     required: true
