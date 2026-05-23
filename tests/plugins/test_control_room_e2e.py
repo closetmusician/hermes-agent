@@ -602,3 +602,146 @@ class TestDatabaseResilience:
         )
         rows = cr.db.get_audit_rows(tool_name="translate")
         assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Email-blocking policies (terminal, write_file, patch, execute_code)
+# ---------------------------------------------------------------------------
+
+
+class TestEmailBlockPolicies:
+    """E2E tests for the bundled email-blocking policies.
+
+    Loads all four email-block policy files (terminal, write_file, patch,
+    execute_code) from plugins/control-room/policies/ and verifies that
+    email-sending patterns are blocked while innocent commands pass through.
+    """
+
+    @pytest.fixture()
+    def cr_email_block(self, tmp_path: Path) -> ControlRoom:
+        """ControlRoom with all bundled email-blocking policies loaded."""
+        policy_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "plugins" / "control-room" / "policies"
+        )
+        pdir = tmp_path / "policies"
+        pdir.mkdir()
+
+        for name in (
+            "terminal-email-block",
+            "writefile-email-block",
+            "patch-email-block",
+            "execute-code-email-block",
+        ):
+            src = policy_src / f"{name}.yaml"
+            (pdir / f"{name}.yaml").write_text(
+                src.read_text(encoding="utf-8"), encoding="utf-8",
+            )
+
+        return ControlRoom(db_path=tmp_path / "audit.db", policy_dir=pdir)
+
+    # -- Blocked scenarios ---------------------------------------------------
+
+    def test_terminal_python_smtplib_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal with python -c 'import smtplib' is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal", {"command": "python -c 'import smtplib'"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_terminal_node_nodemailer_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal with node requiring nodemailer is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal", {"command": 'node -e "require(\'nodemailer\')"'},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_terminal_sendmail_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal with command containing sendMail is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal", {"command": "curl -X POST https://api.example.com/sendMail"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_write_file_smtplib_blocked(self, cr_email_block: ControlRoom) -> None:
+        """write_file with content importing smtplib is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "write_file",
+            {"content": "import smtplib\nfrom email.mime.text import MIMEText"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_write_file_nodemailer_blocked(self, cr_email_block: ControlRoom) -> None:
+        """write_file with content using nodemailer.createTransport is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "write_file",
+            {"content": "const transport = nodemailer.createTransport({})"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_patch_smtp_blocked(self, cr_email_block: ControlRoom) -> None:
+        """patch with new_string containing smtplib.SMTP( is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "patch", {"new_string": 'server = smtplib.SMTP("localhost", 25)'},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_execute_code_smtplib_blocked(self, cr_email_block: ControlRoom) -> None:
+        """execute_code with code importing smtplib is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "execute_code", {"code": "import smtplib"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    # -- Passthrough scenarios -----------------------------------------------
+
+    def test_terminal_ls_allowed(self, cr_email_block: ControlRoom) -> None:
+        """terminal with 'ls -la' passes through (no email pattern)."""
+        result = cr_email_block.pre_tool_call(
+            "terminal", {"command": "ls -la"},
+        )
+        assert result is None
+
+    def test_terminal_python_test_allowed(self, cr_email_block: ControlRoom) -> None:
+        """terminal with 'python test.py' passes through."""
+        result = cr_email_block.pre_tool_call(
+            "terminal", {"command": "python test.py"},
+        )
+        assert result is None
+
+    def test_write_file_console_log_allowed(self, cr_email_block: ControlRoom) -> None:
+        """write_file with innocent JS content passes through."""
+        result = cr_email_block.pre_tool_call(
+            "write_file", {"content": "console.log('hello')"},
+        )
+        assert result is None
+
+    def test_patch_return_allowed(self, cr_email_block: ControlRoom) -> None:
+        """patch with harmless new_string passes through."""
+        result = cr_email_block.pre_tool_call(
+            "patch", {"new_string": "return result"},
+        )
+        assert result is None
+
+    def test_execute_code_print_allowed(self, cr_email_block: ControlRoom) -> None:
+        """execute_code with innocent Python code passes through."""
+        result = cr_email_block.pre_tool_call(
+            "execute_code", {"code": "print('hello')"},
+        )
+        assert result is None
+
+    def test_send_message_not_blocked_by_email_block_policies(
+        self, cr_email_block: ControlRoom,
+    ) -> None:
+        """send_message is NOT blocked by these policies (separate policy)."""
+        result = cr_email_block.pre_tool_call(
+            "send_message", {"target": "email:user@test.com"},
+        )
+        assert result is None
