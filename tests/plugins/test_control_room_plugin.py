@@ -402,7 +402,7 @@ class TestControlRoom:
         )
         assert result is not None
         assert result["action"] == "block"
-        assert "outlook-send-mail" in result["message"].lower() or "send_message" in result["message"].lower()
+        assert "send_message" in result["message"]
         # Verify audit row recorded
         rows = cr.db.get_audit_rows(phase="blocked")
         assert len(rows) == 1
@@ -419,7 +419,24 @@ class TestControlRoom:
         )
         assert result is not None
         assert result["action"] == "block"
+        assert "send_message" in result["message"]
         # Verify audit row recorded
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_blocks_pm_os_outlook_tools(self, tmp_path: Path) -> None:
+        """Hardcoded block: any pm_os/bin/outlook command is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node ~/Code/pm_os/bin/outlook-calendar.js --list"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "send_message" in result["message"]
         rows = cr.db.get_audit_rows(phase="blocked")
         assert len(rows) == 1
 

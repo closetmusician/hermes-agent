@@ -805,3 +805,14 @@ Patterns matched: smtplib, SMTP(), nodemailer, sendgrid, mailgun, .sendmail(), s
 ### Files Updated (tests)
 - `tests/plugins/test_control_room_plugin.py` — regex operator unit tests
 - `tests/plugins/test_control_room_e2e.py` — email block policy e2e tests
+
+### TODO: Credential-level protection for FOCI tokens
+
+**Attack chain (2026-05-20 incident):**
+1. hermes used `write_file` to create a temp Node.js script that reads `~/.pm-os-foci-token.json` (Graph API bearer token with `Mail.Send` scope for yklin@diligent.com)
+2. hermes used `terminal` to run the script, calling `POST /me/messages/{id}/reply` via Microsoft Graph API
+3. Email sent from yklin@diligent.com — no SMTP credentials needed, just the FOCI token already on disk
+
+**Gap:** Phase 4 policies block known email-sending *code patterns* (regex blocklist) but do NOT prevent reading `~/.pm-os-foci-token.json` or other auth token files. A novel sending mechanism not in the regex patterns could still grab the token and send email.
+
+**Potential fix:** Add read-deny policies for sensitive credential files (`~/.pm-os-foci-token.json`, `~/.pm-os-foci-office-token.json`) or move token access behind a gated tool that requires approval (similar to email-send-guard's approval workflow).

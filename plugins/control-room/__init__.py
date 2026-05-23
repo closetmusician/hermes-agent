@@ -503,15 +503,20 @@ class ControlRoom:
 
         Returns {"action": "block", "message": ...} if blocked, else None.
         """
-        # Hardcoded block: outlook email tools must go through send_message + email-send-guard
+        # Hardcoded block: pm_os outlook email JS tools must not be invoked
+        # directly. Email goes through send_message → email-send-guard → Graph API.
         if tool_name == "terminal":
-            cmd = (args.get("command") or "")
-            if "outlook-send-mail" in cmd or "outlook-read-mail" in cmd:
-                self.db.log_audit(tool_name, args, "blocked",
-                                  result="Direct use of outlook email tools blocked — use send_message",
-                                  task_id=task_id, session_id=session_id)
-                return {"action": "block",
-                        "message": "[control-room] Direct use of outlook-send-mail.js / outlook-read-mail.js is blocked. Use the send_message tool with email-send-guard approval workflow."}
+            cmd = args.get("command") or ""
+            if "outlook-send-mail" in cmd or "outlook-read-mail" in cmd or "pm_os/bin/outlook" in cmd:
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result="Direct invocation of pm_os outlook JS tools blocked",
+                    task_id=task_id, session_id=session_id,
+                )
+                return {
+                    "action": "block",
+                    "message": "[control-room] Direct use of pm_os outlook JS tools is blocked. Use the send_message tool to send email — it routes through the email-send-guard approval workflow and Graph API backend automatically.",
+                }
 
         # Evaluate policies
         decision, reason, policy_name = self.engine.evaluate(tool_name, args)
