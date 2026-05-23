@@ -456,6 +456,94 @@ class TestControlRoom:
             "Default policy_dir should load bundled policies from plugin directory"
         )
 
+    def test_pre_tool_call_blocks_write_to_control_room_plugin(self, tmp_path: Path) -> None:
+        """Hardcoded block: write_file to plugins/control-room/ is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "write_file",
+            {"path": "plugins/control-room/__init__.py"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "write-protected" in result["message"]
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_blocks_patch_to_email_send_guard(self, tmp_path: Path) -> None:
+        """Hardcoded block: patch to plugins/email-send-guard/ is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "patch",
+            {"path": "plugins/email-send-guard/__init__.py"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "write-protected" in result["message"]
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_allows_write_to_other_plugins(self, tmp_path: Path) -> None:
+        """Hardcoded block does not affect writes to other plugin directories."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "write_file",
+            {"path": "plugins/some-other/foo.py"},
+        )
+        assert result is None
+
+    def test_pre_tool_call_blocks_execute_code_importing_hermes_internals(self, tmp_path: Path) -> None:
+        """Hardcoded block: execute_code importing hermes internal modules is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "execute_code",
+            {"code": "from hermes_tools import terminal"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "hermes internal modules" in result["message"]
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_pre_tool_call_allows_normal_execute_code(self, tmp_path: Path) -> None:
+        """Hardcoded block does not affect normal execute_code usage."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "execute_code",
+            {"code": 'import json; print("hello")'},
+        )
+        assert result is None
+
+    def test_pre_tool_call_blocks_get_foci_token(self, tmp_path: Path) -> None:
+        """Hardcoded block: terminal invoking get-foci-token.js is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node get-foci-token.js --for mail"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "get-foci-token" in result["message"]
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
     def test_post_tool_call_records(self, tmp_path: Path) -> None:
         cr = ControlRoom(
             db_path=tmp_path / "audit.db",

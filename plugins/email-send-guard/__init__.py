@@ -157,7 +157,7 @@ def _pre_tool_call(
 # Registered tools (agent-callable)
 # ---------------------------------------------------------------------------
 
-def _email_load_draft(args: dict, **_kw: Any) -> str:
+def _email_load_draft(body: str = "", **_kw: Any) -> str:
     """Store a draft email body for review. Computes and returns the content hash.
 
     Usage: Agent calls this before sending any email. The hash identifies the
@@ -165,7 +165,6 @@ def _email_load_draft(args: dict, **_kw: Any) -> str:
     Gotchas: Overwrites any prior draft with the same hash. Sets current to
     this draft.
     """
-    body = args.get("body", "") if isinstance(args, dict) else args
     if not body:
         return json.dumps({"error": "body is required"})
 
@@ -187,14 +186,13 @@ def _email_load_draft(args: dict, **_kw: Any) -> str:
     })
 
 
-def _email_show_preview(args: dict, **_kw: Any) -> str:
+def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
     """Show a formatted preview of a loaded draft and mark it as previewed.
 
     Usage: Agent calls this after email_load_draft. The draft_id is the hash
     returned by email_load_draft.
     Gotchas: Returns an error if the draft_id doesn't match a loaded draft.
     """
-    draft_id = args.get("draft_id", "") if isinstance(args, dict) else args
     if not draft_id:
         return json.dumps({"error": "draft_id is required"})
 

@@ -518,6 +518,55 @@ class ControlRoom:
                     "message": "[control-room] Direct use of pm_os outlook JS tools is blocked. Use the send_message tool to send email — it routes through the email-send-guard approval workflow and Graph API backend automatically.",
                 }
 
+        # Hardcoded block: write-protect security plugin source code.
+        # Hermes must not modify its own guards — closes code-rewrite escalation.
+        if tool_name in ("write_file", "patch"):
+            target_path = args.get("path") or ""
+            if "plugins/control-room" in target_path or "plugins/email-send-guard" in target_path:
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result="Write to security plugin source blocked",
+                    task_id=task_id, session_id=session_id,
+                )
+                return {
+                    "action": "block",
+                    "message": "[control-room] Modifying security plugin source code is blocked. plugins/control-room/ and plugins/email-send-guard/ are write-protected.",
+                }
+
+        # Hardcoded block: prevent execute_code from importing hermes internals.
+        # Stops forging guard state, calling internal APIs, and module abuse.
+        if tool_name == "execute_code":
+            code = args.get("code") or ""
+            if any(pat in code for pat in (
+                "hermes_tools", "hermes_cli", "plugins.", "hermes_constants",
+                "from tools", "import tools", "from agent", "import agent",
+                "from gateway", "import gateway", "from model_tools",
+            )):
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result="execute_code importing hermes internals blocked",
+                    task_id=task_id, session_id=session_id,
+                )
+                return {
+                    "action": "block",
+                    "message": "[control-room] execute_code cannot import hermes internal modules (hermes_tools, hermes_cli, plugins, agent, gateway, model_tools). Use the official tool APIs instead.",
+                }
+
+        # Hardcoded block: prevent direct token extraction via get-foci-token.js.
+        # Tokens are used internally by Graph API backend, not exposed to agent.
+        if tool_name == "terminal":
+            cmd = args.get("command") or ""
+            if "get-foci-token" in cmd:
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result="Direct FOCI token extraction blocked",
+                    task_id=task_id, session_id=session_id,
+                )
+                return {
+                    "action": "block",
+                    "message": "[control-room] Direct use of get-foci-token.js is blocked. Auth tokens are managed internally by the Graph API email backend.",
+                }
+
         # Evaluate policies
         decision, reason, policy_name = self.engine.evaluate(tool_name, args)
 
