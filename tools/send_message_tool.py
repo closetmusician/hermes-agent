@@ -1480,7 +1480,39 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
 
 async def _send_email(extra, chat_id, message):
-    """Send via SMTP (one-shot, no persistent connection needed)."""
+    """Send email via Graph API (M365) or SMTP fallback.
+
+    Two-path dispatch: if a FOCI device-code token and the
+    outlook-send-mail.js tool both exist, uses Microsoft Graph API
+    (POST /me/sendMail) for delivery. This handles M365 corporate
+    accounts where basic SMTP auth is deprecated. Falls back to
+    raw SMTP for non-M365 accounts or when the Graph tooling is
+    absent.
+    """
+    import subprocess
+
+    # -- Graph API path (Microsoft 365 via outlook-send-mail.js) ----------
+    token_path = os.path.expanduser("~/.pm-os-foci-token.json")
+    outlook_tool = os.path.expanduser("~/Code/pm_os/bin/outlook-send-mail.js")
+
+    if os.path.exists(token_path) and os.path.exists(outlook_tool):
+        cmd = [
+            "node", outlook_tool,
+            "--to", chat_id,
+            "--subject", "Hermes Agent",
+            "--body", message,
+            "--content-type", "Text",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return {"success": True, "platform": "email", "method": "graph-api"}
+            else:
+                return {"error": f"Graph API email failed: {result.stderr.strip()}"}
+        except subprocess.TimeoutExpired:
+            return {"error": "Graph API email timed out after 30s"}
+
+    # -- SMTP fallback (non-M365 accounts) --------------------------------
     import smtplib
     from email.mime.text import MIMEText
     from email.utils import formatdate
