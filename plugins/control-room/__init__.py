@@ -480,8 +480,7 @@ class ControlRoom:
             from hermes_constants import get_hermes_home
             db_path = get_hermes_home() / "control-room" / "audit.db"
         if policy_dir is None:
-            from hermes_constants import get_hermes_home
-            policy_dir = get_hermes_home() / "control-room" / "policies"
+            policy_dir = Path(__file__).parent / "policies"
 
         self.db = AuditDB(db_path)
         policies = load_policies(policy_dir)
@@ -504,7 +503,17 @@ class ControlRoom:
 
         Returns {"action": "block", "message": ...} if blocked, else None.
         """
-        # Evaluate policies first
+        # Hardcoded block: outlook email tools must go through send_message + email-send-guard
+        if tool_name == "terminal":
+            cmd = (args.get("command") or "")
+            if "outlook-send-mail" in cmd or "outlook-read-mail" in cmd:
+                self.db.log_audit(tool_name, args, "blocked",
+                                  result="Direct use of outlook email tools blocked — use send_message",
+                                  task_id=task_id, session_id=session_id)
+                return {"action": "block",
+                        "message": "[control-room] Direct use of outlook-send-mail.js / outlook-read-mail.js is blocked. Use the send_message tool with email-send-guard approval workflow."}
+
+        # Evaluate policies
         decision, reason, policy_name = self.engine.evaluate(tool_name, args)
 
         if decision == "block":
