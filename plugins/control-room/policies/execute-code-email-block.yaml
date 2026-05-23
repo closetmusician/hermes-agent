@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking execute_code when code contains email-sending patterns.
+# ABOUTME: Catches smtplib, sendgrid, mailgun, Graph API mail endpoints.
+# ABOUTME: Prevents Python code execution that bypasses send_message guard.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 email loophole closure (2026-05-22).
+name: execute-code-email-block
+description: "Block Python code execution containing email-sending patterns"
+action: block
+triggers:
+  - tool_name: execute_code
+    args:
+      code:
+        operator: regex
+        value: "smtplib|SMTP\\(|sendgrid|mailgun|\\.sendmail\\(|graph\\.microsoft\\.com.*(sendMail|messages)|/me/(sendMail|messages)"
+preconditions:
+  - state_key: email.terminal_send_override
+    required: true
+    message: "Cannot execute code containing email-sending patterns. Use send_message tool with email-send-guard approval workflow."

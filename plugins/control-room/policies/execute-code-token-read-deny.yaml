@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking execute_code when code references FOCI auth token files.
+# ABOUTME: Catches pm-os-foci-token.json and pm-os-foci-office-token.json paths.
+# ABOUTME: Prevents Python code execution that reads bearer tokens to bypass tool guards.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 token exfiltration closure (2026-05-22).
+name: execute-code-token-read-deny
+description: "Block Python code execution referencing FOCI auth token files"
+action: block
+triggers:
+  - tool_name: execute_code
+    args:
+      code:
+        operator: regex
+        value: "pm-os-foci-token|pm-os-foci-office-token"
+preconditions:
+  - state_key: token.read_override
+    required: true
+    message: "Cannot execute code referencing FOCI auth token files. Use the designated pm_os tools which handle authentication internally."

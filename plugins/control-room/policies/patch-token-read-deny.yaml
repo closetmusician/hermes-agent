@@ -1,0 +1,23 @@
+# ABOUTME: Policy blocking patch tool when new_string/patch references FOCI token files.
+# ABOUTME: Catches pm-os-foci-token.json and pm-os-foci-office-token.json paths.
+# ABOUTME: Prevents patching code that reads bearer tokens to bypass tool guards.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 token exfiltration closure (2026-05-22).
+name: patch-token-read-deny
+description: "Block patching files with FOCI auth token file references"
+action: block
+triggers:
+  - tool_name: patch
+    args:
+      new_string:
+        operator: regex
+        value: "pm-os-foci-token|pm-os-foci-office-token"
+  - tool_name: patch
+    args:
+      patch:
+        operator: regex
+        value: "pm-os-foci-token|pm-os-foci-office-token"
+preconditions:
+  - state_key: token.read_override
+    required: true
+    message: "Cannot patch files with FOCI auth token references. Use the designated pm_os tools which handle authentication internally."

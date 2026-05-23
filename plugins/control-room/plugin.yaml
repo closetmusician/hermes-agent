@@ -1,0 +1,7 @@
+name: control-room
+version: 0.1.0
+description: "Audit logging and policy enforcement for tool calls. Tracks all tool invocations in SQLite, evaluates YAML-defined policies with preconditions and workflow state, and exposes HTTP monitoring endpoints."
+author: NousResearch
+hooks:
+  - pre_tool_call
+  - post_tool_call
