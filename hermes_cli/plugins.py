@@ -169,6 +169,17 @@ VALID_HOOKS: Set[str] = {
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
+# Hardcoded set of security plugins that MUST load unconditionally.
+# These cannot be disabled via plugins.disabled or omitted from
+# plugins.enabled. If they fail to load, the system fails closed
+# (disables dangerous tools). This is a defense-in-depth backstop —
+# even if someone removes ``mandatory: true`` from the plugin YAML
+# manifest, these plugins will still be treated as mandatory.
+MANDATORY_SECURITY_PLUGINS: frozenset = frozenset({
+    "control-room",
+    "email-send-guard",
+})
+
 _NS_PARENT = "hermes_plugins"
 
 
@@ -265,6 +276,11 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # When True, the plugin is mandatory — it loads unconditionally,
+    # cannot be disabled via config, and triggers fail-closed behavior
+    # if it crashes during register(). Set via ``mandatory: true`` in
+    # plugin.yaml or via the hardcoded MANDATORY_SECURITY_PLUGINS set.
+    mandatory: bool = False
 
 
 @dataclass
@@ -782,6 +798,9 @@ class PluginManager:
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
+        # Tracks mandatory plugins that failed to load. Callers can
+        # inspect this to decide whether to disable dangerous tools.
+        self.mandatory_load_failures: Dict[str, str] = {}
 
     # -----------------------------------------------------------------------
     # Public
@@ -804,6 +823,7 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._context_engine = None
+            self.mandatory_load_failures.clear()
         self._discovered = True
 
         manifests: List[PluginManifest] = []
@@ -874,6 +894,19 @@ class PluginManager:
             winners[manifest.key or manifest.name] = manifest
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+
+            # Mandatory security plugins load unconditionally — they
+            # cannot be disabled via config and don't need plugins.enabled.
+            # On load failure they trigger fail-closed behavior.
+            if manifest.mandatory:
+                if lookup_key in disabled or manifest.name in disabled:
+                    logger.warning(
+                        "Ignoring plugins.disabled for mandatory plugin '%s' "
+                        "— security plugins cannot be disabled via config",
+                        lookup_key,
+                    )
+                self._load_mandatory_plugin(manifest)
+                continue
 
             # Explicit disable always wins (matches on key or on legacy
             # bare name for back-compat with existing user configs).
@@ -1111,6 +1144,13 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            # A plugin is mandatory if its YAML says so OR if it appears
+            # in the hardcoded MANDATORY_SECURITY_PLUGINS set (defense-in-depth).
+            is_mandatory = bool(data.get("mandatory", False)) or (
+                key in MANDATORY_SECURITY_PLUGINS
+                or name in MANDATORY_SECURITY_PLUGINS
+            )
+
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1123,6 +1163,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                mandatory=is_mandatory,
             )
         except Exception as exc:
             logger.warning(
@@ -1232,6 +1273,27 @@ class PluginManager:
             )
 
         self._plugins[manifest.key or manifest.name] = loaded
+
+    def _load_mandatory_plugin(self, manifest: PluginManifest) -> None:
+        """Load a mandatory security plugin with fail-closed error handling.
+
+        Delegates to ``_load_plugin`` for the actual import/register, then
+        inspects the result. If the plugin failed to load, records the
+        failure in ``mandatory_load_failures`` and logs at CRITICAL level
+        so operators cannot miss it.
+        """
+        self._load_plugin(manifest)
+        lookup_key = manifest.key or manifest.name
+        loaded = self._plugins.get(lookup_key)
+        if loaded and not loaded.enabled:
+            # Mandatory plugin failed to load — record for fail-closed.
+            error_msg = loaded.error or "unknown error"
+            self.mandatory_load_failures[lookup_key] = error_msg
+            logger.critical(
+                "MANDATORY security plugin '%s' failed to load: %s  "
+                "— dangerous tools may be disabled as a safety measure",
+                lookup_key, error_msg,
+            )
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
