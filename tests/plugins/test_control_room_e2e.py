@@ -745,3 +745,171 @@ class TestEmailBlockPolicies:
             "send_message", {"target": "email:user@test.com"},
         )
         assert result is None
+
+    # -- pm_os email tool blocking ---------------------------------------------
+
+    def test_terminal_outlook_send_mail_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal invoking outlook-send-mail.js is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal",
+            {"command": "node ~/Code/pm_os/bin/outlook-send-mail.js --to foo@bar.com --subject test --body hi"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_terminal_outlook_read_mail_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal invoking outlook-read-mail.js is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal",
+            {"command": "node ~/Code/pm_os/bin/outlook-read-mail.js"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# Token read-deny policies (terminal, write_file, patch, execute_code)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenReadDenyPolicies:
+    """E2E tests for FOCI token read-deny policies.
+
+    Loads all four token-read-deny policy files from
+    plugins/control-room/policies/ and verifies that references to
+    FOCI token file paths are blocked while normal operations pass.
+    """
+
+    @pytest.fixture()
+    def cr_token_deny(self, tmp_path: Path) -> ControlRoom:
+        """ControlRoom with all bundled token-read-deny policies loaded."""
+        policy_src = (
+            Path(__file__).resolve().parent.parent.parent
+            / "plugins" / "control-room" / "policies"
+        )
+        pdir = tmp_path / "policies"
+        pdir.mkdir()
+
+        for name in (
+            "terminal-token-read-deny",
+            "writefile-token-read-deny",
+            "patch-token-read-deny",
+            "execute-code-token-read-deny",
+        ):
+            src = policy_src / f"{name}.yaml"
+            (pdir / f"{name}.yaml").write_text(
+                src.read_text(encoding="utf-8"), encoding="utf-8",
+            )
+
+        return ControlRoom(db_path=tmp_path / "audit.db", policy_dir=pdir)
+
+    # -- Blocked scenarios ---------------------------------------------------
+
+    def test_terminal_cat_foci_token_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """terminal with 'cat ~/.pm-os-foci-token.json' is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "terminal",
+            {"command": "cat ~/.pm-os-foci-token.json"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_terminal_cat_office_token_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """terminal with 'cat ~/.pm-os-foci-office-token.json' is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "terminal",
+            {"command": "cat ~/.pm-os-foci-office-token.json"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_terminal_node_script_reading_token_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """terminal running a node script that reads the token file is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "terminal",
+            {"command": "node -e \"const t = require('fs').readFileSync('pm-os-foci-token.json')\""},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_write_file_token_reference_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """write_file with content referencing pm-os-foci-token is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "write_file",
+            {"content": "const token = JSON.parse(fs.readFileSync('~/.pm-os-foci-token.json'))"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_write_file_office_token_reference_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """write_file with content referencing pm-os-foci-office-token is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "write_file",
+            {"content": "token_path = os.path.expanduser('~/.pm-os-foci-office-token.json')"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_patch_token_reference_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """patch with new_string referencing pm-os-foci-token is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "patch",
+            {"new_string": "const creds = require('./pm-os-foci-token.json')"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_patch_content_token_reference_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """patch with patch field referencing pm-os-foci-office-token is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "patch",
+            {"patch": "+token_file = 'pm-os-foci-office-token.json'"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_execute_code_token_reference_blocked(self, cr_token_deny: ControlRoom) -> None:
+        """execute_code with code reading pm-os-foci-token is blocked."""
+        result = cr_token_deny.pre_tool_call(
+            "execute_code",
+            {"code": "import json; t = json.load(open('pm-os-foci-token.json'))"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    # -- Passthrough scenarios -----------------------------------------------
+
+    def test_terminal_ls_allowed(self, cr_token_deny: ControlRoom) -> None:
+        """terminal with 'ls -la' passes through (no token pattern)."""
+        result = cr_token_deny.pre_tool_call(
+            "terminal", {"command": "ls -la"},
+        )
+        assert result is None
+
+    def test_terminal_cat_other_file_allowed(self, cr_token_deny: ControlRoom) -> None:
+        """terminal with 'cat config.json' passes through."""
+        result = cr_token_deny.pre_tool_call(
+            "terminal", {"command": "cat config.json"},
+        )
+        assert result is None
+
+    def test_write_file_normal_code_allowed(self, cr_token_deny: ControlRoom) -> None:
+        """write_file with innocent content passes through."""
+        result = cr_token_deny.pre_tool_call(
+            "write_file", {"content": "console.log('hello world')"},
+        )
+        assert result is None
+
+    def test_patch_normal_code_allowed(self, cr_token_deny: ControlRoom) -> None:
+        """patch with harmless new_string passes through."""
+        result = cr_token_deny.pre_tool_call(
+            "patch", {"new_string": "return result"},
+        )
+        assert result is None
+
+    def test_execute_code_normal_allowed(self, cr_token_deny: ControlRoom) -> None:
+        """execute_code with innocent Python code passes through."""
+        result = cr_token_deny.pre_tool_call(
+            "execute_code", {"code": "print('hello')"},
+        )
+        assert result is None
