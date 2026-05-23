@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import threading
@@ -146,6 +147,78 @@ def invalidate_check_fn_cache() -> None:
     affect tool availability (e.g. ``hermes tools enable``)."""
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Handler call-style detection
+#
+# Built-in tool handlers use ``def handler(args: dict, **kw)`` — they
+# receive the entire args dict as a single positional argument.  Plugin
+# handlers may instead declare typed keyword parameters like
+# ``def handler(body: str, recipient: str)``.  dispatch() must unpack
+# the args dict as ``**args`` for those handlers so each parameter gets
+# its own value.  Without this, ``body`` receives the whole dict and
+# downstream calls like ``body.encode()`` crash with AttributeError.
+#
+# Detection: inspect the handler's first positional parameter name.  If
+# it is literally ``args`` (the built-in convention), pass the dict
+# positionally.  Otherwise, unpack as keyword arguments.  Results are
+# cached per handler callable since signatures don't change at runtime.
+# ---------------------------------------------------------------------------
+
+_handler_style_cache: Dict[Callable, bool] = {}
+_handler_style_cache_lock = threading.Lock()
+
+
+def _handler_wants_args_dict(handler: Callable) -> bool:
+    """Return True when the handler follows the built-in ``(args, **kw)`` convention.
+
+    Returns False for plugin-style handlers with named keyword parameters,
+    signalling that the args dict should be unpacked as ``**args``.
+    Defaults to True (built-in style) when introspection fails so that
+    existing handlers are never broken by a detection edge case.
+    """
+    with _handler_style_cache_lock:
+        cached = _handler_style_cache.get(handler)
+        if cached is not None:
+            return cached
+
+    try:
+        sig = inspect.signature(handler)
+        params = list(sig.parameters.values())
+        # Handlers with no positional params or whose first positional
+        # param is named ``args`` follow the built-in convention.
+        positional_kinds = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        first_positional = next(
+            (p for p in params if p.kind in positional_kinds), None
+        )
+        result = first_positional is not None and first_positional.name == "args"
+    except (ValueError, TypeError):
+        # If introspection fails (C extensions, builtins, etc.), assume
+        # built-in convention to preserve backward compatibility.
+        result = True
+
+    with _handler_style_cache_lock:
+        _handler_style_cache[handler] = result
+    return result
+
+
+def _resolve_handler_call(
+    handler: Callable, args: dict, kwargs: dict
+) -> tuple[tuple, dict]:
+    """Decide how to call a handler based on its signature convention.
+
+    Returns ``(positional_args_tuple, keyword_args_dict)`` ready to be
+    splatted into the handler call.  Built-in handlers get
+    ``(args_dict,), kwargs``.  Plugin handlers get ``(), {**args, **kwargs}``.
+    """
+    if _handler_wants_args_dict(handler):
+        return (args,), kwargs
+    merged = {**args, **kwargs} if kwargs else dict(args)
+    return (), merged
 
 
 class ToolRegistry:
@@ -391,6 +464,12 @@ class ToolRegistry:
         """Execute a tool handler by name.
 
         * Async handlers are bridged automatically via ``_run_async()``.
+        * Plugin handlers whose first parameter is NOT named ``args``
+          receive ``**args`` (keyword unpacking) so that handlers with
+          typed signatures like ``def handler(body: str, recipient: str)``
+          get individual values instead of the raw dict.  Built-in
+          handlers follow the ``def handler(args, **kw)`` convention and
+          continue to receive the dict positionally.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
@@ -398,10 +477,11 @@ class ToolRegistry:
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
         try:
+            call_args, call_kwargs = _resolve_handler_call(entry.handler, args, kwargs)
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                return _run_async(entry.handler(*call_args, **call_kwargs))
+            return entry.handler(*call_args, **call_kwargs)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
