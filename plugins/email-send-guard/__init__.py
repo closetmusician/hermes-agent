@@ -3,7 +3,7 @@ ABOUTME: Email send guard plugin for Hermes.
 ABOUTME: Blocks send_message(email) until draft is loaded, previewed, and
 ABOUTME: explicitly user-approved. State machine: EMPTY -> LOADED -> PREVIEWED
 ABOUTME: -> APPROVED -> ALLOWED. Approvals expire after 15 minutes.
-ABOUTME: Uses SHA256 body hashing to bind approval to exact content.
+ABOUTME: Uses SHA256 hashing over (recipient, body) to bind approval to exact content+target.
 """
 
 from __future__ import annotations
@@ -78,8 +78,35 @@ def _save_state(state: dict) -> None:
 
 
 def _body_hash(body: str) -> str:
-    """Compute SHA256 hex digest of a message body."""
+    """Compute SHA256 hex digest of a message body.
+
+    Used for draft identity — drafts are content-addressed by body alone
+    since the review step is about inspecting what will be sent.
+    """
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _extract_recipient(target: str) -> str:
+    """Extract the email recipient from a send_message target string.
+
+    Target format is "email:user@example.com" (case-insensitive prefix).
+    Returns the lowercased recipient, or empty string if unparseable.
+    """
+    parts = target.split(":", 1)
+    if len(parts) < 2:
+        return ""
+    return parts[1].strip().lower()
+
+
+def _approval_hash(recipient: str, body: str) -> str:
+    """Compute SHA256 hex digest binding approval to (recipient, body).
+
+    Approvals must be scoped to a specific recipient so that an approval
+    for safe@company.com cannot be replayed to evil@attacker.com with the
+    same body. The recipient is lowercased for consistency.
+    """
+    key = f"{recipient.lower()}\0{body}"
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -101,16 +128,18 @@ def _pre_tool_call(
     if not isinstance(args, dict):
         return None
     target = args.get("target", "")
-    if not isinstance(target, str) or not target.startswith("email"):
+    if not isinstance(target, str) or not target.lower().startswith("email"):
         return None
 
     # This is an email send -- enforce the state machine.
     body = args.get("message", "")
-    body_hash = _body_hash(body)
+    bh = _body_hash(body)
+    recipient = _extract_recipient(target)
+    ah = _approval_hash(recipient, body)
     state = _load_state()
 
-    # Gate 1: draft must be loaded
-    draft = state["drafts"].get(body_hash)
+    # Gate 1: draft must be loaded (keyed by body hash — content review)
+    draft = state["drafts"].get(bh)
     if not draft or "loaded_at" not in draft:
         return {
             "action": "block",
@@ -130,13 +159,16 @@ def _pre_tool_call(
             ),
         }
 
-    # Gate 3: user must have approved (and approval must not be expired)
-    approval = state["approvals"].get(body_hash)
+    # Gate 3: user must have approved (and approval must not be expired).
+    # Approval is keyed by hash(recipient, body) so an approval for one
+    # recipient cannot be replayed to send the same body to another.
+    approval = state["approvals"].get(ah)
     if not approval:
         return {
             "action": "block",
             "message": (
-                "Email send blocked: user approval required. "
+                "Email send blocked: user approval required for this "
+                "recipient+body combination. "
                 "Run /approve-email to approve this draft."
             ),
         }
@@ -157,13 +189,14 @@ def _pre_tool_call(
 # Registered tools (agent-callable)
 # ---------------------------------------------------------------------------
 
-def _email_load_draft(body: str = "", **_kw: Any) -> str:
+def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
     """Store a draft email body for review. Computes and returns the content hash.
 
     Usage: Agent calls this before sending any email. The hash identifies the
-    exact body content for preview and approval.
+    exact body content for preview and approval. Recipient is required so
+    the approval can be bound to the specific target.
     Gotchas: Overwrites any prior draft with the same hash. Sets current to
-    this draft.
+    this draft. Recipient is stored and used in the approval hash.
     """
     if not body:
         return json.dumps({"error": "body is required"})
@@ -172,6 +205,7 @@ def _email_load_draft(body: str = "", **_kw: Any) -> str:
     state = _load_state()
     state["drafts"][h] = {
         "body": body,
+        "recipient": recipient.strip().lower(),
         "loaded_at": time.time(),
         "previewed_at": None,
     }
@@ -182,6 +216,7 @@ def _email_load_draft(body: str = "", **_kw: Any) -> str:
         "status": "draft_loaded",
         "draft_id": h,
         "body_length": len(body),
+        "recipient": recipient.strip().lower(),
         "next_step": "Call email_show_preview to preview, then user approves via /approve-email",
     })
 
@@ -221,6 +256,8 @@ def _handle_approve(raw_args: str) -> str:
 
     Usage: /approve-email [draft_id]
     If no draft_id provided, approves the current (most recently loaded) draft.
+    Approval is bound to the (recipient, body) tuple stored in the draft so
+    it cannot be replayed to a different recipient.
     Gotchas: Only works after the draft has been loaded and previewed.
     """
     draft_id = raw_args.strip() if raw_args else ""
@@ -237,15 +274,22 @@ def _handle_approve(raw_args: str) -> str:
     if not draft.get("previewed_at"):
         return "Draft not previewed yet. Preview with email_show_preview first."
 
+    # Compute the approval key from (recipient, body) so the approval is
+    # bound to this specific recipient. If no recipient was stored (legacy
+    # drafts), fall back to body-only hash for backward compat.
+    recipient = draft.get("recipient", "")
+    ah = _approval_hash(recipient, draft["body"])
+
     now = time.time()
-    state["approvals"][draft_id] = {
+    state["approvals"][ah] = {
         "approved_at": now,
         "expires_at": now + APPROVAL_TTL_SECONDS,
     }
     _save_state(state)
 
+    recipient_note = f" for {recipient}" if recipient else ""
     return (
-        f"Email draft approved (id: {draft_id[:12]}...). "
+        f"Email draft approved{recipient_note} (id: {draft_id[:12]}...). "
         f"Approval valid for {APPROVAL_TTL_SECONDS // 60} minutes."
     )
 
@@ -260,6 +304,10 @@ _LOAD_DRAFT_SCHEMA = {
         "body": {
             "type": "string",
             "description": "The full email body text to store as a draft.",
+        },
+        "recipient": {
+            "type": "string",
+            "description": "The email recipient address (e.g. user@example.com). Used to bind approval to this specific recipient.",
         },
     },
     "required": ["body"],

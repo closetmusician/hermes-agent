@@ -254,7 +254,7 @@ class TestGateApproved:
 class TestAllGatesPass:
     def test_allows_when_all_gates_pass(self, pre_hook, load_draft, show_preview, approve_cmd):
         body = "Fully approved draft"
-        load_draft(body=body)
+        load_draft(body=body, recipient="ok@example.com")
         draft_id = _body_hash(body)
         show_preview(draft_id=draft_id)
         approve_cmd(draft_id)
@@ -272,19 +272,22 @@ class TestAllGatesPass:
 class TestExpiredApproval:
     def test_blocks_when_approval_expired(self, plugin, pre_hook, load_draft, show_preview, approve_cmd):
         body = "Expiring draft"
-        load_draft(body=body)
+        recipient = "late@example.com"
+        load_draft(body=body, recipient=recipient)
         draft_id = _body_hash(body)
         show_preview(draft_id=draft_id)
         approve_cmd(draft_id)
 
-        # Manually expire the approval by backdating expires_at
+        # Manually expire the approval by backdating expires_at.
+        # Approval key is now _approval_hash(recipient, body), not draft_id.
+        ah = plugin._approval_hash(recipient, body)
         state = plugin._load_state()
-        state["approvals"][draft_id]["expires_at"] = time.time() - 1
+        state["approvals"][ah]["expires_at"] = time.time() - 1
         plugin._save_state(state)
 
         result = pre_hook(
             tool_name="send_message",
-            args={"target": "email:late@example.com", "message": body},
+            args={"target": f"email:{recipient}", "message": body},
         )
         assert result is not None
         assert result["action"] == "block"
@@ -340,7 +343,8 @@ class TestShowPreview:
 class TestApproveCommand:
     def test_sets_approval_with_ttl(self, plugin, load_draft, show_preview, approve_cmd):
         body = "Approve me"
-        load_draft(body=body)
+        recipient = "test@example.com"
+        load_draft(body=body, recipient=recipient)
         draft_id = _body_hash(body)
         show_preview(draft_id=draft_id)
 
@@ -348,9 +352,11 @@ class TestApproveCommand:
         result = approve_cmd(draft_id)
         after = time.time()
 
+        # Approval is now keyed by hash(recipient, body), not draft_id
+        ah = plugin._approval_hash(recipient, body)
         state = plugin._load_state()
-        assert draft_id in state["approvals"]
-        approval = state["approvals"][draft_id]
+        assert ah in state["approvals"]
+        approval = state["approvals"][ah]
         assert before <= approval["approved_at"] <= after
         # TTL is 15 minutes
         assert approval["expires_at"] - approval["approved_at"] == pytest.approx(
@@ -359,15 +365,17 @@ class TestApproveCommand:
 
     def test_approve_current_draft_when_no_id(self, plugin, load_draft, show_preview, approve_cmd):
         body = "Current draft"
-        load_draft(body=body)
+        recipient = "current@example.com"
+        load_draft(body=body, recipient=recipient)
         draft_id = _body_hash(body)
         show_preview(draft_id=draft_id)
 
         # Pass empty string (no draft_id) -- should approve current
         approve_cmd("")
 
+        ah = plugin._approval_hash(recipient, body)
         state = plugin._load_state()
-        assert draft_id in state["approvals"]
+        assert ah in state["approvals"]
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +386,7 @@ class TestHashInvalidation:
     def test_different_body_not_approved(self, pre_hook, load_draft, show_preview, approve_cmd):
         # Approve draft A
         body_a = "Original body"
-        load_draft(body=body_a)
+        load_draft(body=body_a, recipient="x@y.com")
         show_preview(draft_id=_body_hash(body_a))
         approve_cmd(_body_hash(body_a))
 
@@ -394,7 +402,7 @@ class TestHashInvalidation:
     def test_must_reload_for_changed_body(self, pre_hook, load_draft, show_preview, approve_cmd):
         # Full flow for body A
         body_a = "Body A"
-        load_draft(body=body_a)
+        load_draft(body=body_a, recipient="x@y.com")
         show_preview(draft_id=_body_hash(body_a))
         approve_cmd(_body_hash(body_a))
 
@@ -406,7 +414,7 @@ class TestHashInvalidation:
 
         # Body B needs its own full flow
         body_b = "Body B"
-        load_draft(body=body_b)
+        load_draft(body=body_b, recipient="x@y.com")
         show_preview(draft_id=_body_hash(body_b))
         approve_cmd(_body_hash(body_b))
 
@@ -414,3 +422,113 @@ class TestHashInvalidation:
             tool_name="send_message",
             args={"target": "email:x@y.com", "message": body_b},
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# 12. Case-insensitive target matching (Bug 1: case-sensitivity bypass)
+# ---------------------------------------------------------------------------
+
+class TestCaseInsensitiveTarget:
+    """Guard must catch email targets regardless of casing.
+
+    send_message_tool.py normalizes `target.split(":")[0].strip().lower()`
+    AFTER hooks fire. So "Email:victim@evil.com" bypasses a guard that only
+    checks `target.startswith("email")` (lowercase). The guard must
+    case-fold the target before the startswith check.
+    """
+
+    def test_capital_email_is_caught(self, pre_hook):
+        """target="Email:foo@bar.com" must be intercepted by the guard."""
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "Email:foo@bar.com", "message": "pwned"},
+        )
+        assert result is not None, (
+            "Guard failed to intercept 'Email:foo@bar.com' — "
+            "case-sensitivity bypass"
+        )
+        assert result["action"] == "block"
+
+    def test_all_caps_email_is_caught(self, pre_hook):
+        """target="EMAIL:foo@bar.com" must be intercepted by the guard."""
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "EMAIL:foo@bar.com", "message": "pwned"},
+        )
+        assert result is not None, (
+            "Guard failed to intercept 'EMAIL:foo@bar.com' — "
+            "case-sensitivity bypass"
+        )
+        assert result["action"] == "block"
+
+    def test_mixed_case_email_is_caught(self, pre_hook):
+        """target="eMaIl:foo@bar.com" must be intercepted by the guard."""
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "eMaIl:foo@bar.com", "message": "pwned"},
+        )
+        assert result is not None, (
+            "Guard failed to intercept 'eMaIl:foo@bar.com' — "
+            "case-sensitivity bypass"
+        )
+        assert result["action"] == "block"
+
+    def test_capital_email_full_flow_works(
+        self, pre_hook, load_draft, show_preview, approve_cmd
+    ):
+        """A properly approved draft must pass even with capitalized target."""
+        body = "Legit email"
+        load_draft(body=body, recipient="legit@example.com")
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "Email:legit@example.com", "message": body},
+        )
+        assert result is None, "Approved email blocked with capitalized target"
+
+
+# ---------------------------------------------------------------------------
+# 13. Approval bound to (recipient, subject, body) not just body
+#     (Bug 2: approval replay across recipients)
+# ---------------------------------------------------------------------------
+
+class TestApprovalReplayAcrossRecipients:
+    """Approval for body+recipient_A must NOT transfer to recipient_B.
+
+    The approval hash must include the recipient (and subject when present)
+    so that an attacker cannot get a body approved for a safe recipient
+    then replay it to a dangerous one.
+    """
+
+    def test_approval_not_transferable_to_different_recipient(
+        self, pre_hook, load_draft, show_preview, approve_cmd
+    ):
+        """Approve body for safe@co.com, then send same body to evil@attacker.com."""
+        body = "Quarterly report attached"
+
+        # Full approval flow for safe recipient
+        load_draft(body=body, recipient="safe@company.com")
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        # Verify it works for the original target
+        result_safe = pre_hook(
+            tool_name="send_message",
+            args={"target": "email:safe@company.com", "message": body},
+        )
+        assert result_safe is None, "Approved email blocked for original recipient"
+
+        # Now try the SAME body but a DIFFERENT recipient -- must be blocked
+        result_evil = pre_hook(
+            tool_name="send_message",
+            args={"target": "email:evil@attacker.com", "message": body},
+        )
+        assert result_evil is not None, (
+            "SECURITY BUG: approval for safe@company.com was replayed to "
+            "evil@attacker.com — approval must bind to recipient"
+        )
+        assert result_evil["action"] == "block"

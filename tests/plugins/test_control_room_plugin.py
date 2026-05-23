@@ -558,3 +558,239 @@ class TestControlRoom:
         assert rows[0]["result"] == "contents"
         assert rows[0]["duration_ms"] is not None
         assert rows[0]["duration_ms"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Gap 1: Token file read-deny via read_file and search_files
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFileReadDeny:
+    """Block read_file/search_files access to credential files.
+
+    Hermes can bypass the terminal-level get-foci-token.js block by using
+    read_file to read the raw JSON token file, or search_files to discover
+    token locations.  These tests verify the hardcoded blocks close that gap.
+    """
+
+    def test_read_file_foci_token_json_blocked(self, tmp_path: Path) -> None:
+        """read_file targeting ~/.pm-os-foci-token.json is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/Users/someone/.pm-os-foci-token.json"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "ask the user" in result["message"].lower() or "permission" in result["message"].lower()
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_read_file_foci_token_substring_blocked(self, tmp_path: Path) -> None:
+        """read_file with any path containing 'foci-token' is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/tmp/foci-token-cache.json"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_read_file_outlook_send_mail_js_blocked(self, tmp_path: Path) -> None:
+        """read_file targeting outlook-send-mail.js is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/Users/someone/Code/pm_os/bin/outlook-send-mail.js"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_read_file_auth_json_in_cred_dir_blocked(self, tmp_path: Path) -> None:
+        """read_file targeting auth.json in credential-like directories is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/Users/someone/.config/microsoft/auth.json"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_read_file_normal_path_allowed(self, tmp_path: Path) -> None:
+        """read_file on a normal file is not blocked by credential guards."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/tmp/my-project/main.py"},
+        )
+        assert result is None
+
+    def test_search_files_foci_token_pattern_blocked(self, tmp_path: Path) -> None:
+        """search_files with a pattern targeting token files is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "search_files",
+            {"pattern": "foci-token", "path": "/Users/someone"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        rows = cr.db.get_audit_rows(phase="blocked")
+        assert len(rows) == 1
+
+    def test_search_files_pm_os_foci_token_blocked(self, tmp_path: Path) -> None:
+        """search_files targeting .pm-os-foci-token is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "search_files",
+            {"pattern": "pm-os-foci-token"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_search_files_outlook_send_mail_blocked(self, tmp_path: Path) -> None:
+        """search_files with pattern targeting outlook-send-mail is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "search_files",
+            {"pattern": "outlook-send-mail"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_search_files_auth_json_blocked(self, tmp_path: Path) -> None:
+        """search_files with pattern targeting auth.json is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "search_files",
+            {"pattern": "auth.json", "path": "/Users/someone/.config"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+
+    def test_search_files_normal_pattern_allowed(self, tmp_path: Path) -> None:
+        """search_files with a normal pattern is not blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "search_files",
+            {"pattern": "def main", "path": "/tmp/project"},
+        )
+        assert result is None
+
+    def test_block_message_redirects_to_user(self, tmp_path: Path) -> None:
+        """Block messages for credential access tell hermes to ask the user."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "read_file",
+            {"path": "/Users/someone/.pm-os-foci-token.json"},
+        )
+        assert result is not None
+        msg = result["message"].lower()
+        # Must redirect to asking the user, not just say "blocked"
+        assert "ask" in msg or "permission" in msg
+        assert "user" in msg
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: Fail-closed on guard exceptions
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosed:
+    """When pre_tool_call internals raise, the tool call must be BLOCKED.
+
+    The current code in model_tools.py catches hook exceptions and continues,
+    making guards a no-op if hermes corrupts state files. The fix wraps the
+    plugin's own pre_tool_call logic in try/except and returns a block on
+    ANY internal exception.
+    """
+
+    def test_exception_in_policy_evaluation_blocks(self, tmp_path: Path) -> None:
+        """If PolicyEngine.evaluate() raises, the tool call is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        # Sabotage the engine to simulate corruption
+        original_evaluate = cr.engine.evaluate
+        def exploding_evaluate(tool_name, args):
+            raise RuntimeError("Corrupted guard state")
+        cr.engine.evaluate = exploding_evaluate
+
+        result = cr.pre_tool_call("terminal", {"command": "ls"})
+        assert result is not None
+        assert result["action"] == "block"
+        assert "guard error" in result["message"].lower() or "error" in result["message"].lower()
+        # Must tell hermes to ask for permission
+        msg = result["message"].lower()
+        assert "ask" in msg or "permission" in msg
+
+    def test_exception_in_audit_logging_blocks(self, tmp_path: Path) -> None:
+        """If AuditDB.log_audit() raises, the tool call is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        # Sabotage the db to simulate corruption
+        cr.db._conn.close()
+
+        result = cr.pre_tool_call("read_file", {"path": "/tmp/normal.txt"})
+        assert result is not None
+        assert result["action"] == "block"
+        # Must redirect to asking user
+        msg = result["message"].lower()
+        assert "ask" in msg or "permission" in msg
+
+    def test_exception_preserves_hardcoded_blocks(self, tmp_path: Path) -> None:
+        """Hardcoded blocks still fire even when the engine is broken.
+
+        The exception handler is a catch-all AFTER the hardcoded checks,
+        so hardcoded blocks (like write-protect) should still return their
+        specific messages, not the generic guard-error message.
+        """
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        # Even with a broken engine, hardcoded blocks work
+        result = cr.pre_tool_call(
+            "write_file",
+            {"path": "plugins/control-room/__init__.py"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert "write-protected" in result["message"]

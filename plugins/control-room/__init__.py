@@ -496,12 +496,66 @@ class ControlRoom:
 
     # -- hook callbacks -----------------------------------------------------
 
+    # Credential file patterns blocked in read_file and search_files.
+    # Hermes can bypass the terminal-level get-foci-token.js block by
+    # reading the raw token file or searching for token locations.
+    _CREDENTIAL_PATH_PATTERNS: tuple[str, ...] = (
+        "foci-token",
+        "pm-os-foci-token",
+        "outlook-send-mail",
+        "outlook-read-mail",
+    )
+
+    # Auth files in credential directories (more specific -- needs the
+    # full filename to avoid false positives on generic names).
+    _CREDENTIAL_AUTH_FILES: tuple[str, ...] = (
+        "auth.json",
+    )
+
+    _CREDENTIAL_BLOCK_MSG = (
+        "[control-room] Access to credential/token files is blocked. "
+        "Auth tokens and credentials are managed internally. "
+        "If you need to perform this action, please ask the user for "
+        "explicit permission instead of trying to work around security controls."
+    )
+
+    _GUARD_ERROR_BLOCK_MSG = (
+        "[control-room] Tool call blocked due to a guard error. "
+        "If you need to perform this action, please ask the user for "
+        "explicit permission instead of trying to work around security controls."
+    )
+
+    def _is_credential_path(self, path: str) -> bool:
+        """Return True if path targets a known credential/token file.
+
+        Checks for credential patterns in the path string and auth files
+        in config/credential-like directories.
+        """
+        path_lower = path.lower()
+        for pattern in self._CREDENTIAL_PATH_PATTERNS:
+            if pattern in path_lower:
+                return True
+        for auth_file in self._CREDENTIAL_AUTH_FILES:
+            if path_lower.endswith(auth_file):
+                # Only block auth.json in credential-adjacent directories
+                # to avoid false positives on unrelated auth.json files.
+                if any(seg in path_lower for seg in (
+                    ".config/", "credentials", "microsoft", "azure",
+                    ".hermes/", "mcp-tokens", "pm_os", "pm-os",
+                )):
+                    return True
+        return False
+
     def pre_tool_call(
         self, tool_name: str, args: dict, task_id: str = "", session_id: str = "", **kwargs: Any
     ) -> Optional[dict]:
         """pre_tool_call hook: audit + policy check.
 
         Returns {"action": "block", "message": ...} if blocked, else None.
+
+        Fail-closed: if any internal logic raises an exception, the tool
+        call is BLOCKED rather than allowed through. This prevents hermes
+        from bypassing guards by corrupting state files to cause exceptions.
         """
         # Hardcoded block: pm_os outlook email JS tools must not be invoked
         # directly. Email goes through send_message → email-send-guard → Graph API.
@@ -567,26 +621,74 @@ class ControlRoom:
                     "message": "[control-room] Direct use of get-foci-token.js is blocked. Auth tokens are managed internally by the Graph API email backend.",
                 }
 
-        # Evaluate policies
-        decision, reason, policy_name = self.engine.evaluate(tool_name, args)
+        # Hardcoded block: prevent read_file from accessing credential files.
+        # Closes the gap where hermes bypasses terminal-level token blocks
+        # by reading the raw token JSON or credential files directly.
+        if tool_name == "read_file":
+            file_path = args.get("path") or ""
+            if self._is_credential_path(file_path):
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result="Credential file read blocked",
+                    task_id=task_id, session_id=session_id,
+                )
+                return {"action": "block", "message": self._CREDENTIAL_BLOCK_MSG}
 
-        if decision == "block":
+        # Hardcoded block: prevent search_files from discovering credential files.
+        # Hermes can use search_files to find token file locations and then
+        # read them. Block search patterns that target known credential paths.
+        if tool_name == "search_files":
+            pattern = args.get("pattern") or ""
+            search_path = args.get("path") or ""
+            combined = f"{pattern} {search_path}".lower()
+            for cred_pattern in self._CREDENTIAL_PATH_PATTERNS:
+                if cred_pattern in combined:
+                    self.db.log_audit(
+                        tool_name, args, "blocked",
+                        result="Credential file search blocked",
+                        task_id=task_id, session_id=session_id,
+                    )
+                    return {"action": "block", "message": self._CREDENTIAL_BLOCK_MSG}
+            for auth_file in self._CREDENTIAL_AUTH_FILES:
+                if auth_file in combined:
+                    self.db.log_audit(
+                        tool_name, args, "blocked",
+                        result="Credential file search blocked",
+                        task_id=task_id, session_id=session_id,
+                    )
+                    return {"action": "block", "message": self._CREDENTIAL_BLOCK_MSG}
+
+        # Fail-closed wrapper: policy evaluation and audit logging run
+        # inside try/except. If ANYTHING raises (corrupted DB, sabotaged
+        # state files, bad policy YAML), the tool call is BLOCKED rather
+        # than silently allowed through.
+        try:
+            # Evaluate policies
+            decision, reason, policy_name = self.engine.evaluate(tool_name, args)
+
+            if decision == "block":
+                self.db.log_audit(
+                    tool_name, args, "blocked",
+                    result=reason, task_id=task_id, session_id=session_id,
+                )
+                return {"action": "block", "message": f"[control-room] {reason}"}
+
+            # Record pre-phase audit
             self.db.log_audit(
-                tool_name, args, "blocked",
-                result=reason, task_id=task_id, session_id=session_id,
+                tool_name, args, "pre", task_id=task_id, session_id=session_id,
             )
-            return {"action": "block", "message": f"[control-room] {reason}"}
+            # Track start time for duration
+            with self._inflight_lock:
+                self._inflight[f"{tool_name}:{task_id}"] = time.monotonic()
 
-        # Record pre-phase audit
-        self.db.log_audit(
-            tool_name, args, "pre", task_id=task_id, session_id=session_id,
-        )
-        # Track start time for duration
-        call_key = f"{tool_name}:{task_id}:{time.monotonic()}"
-        with self._inflight_lock:
-            self._inflight[f"{tool_name}:{task_id}"] = time.monotonic()
+            return None
 
-        return None
+        except Exception as exc:
+            logger.error(
+                "control-room guard error (fail-closed): %s — blocking tool call %s",
+                exc, tool_name,
+            )
+            return {"action": "block", "message": self._GUARD_ERROR_BLOCK_MSG}
 
     def post_tool_call(
         self,
