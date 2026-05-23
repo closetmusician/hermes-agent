@@ -833,13 +833,13 @@ def handle_function_call(
             # Prefer the caller-provided list so subagents can't overwrite
             # the parent's tool set via the process-global.
             sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-            result = registry.dispatch(
+            result = registry._dispatch_unchecked(
                 function_name, function_args,
                 task_id=task_id,
                 enabled_tools=sandbox_enabled,
             )
         else:
-            result = registry.dispatch(
+            result = registry._dispatch_unchecked(
                 function_name, function_args,
                 task_id=task_id,
                 user_task=user_task,
