@@ -407,8 +407,8 @@ class TestControlRoom:
         rows = cr.db.get_audit_rows(phase="blocked")
         assert len(rows) == 1
 
-    def test_pre_tool_call_blocks_outlook_read_mail(self, tmp_path: Path) -> None:
-        """Hardcoded block: terminal invoking outlook-read-mail.js is blocked."""
+    def test_pre_tool_call_allows_outlook_read_mail(self, tmp_path: Path) -> None:
+        """outlook-read-mail.js is allowed (read is not blocked, only send/reply)."""
         cr = ControlRoom(
             db_path=tmp_path / "audit.db",
             policy_dir=tmp_path / "no-policies",
@@ -416,6 +416,18 @@ class TestControlRoom:
         result = cr.pre_tool_call(
             "terminal",
             {"command": "node outlook-read-mail.js"},
+        )
+        assert result is None
+
+    def test_pre_tool_call_blocks_outlook_reply_mail(self, tmp_path: Path) -> None:
+        """Hardcoded block: terminal invoking outlook-reply-mail.js is blocked."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node outlook-reply-mail.js --to foo@bar.com"},
         )
         assert result is not None
         assert result["action"] == "block"
@@ -439,6 +451,18 @@ class TestControlRoom:
         assert "send_message" in result["message"]
         rows = cr.db.get_audit_rows(phase="blocked")
         assert len(rows) == 1
+
+    def test_pre_tool_call_allows_pm_os_outlook_read(self, tmp_path: Path) -> None:
+        """pm_os/bin/outlook-read-mail.js is allowed (read exemption)."""
+        cr = ControlRoom(
+            db_path=tmp_path / "audit.db",
+            policy_dir=tmp_path / "no-policies",
+        )
+        result = cr.pre_tool_call(
+            "terminal",
+            {"command": "node ~/Code/pm_os/bin/outlook-read-mail.js --folder inbox"},
+        )
+        assert result is None
 
     def test_pre_tool_call_allows_normal_terminal(self, tmp_path: Path) -> None:
         """Hardcoded block does not affect normal terminal commands."""

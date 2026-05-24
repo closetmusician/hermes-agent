@@ -11,8 +11,8 @@ triggers:
     args:
       command:
         operator: regex
-        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s|outlook-send-mail|outlook-read-mail"
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s|outlook-send-mail|outlook-reply-mail"
 preconditions:
   - state_key: email.terminal_send_override
     required: true
-    message: "Direct email sending via terminal is not allowed. Use send_message tool with email-send-guard approval workflow."
+    message: "Email cannot be sent via terminal commands (curl, sendmail, python smtp, etc.). To send email:\n1. Call send_message(target='email:recipient@example.com', message='your message')\n2. The system will prompt you to call email_load_draft to create a draft\n3. Call email_show_preview to review the draft\n4. The user will run /approve-email to approve\n5. Then call send_message again to send the approved draft"

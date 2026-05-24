@@ -15,4 +15,4 @@ triggers:
 preconditions:
   - state_key: email.terminal_send_override
     required: true
-    message: "Cannot write files containing email-sending code. Use send_message tool with email-send-guard approval workflow."
+    message: "Files containing email-sending code cannot be written. To send email:\n1. Call send_message(target='email:recipient@example.com', message='your message')\n2. The system will prompt you to call email_load_draft to create a draft\n3. Call email_show_preview to review the draft\n4. The user will run /approve-email to approve\n5. Then call send_message again to send the approved draft"

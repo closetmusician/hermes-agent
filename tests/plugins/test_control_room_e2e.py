@@ -757,11 +757,19 @@ class TestEmailBlockPolicies:
         assert result is not None
         assert result["action"] == "block"
 
-    def test_terminal_outlook_read_mail_blocked(self, cr_email_block: ControlRoom) -> None:
-        """terminal invoking outlook-read-mail.js is blocked."""
+    def test_terminal_outlook_read_mail_allowed(self, cr_email_block: ControlRoom) -> None:
+        """terminal invoking outlook-read-mail.js is allowed (read not blocked)."""
         result = cr_email_block.pre_tool_call(
             "terminal",
             {"command": "node ~/Code/pm_os/bin/outlook-read-mail.js"},
+        )
+        assert result is None
+
+    def test_terminal_outlook_reply_mail_blocked(self, cr_email_block: ControlRoom) -> None:
+        """terminal invoking outlook-reply-mail.js is blocked."""
+        result = cr_email_block.pre_tool_call(
+            "terminal",
+            {"command": "node ~/Code/pm_os/bin/outlook-reply-mail.js --to foo@bar.com"},
         )
         assert result is not None
         assert result["action"] == "block"

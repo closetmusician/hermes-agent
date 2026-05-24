@@ -503,7 +503,7 @@ class ControlRoom:
         "foci-token",
         "pm-os-foci-token",
         "outlook-send-mail",
-        "outlook-read-mail",
+        "outlook-reply-mail",
     )
 
     # Auth files in credential directories (more specific -- needs the
@@ -513,14 +513,14 @@ class ControlRoom:
     )
 
     _CREDENTIAL_BLOCK_MSG = (
-        "[control-room] Access to credential/token files is blocked. "
+        "Access to credential/token files is blocked. "
         "Auth tokens and credentials are managed internally. "
         "If you need to perform this action, please ask the user for "
         "explicit permission instead of trying to work around security controls."
     )
 
     _GUARD_ERROR_BLOCK_MSG = (
-        "[control-room] Tool call blocked due to a guard error. "
+        "Tool call blocked due to a guard error. "
         "If you need to perform this action, please ask the user for "
         "explicit permission instead of trying to work around security controls."
     )
@@ -561,7 +561,8 @@ class ControlRoom:
         # directly. Email goes through send_message → email-send-guard → Graph API.
         if tool_name == "terminal":
             cmd = args.get("command") or ""
-            if "outlook-send-mail" in cmd or "outlook-read-mail" in cmd or "pm_os/bin/outlook" in cmd:
+            if ("outlook-send-mail" in cmd or "outlook-reply-mail" in cmd
+                    or ("pm_os/bin/outlook" in cmd and "outlook-read" not in cmd)):
                 self.db.log_audit(
                     tool_name, args, "blocked",
                     result="Direct invocation of pm_os outlook JS tools blocked",
@@ -569,7 +570,16 @@ class ControlRoom:
                 )
                 return {
                     "action": "block",
-                    "message": "[control-room] Direct use of pm_os outlook JS tools is blocked. Use the send_message tool to send email — it routes through the email-send-guard approval workflow and Graph API backend automatically.",
+                    "message": (
+                        "Email cannot be sent by directly invoking outlook JS tools. To send email:\n"
+                        "1. Call send_message(target='email:recipient@example.com', message='your message')\n"
+                        "2. The system will prompt you to call email_load_draft to create a draft\n"
+                        "3. Call email_show_preview to review the draft\n"
+                        "4. The user will run /approve-email to approve\n"
+                        "5. Then call send_message again to send the approved draft\n"
+                        "To read email or run briefings, use skills like /pm-morning or /pm-weekly "
+                        "instead of calling outlook JS directly."
+                    ),
                 }
 
         # Hardcoded block: write-protect security plugin source code.
@@ -584,7 +594,7 @@ class ControlRoom:
                 )
                 return {
                     "action": "block",
-                    "message": "[control-room] Modifying security plugin source code is blocked. plugins/control-room/ and plugins/email-send-guard/ are write-protected.",
+                    "message": "Modifying security plugin source code is blocked. plugins/control-room/ and plugins/email-send-guard/ are write-protected.",
                 }
 
         # Hardcoded block: prevent execute_code from importing hermes internals.
@@ -603,7 +613,7 @@ class ControlRoom:
                 )
                 return {
                     "action": "block",
-                    "message": "[control-room] execute_code cannot import hermes internal modules (hermes_tools, hermes_cli, plugins, agent, gateway, model_tools). Use the official tool APIs instead.",
+                    "message": "execute_code cannot import hermes internal modules (hermes_tools, hermes_cli, plugins, agent, gateway, model_tools). Use the official tool APIs instead.",
                 }
 
         # Hardcoded block: prevent direct token extraction via get-foci-token.js.
@@ -618,7 +628,12 @@ class ControlRoom:
                 )
                 return {
                     "action": "block",
-                    "message": "[control-room] Direct use of get-foci-token.js is blocked. Auth tokens are managed internally by the Graph API email backend.",
+                    "message": (
+                        "Direct use of get-foci-token.js is forbidden — Hermes must never access "
+                        "auth tokens directly. Auth tokens are managed internally by the email broker. "
+                        "If you need to renew an expired token, run: "
+                        "node ~/Code/pm_os/bin/ensure-tokens.js"
+                    ),
                 }
 
         # Hardcoded block: prevent read_file from accessing credential files.
@@ -671,7 +686,7 @@ class ControlRoom:
                     tool_name, args, "blocked",
                     result=reason, task_id=task_id, session_id=session_id,
                 )
-                return {"action": "block", "message": f"[control-room] {reason}"}
+                return {"action": "block", "message": reason}
 
             # Record pre-phase audit
             self.db.log_audit(

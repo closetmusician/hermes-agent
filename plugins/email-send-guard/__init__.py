@@ -144,8 +144,11 @@ def _pre_tool_call(
         return {
             "action": "block",
             "message": (
-                "Email send blocked: no draft loaded for this body. "
-                "Load draft first with email_load_draft."
+                "Email send blocked: no draft loaded for this email body. Before sending, you must:\n"
+                "1. Call email_load_draft(body='your message', recipient='recipient@example.com') to create a draft\n"
+                "2. Call email_show_preview to review the draft with the user\n"
+                "3. Wait for the user to run /approve-email\n"
+                "4. Then call send_message(target='email:recipient@example.com', message='your message') to send"
             ),
         }
 
@@ -154,8 +157,9 @@ def _pre_tool_call(
         return {
             "action": "block",
             "message": (
-                "Email send blocked: draft not previewed. "
-                "Preview draft first with email_show_preview."
+                "Email send blocked: draft exists but has not been previewed. "
+                "Call email_show_preview now to show the draft to the user for review. "
+                "After preview, the user will run /approve-email to approve sending."
             ),
         }
 
@@ -167,17 +171,20 @@ def _pre_tool_call(
         return {
             "action": "block",
             "message": (
-                "Email send blocked: user approval required for this "
-                "recipient+body combination. "
-                "Run /approve-email to approve this draft."
+                "Email send blocked: draft has been previewed but not yet approved by the user. "
+                "Wait for the user to run /approve-email. "
+                "Do not attempt to send again until the user explicitly approves."
             ),
         }
     if approval.get("expires_at", 0) < time.time():
         return {
             "action": "block",
             "message": (
-                "Email send blocked: approval expired. "
-                "Run /approve-email to re-approve this draft."
+                "Email send blocked: the previous approval has expired. Start the workflow again:\n"
+                "1. Call email_load_draft(body='your message', recipient='recipient@example.com')\n"
+                "2. Call email_show_preview\n"
+                "3. Wait for the user to run /approve-email\n"
+                "4. Then call send_message to send"
             ),
         }
 
