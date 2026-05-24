@@ -1,3 +1,8 @@
+# ABOUTME: Email platform adapter for Hermes gateway (IMAP IDLE + SMTP).
+# ABOUTME: Receives user messages via IMAP push/poll, sends replies via SMTP.
+# ABOUTME: Handles connection lifecycle, backoff, circuit-breaking on failures.
+# ABOUTME: Supports attachments (images + documents) via MIME parsing.
+# ABOUTME: Auth: EMAIL_ADDRESS + EMAIL_PASSWORD env vars, EMAIL_ALLOWED_USERS ACL.
 """
 Email platform adapter for the Hermes gateway.
 
@@ -22,6 +27,7 @@ import email as email_lib
 import imaplib
 import logging
 import os
+import random
 import re
 import select
 import socket
@@ -387,32 +393,56 @@ class EmailAdapter(BasePlatformAdapter):
             await asyncio.sleep(delay)
 
     # Stepped backoff schedule: after N consecutive errors, wait this many
-    # seconds before the next attempt.  Ramps quickly to 10 minutes so a
-    # rate-limited server has time to forgive us.
-    _BACKOFF_STEPS = (15, 30, 180, 600)  # 15s, 30s, 3min, 10min
+    # seconds before the next attempt. Ramps through short delays, then 10min,
+    # then degrades to 30min/1hr for sustained outages so we never die but
+    # also never spam. Jitter (±20%) prevents thundering herd on recovery.
+    _BACKOFF_STEPS = (15, 30, 60, 180, 600, 600, 600, 600, 600, 600, 1800, 3600)
+    #                 1   2   3   4    5-10 (10min plateau)    11=30min  12+=1hr
+
+    # After this many consecutive errors, suppress repeated log lines.
+    # Only every Nth error gets logged at WARNING; others at DEBUG.
+    _LOG_SUPPRESS_AFTER = 5
+    _LOG_EVERY_N = 10
 
     def _backoff_delay(self) -> float:
-        """Compute poll delay with stepped backoff on consecutive errors.
+        """Compute poll delay with stepped backoff + jitter on consecutive errors.
 
         Returns normal poll interval on success, escalating through
-        _BACKOFF_STEPS on repeated failures (capped at 10 minutes).
+        _BACKOFF_STEPS on repeated failures. After exhausting the step list,
+        caps at 1 hour. Adds ±20% jitter to prevent synchronized retries
+        across multiple gateway instances.
         """
         if self._consecutive_errors == 0:
             return self._poll_interval
         idx = min(self._consecutive_errors, len(self._BACKOFF_STEPS)) - 1
-        return self._BACKOFF_STEPS[idx]
+        base = self._BACKOFF_STEPS[idx]
+        # Jitter: ±20% randomization to avoid thundering herd
+        jitter = base * 0.2 * (2 * random.random() - 1)
+        return max(1.0, base + jitter)
 
     async def _idle_loop(self) -> None:
         """Persistent IMAP IDLE loop — server pushes new-message notifications.
 
         Runs as an asyncio task. Delegates blocking IDLE I/O to an executor
         thread via _idle_and_fetch, then dispatches any returned messages on
-        the event loop. Reconnects with exponential backoff on errors.
+        the event loop.
+
+        Resilience strategy:
+        - On success: resets error counter, loops immediately.
+        - On failure: increments counter, backs off per _BACKOFF_STEPS with
+          jitter, suppresses log spam after _LOG_SUPPRESS_AFTER errors.
+        - Never exits: even after hours of failures, degrades to 1hr polling
+          rather than killing the process.
         """
         while self._running:
             try:
                 loop = asyncio.get_running_loop()
                 messages = await loop.run_in_executor(None, self._idle_and_fetch)
+                # Success — reset error state
+                if self._consecutive_errors > 0:
+                    logger.info("[Email] IMAP IDLE recovered after %d consecutive errors",
+                                self._consecutive_errors)
+                self._consecutive_errors = 0
                 for msg in messages:
                     await self._dispatch_message(msg)
             except asyncio.CancelledError:
@@ -420,8 +450,17 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception as e:
                 self._consecutive_errors += 1
                 delay = self._backoff_delay()
-                logger.error("[Email] IDLE loop error (%d consecutive, next retry in %ds): %s",
-                             self._consecutive_errors, delay, e)
+                # Log suppression: full ERROR for first few, then only every Nth
+                # at WARNING level, others at DEBUG to avoid log flooding.
+                if self._consecutive_errors <= self._LOG_SUPPRESS_AFTER:
+                    logger.error("[Email] IDLE loop error (%d consecutive, retry in %.0fs): %s",
+                                 self._consecutive_errors, delay, e)
+                elif self._consecutive_errors % self._LOG_EVERY_N == 0:
+                    logger.warning("[Email] IDLE loop still failing (%d consecutive errors, retry in %.0fs): %s",
+                                   self._consecutive_errors, delay, e)
+                else:
+                    logger.debug("[Email] IDLE loop error (%d consecutive, retry in %.0fs): %s",
+                                 self._consecutive_errors, delay, e)
                 await asyncio.sleep(delay)
 
     def _idle_and_fetch(self) -> List[Dict[str, Any]]:
@@ -444,10 +483,10 @@ class EmailAdapter(BasePlatformAdapter):
                 imap.socket().settimeout(300)  # 5 minutes
             imap.select("INBOX")
 
-            # Reset errors on successful connection
-            if self._consecutive_errors > 0:
-                logger.info("[Email] IMAP recovered after %d consecutive errors", self._consecutive_errors)
-            self._consecutive_errors = 0
+            # NOTE: Do NOT reset _consecutive_errors here. The counter is
+            # managed by _idle_loop on full success (messages returned without
+            # raising). Resetting on connection alone defeats backoff when
+            # the failure occurs later during IDLE drain.
 
             while self._running:
                 # Send IDLE command (raw protocol — imaplib has no native IDLE)
@@ -461,11 +500,12 @@ class EmailAdapter(BasePlatformAdapter):
                                    response.decode(errors="replace").strip())
                     break
 
-                # Wait for server notification or 8-min heartbeat timeout.
-                # Yahoo IMAP drops IDLE connections after ~10 minutes, so
-                # we proactively exit before the server kills us.
+                # Wait for server notification or 4-min heartbeat timeout.
+                # Many IMAP servers (Yahoo, Gmail) drop IDLE connections
+                # after 5-10 minutes. Using 4 minutes gives a comfortable
+                # margin to exit cleanly before the server kills us.
                 sock = imap.socket()
-                readable, _, _ = select.select([sock], [], [], 480)  # 8 minutes
+                readable, _, _ = select.select([sock], [], [], 240)  # 4 minutes
 
                 # If select says readable, verify the socket is still alive.
                 # A server-side close makes select return readable, but the
