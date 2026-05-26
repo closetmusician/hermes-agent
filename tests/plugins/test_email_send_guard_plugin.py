@@ -532,3 +532,102 @@ class TestApprovalReplayAcrossRecipients:
             "evil@attacker.com — approval must bind to recipient"
         )
         assert result_evil["action"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# 14. show_preview falls back to current draft when no draft_id given
+# ---------------------------------------------------------------------------
+
+class TestShowPreviewFallsBackToCurrentDraft:
+    """show_preview with empty draft_id should use the current (most recent) draft."""
+
+    def test_preview_uses_current_when_no_id(self, plugin, load_draft, show_preview):
+        body = "test body"
+        result_load = load_draft(body=body, recipient="a@b.com")
+        loaded = json.loads(result_load)
+        expected_draft_id = loaded["draft_id"]
+
+        # Call show_preview with empty string (no explicit draft_id)
+        result_preview = show_preview(draft_id="")
+        parsed = json.loads(result_preview)
+
+        assert parsed["status"] == "draft_previewed"
+        assert parsed["draft_id"] == expected_draft_id
+
+
+# ---------------------------------------------------------------------------
+# 15. show_preview with no draft and no current -> error
+# ---------------------------------------------------------------------------
+
+class TestShowPreviewNoDraftNoCurrent:
+    """show_preview with no draft_id and no loaded drafts returns an error."""
+
+    def test_preview_no_draft_returns_error(self, show_preview):
+        result = show_preview(draft_id="")
+        parsed = json.loads(result)
+
+        assert "error" in parsed
+        assert "no draft" in parsed["error"].lower() or "load" in parsed["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 16. /approve-email ignores non-hash freetext args (falls back to current)
+# ---------------------------------------------------------------------------
+
+class TestApproveIgnoresNonHashArgs:
+    """Freetext arg (not a sha256 hash) should be ignored; approve current draft."""
+
+    def test_freetext_arg_falls_back_to_current(self, plugin, load_draft, show_preview, approve_cmd):
+        body = "Freetext approve body"
+        recipient = "yu_kuan@yahoo.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+
+        # Freetext arg — not a valid sha256 hash
+        result = approve_cmd("to yu_kuan@yahoo.com")
+
+        assert "approved" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 17. /approve-email accepts a valid sha256 hash
+# ---------------------------------------------------------------------------
+
+class TestApproveAcceptsValidHash:
+    """Passing a real sha256 draft_id hash to /approve-email should succeed."""
+
+    def test_valid_hash_approves(self, plugin, load_draft, show_preview, approve_cmd):
+        body = "Hash approve body"
+        recipient = "hash@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+
+        result = approve_cmd(draft_id)
+
+        assert "approved" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 18. /approve-email rejects invalid hash gracefully (falls back to current)
+# ---------------------------------------------------------------------------
+
+class TestApproveRejectsInvalidHashGracefully:
+    """Non-hex / wrong-length arg should be treated as freetext, not a hash.
+
+    The approve handler should fall back to the current draft rather than
+    returning "No draft found".
+    """
+
+    def test_invalid_hash_falls_back_to_current(self, plugin, load_draft, show_preview, approve_cmd):
+        body = "Invalid hash body"
+        recipient = "fallback@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+
+        # "not-a-hash-at-all" is not hex and not 64 chars — should be ignored
+        result = approve_cmd("not-a-hash-at-all")
+
+        assert "approved" in result.lower()

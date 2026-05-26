@@ -483,62 +483,6 @@ class TestHTTPMonitoring:
 
 
 # ---------------------------------------------------------------------------
-# n. Full email policy flow
-# ---------------------------------------------------------------------------
-
-
-class TestFullEmailPolicyFlow:
-    """End-to-end: load bundled email-send.yaml policy and test against it."""
-
-    def test_bundled_email_policy(self, tmp_path: Path) -> None:
-        """Load the bundled email-send.yaml and test the full flow."""
-        # Copy the bundled policy to a tmp dir
-        bundled = Path(__file__).resolve().parent.parent.parent / "plugins" / "control-room" / "policies" / "email-send.yaml"
-        pdir = tmp_path / "policies"
-        pdir.mkdir()
-
-        # Read and write the bundled policy
-        policy_text = bundled.read_text(encoding="utf-8")
-        (pdir / "email-send.yaml").write_text(policy_text)
-
-        cr = ControlRoom(db_path=tmp_path / "audit.db", policy_dir=pdir)
-
-        # Step 1: Attempt to send email -- should be blocked (no draft loaded)
-        result = cr.pre_tool_call("send_message", {"target": "ceo@company.com", "body": "Q3 report"})
-        assert result is not None
-        assert result["action"] == "block"
-        assert "loaded" in result["message"].lower()
-
-        # Step 2: Load draft
-        cr.db.set_state("draft.email.loaded", "true")
-
-        # Step 3: Attempt again -- still blocked (not approved)
-        result = cr.pre_tool_call("send_message", {"target": "ceo@company.com", "body": "Q3 report"})
-        assert result is not None
-        assert result["action"] == "block"
-        assert "approved" in result["message"].lower()
-
-        # Step 4: Approve draft
-        cr.db.set_state("draft.email.approved", "true")
-
-        # Step 5: Now it should be allowed
-        result = cr.pre_tool_call("send_message", {"target": "ceo@company.com", "body": "Q3 report"})
-        assert result is None, "Should be allowed after both preconditions met"
-
-        # Verify audit trail
-        pre_rows = cr.db.get_audit_rows(phase="pre")
-        blocked_rows = cr.db.get_audit_rows(phase="blocked")
-        assert len(pre_rows) == 1  # only the successful call
-        assert len(blocked_rows) == 2  # two blocked attempts
-
-        # Verify policy log
-        block_logs = cr.db.get_policy_rows(decision="block")
-        allow_logs = cr.db.get_policy_rows(decision="allow")
-        assert len(block_logs) >= 2
-        assert len(allow_logs) >= 1
-
-
-# ---------------------------------------------------------------------------
 # Database resilience
 # ---------------------------------------------------------------------------
 

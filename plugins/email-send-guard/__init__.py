@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -231,14 +232,17 @@ def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
 def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
     """Show a formatted preview of a loaded draft and mark it as previewed.
 
-    Usage: Agent calls this after email_load_draft. The draft_id is the hash
-    returned by email_load_draft.
-    Gotchas: Returns an error if the draft_id doesn't match a loaded draft.
+    Usage: Agent calls this after email_load_draft. Omit draft_id to preview
+    the most recently loaded draft.
+    Gotchas: Returns an error if no matching draft exists.
     """
-    if not draft_id:
-        return json.dumps({"error": "draft_id is required"})
-
     state = _load_state()
+
+    if not draft_id:
+        draft_id = state.get("current", "")
+    if not draft_id:
+        return json.dumps({"error": "No draft to preview. Load a draft first with email_load_draft."})
+
     draft = state["drafts"].get(draft_id)
     if not draft:
         return json.dumps({"error": f"No draft found with id {draft_id}"})
@@ -258,16 +262,20 @@ def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
 # Slash command (user-only)
 # ---------------------------------------------------------------------------
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def _handle_approve(raw_args: str) -> str:
     """Approve an email draft for sending. Sets a 15-minute approval window.
 
     Usage: /approve-email [draft_id]
-    If no draft_id provided, approves the current (most recently loaded) draft.
-    Approval is bound to the (recipient, body) tuple stored in the draft so
-    it cannot be replayed to a different recipient.
+    If no draft_id provided (or arg is not a valid hash), approves the current
+    (most recently loaded) draft. Approval is bound to the (recipient, body)
+    tuple stored in the draft so it cannot be replayed to a different recipient.
     Gotchas: Only works after the draft has been loaded and previewed.
     """
-    draft_id = raw_args.strip() if raw_args else ""
+    raw = raw_args.strip() if raw_args else ""
+    draft_id = raw if _SHA256_RE.match(raw) else ""
     state = _load_state()
 
     if not draft_id:
@@ -325,10 +333,9 @@ _SHOW_PREVIEW_SCHEMA = {
     "properties": {
         "draft_id": {
             "type": "string",
-            "description": "The draft hash ID returned by email_load_draft.",
+            "description": "The draft hash ID returned by email_load_draft. Optional — defaults to the most recently loaded draft.",
         },
     },
-    "required": ["draft_id"],
 }
 
 

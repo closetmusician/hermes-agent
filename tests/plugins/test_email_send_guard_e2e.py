@@ -688,3 +688,49 @@ class TestEdgeCases:
         handler = manager._plugin_commands["approve-email"]["handler"]
         result = handler("nonexistent_hash_value")
         assert "no draft" in result.lower() or "not found" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 14. /approve-email with freetext arg — full pipeline
+# ---------------------------------------------------------------------------
+
+class TestApproveWithFreetext:
+    """Full pipeline where /approve-email receives freetext instead of a hash.
+
+    Freetext (e.g. "send to yu_kuan@yahoo.com") is not a valid sha256 hash,
+    so the approve handler should ignore it and fall back to the current draft.
+    The full flow (load -> preview -> approve-with-freetext -> send) must succeed.
+    """
+
+    def test_freetext_approve_full_pipeline(self, registered, plugin_module):
+        manager, ctx = registered
+        body = "Freetext approval pipeline email"
+        recipient = "yu_kuan@yahoo.com"
+        draft_id = _body_hash(body)
+
+        from tools.registry import registry
+        load_entry = registry.get_entry("email_load_draft")
+        preview_entry = registry.get_entry("email_show_preview")
+
+        # Step 1: load draft with recipient
+        load_result = json.loads(load_entry.handler(body=body, recipient=recipient))
+        assert load_result["status"] == "draft_loaded"
+        assert load_result["draft_id"] == draft_id
+
+        # Step 2: preview
+        preview_result = json.loads(preview_entry.handler(draft_id=draft_id))
+        assert preview_result["status"] == "draft_previewed"
+
+        # Step 3: approve with freetext arg (not a hash)
+        approve_handler = manager._plugin_commands.get("approve-email", {}).get("handler")
+        assert approve_handler is not None, "/approve-email must be registered"
+        approval_msg = approve_handler("send to yu_kuan@yahoo.com")
+        assert "approved" in approval_msg.lower()
+
+        # Step 4: send — should pass (hook returns None => empty list)
+        results = manager.invoke_hook(
+            "pre_tool_call",
+            tool_name="send_message",
+            args={"target": f"email:{recipient}", "message": body},
+        )
+        assert results == []
