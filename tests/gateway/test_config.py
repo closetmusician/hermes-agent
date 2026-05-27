@@ -681,7 +681,6 @@ class TestHomeChannelEnvOverrides:
                     extra={
                         "address": "hermes@test.com",
                         "imap_host": "imap.test.com",
-                        "smtp_host": "smtp.test.com",
                     },
                 ),
                 {"EMAIL_HOME_ADDRESS": "user@test.com", "EMAIL_HOME_ADDRESS_NAME": "Inbox"},

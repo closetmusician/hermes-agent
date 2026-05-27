@@ -2,7 +2,7 @@
 """
 ABOUTME: End-to-end smoke test for the email draft→preview→approve→send workflow.
 ABOUTME: Directly invokes AIAgent (bypasses Telegram transport) to exercise the
-ABOUTME: full email-send-guard plugin pipeline with real SMTP/Graph API delivery.
+ABOUTME: full email-send-guard plugin pipeline with Graph API delivery.
 ABOUTME: Verifies receipt via Outlook Graph API Sent Items folder.
 ABOUTME: Usage: python tests/e2e_email_smoke.py
 """

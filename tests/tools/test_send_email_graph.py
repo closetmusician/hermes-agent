@@ -1,16 +1,14 @@
 """Tests for Graph API email path in _send_email().
 
-Verifies that _send_email() prefers Microsoft Graph API (via
-outlook-send-mail.js) when a FOCI token exists, and falls back to
-SMTP when it does not. Mocks only system boundaries (subprocess.run,
-os.path.exists) -- never internal modules.
+Verifies that _send_email() sends via Microsoft Graph API (via
+outlook-send-mail.js) when a FOCI token exists, and returns an error
+when Graph API is not configured. Mocks only system boundaries
+(subprocess.run, os.path.exists) -- never internal modules.
 """
 
 import asyncio
 import subprocess
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from tools.send_message_tool import _send_email
 
@@ -27,7 +25,7 @@ def _run(coro):
 
 class TestGraphApiPath:
     """When FOCI token and outlook-send-mail.js both exist, _send_email
-    should shell out to the Node tool instead of using SMTP."""
+    should shell out to the Node tool."""
 
     @patch("subprocess.run")
     @patch("os.path.exists")
@@ -41,14 +39,13 @@ class TestGraphApiPath:
         assert result["success"] is True
         assert result["method"] == "graph-api"
         assert result["platform"] == "email"
-        # SMTP should NOT have been attempted
         mock_run.assert_called_once()
 
     @patch("subprocess.run")
     @patch("os.path.exists")
     def test_command_construction(self, mock_exists, mock_run):
-        """Subprocess command includes correct --to, --subject, --body,
-        --content-type args. Body is HTML-converted markdown."""
+        """Subprocess command includes correct --to, --subject, --body args.
+        Body is raw markdown (JS tool handles formatting)."""
         mock_exists.return_value = True
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -62,16 +59,15 @@ class TestGraphApiPath:
         assert cmd[cmd.index("--subject") + 1] == "Hermes Agent"
         assert "--body" in cmd
         body = cmd[cmd.index("--body") + 1]
-        assert "<html>" in body
+        # Body should be raw markdown, NOT HTML-wrapped
         assert "Test body" in body
-        assert "--content-type" in cmd
-        assert cmd[cmd.index("--content-type") + 1] == "HTML"
+        # No --content-type arg (JS tool auto-detects)
+        assert "--content-type" not in cmd
 
     @patch("subprocess.run")
     @patch("os.path.exists")
     def test_graph_api_failure_returns_error(self, mock_exists, mock_run):
-        """When outlook-send-mail.js exits non-zero, return an error dict
-        (do NOT fall back to SMTP)."""
+        """When outlook-send-mail.js exits non-zero, return an error dict."""
         mock_exists.return_value = True
         mock_run.return_value = MagicMock(
             returncode=1, stdout="", stderr="Token expired"
@@ -97,19 +93,17 @@ class TestGraphApiPath:
 
 
 # ---------------------------------------------------------------------------
-# SMTP fallback -- no FOCI token
+# No Graph API configured -- returns error (no SMTP fallback)
 # ---------------------------------------------------------------------------
 
 
-class TestSmtpFallback:
-    """When FOCI token does NOT exist, _send_email should use the
-    existing SMTP path."""
+class TestNoGraphConfig:
+    """When Graph API is not available, _send_email should return an error.
+    There is no SMTP fallback."""
 
     @patch("os.path.exists", return_value=False)
-    def test_smtp_fallback_when_no_token(self, mock_exists):
-        """Without FOCI token, falls through to SMTP (which needs config)."""
-        # No EMAIL_ADDRESS/PASSWORD/SMTP_HOST set, so SMTP will return
-        # a config-missing error -- that's fine, it proves we reached SMTP.
+    def test_error_when_no_graph_config(self, mock_exists):
+        """Without FOCI token, returns a config-missing error."""
         result = _run(_send_email({}, "user@example.com", "Hello"))
 
         assert "error" in result
@@ -117,9 +111,8 @@ class TestSmtpFallback:
 
     @patch("subprocess.run")
     @patch("os.path.exists")
-    def test_smtp_fallback_when_only_token_exists(self, mock_exists, mock_run):
-        """If token exists but outlook-send-mail.js does NOT, fall through
-        to SMTP."""
+    def test_error_when_only_token_exists(self, mock_exists, mock_run):
+        """If token exists but outlook-send-mail.js does NOT, returns error."""
         import os
 
         token_path = os.path.expanduser("~/.pm-os-foci-token.json")
@@ -136,7 +129,6 @@ class TestSmtpFallback:
 
         result = _run(_send_email({}, "user@example.com", "Hello"))
 
-        # Should reach SMTP path (config-missing error proves it)
         assert "error" in result
         assert "not configured" in result["error"].lower()
         mock_run.assert_not_called()

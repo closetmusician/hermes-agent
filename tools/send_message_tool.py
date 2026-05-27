@@ -10,9 +10,7 @@ import json
 import logging
 import os
 import re
-import ssl
 import time
-from email.utils import formatdate
 from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
@@ -239,22 +237,16 @@ def _handle_send(args):
                 )
             else:
                 return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
-        # Email can be configured via env vars (SMTP) or Graph API token;
+        # Email uses Graph API (outlook-send-mail.js + FOCI token);
         # synthesize a pconfig so send_message works without gateway.yaml.
         elif platform_name == "email":
-            email_addr = os.getenv("EMAIL_ADDRESS", "").strip()
-            email_smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
             token_path = os.path.expanduser("~/.pm-os-foci-token.json")
             outlook_tool = os.path.expanduser("~/Code/pm_os/bin/outlook-send-mail.js")
-            has_graph = os.path.exists(token_path) and os.path.exists(outlook_tool)
-            if (email_addr and email_smtp) or has_graph:
+            if os.path.exists(token_path) and os.path.exists(outlook_tool):
                 from gateway.config import PlatformConfig
                 pconfig = PlatformConfig(
                     enabled=True,
-                    extra={
-                        "address": email_addr,
-                        "smtp_host": email_smtp,
-                    },
+                    extra={},
                 )
             else:
                 return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
@@ -1290,112 +1282,35 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         return _error(f"Signal send failed: {e}")
 
 
-_EMAIL_HTML_TEMPLATE = (
-    "<html><head><style>"
-    "ul, ol {{ margin: 0; padding-left: 24px; }} "
-    "li {{ margin: 0 0 2px 0; }} "
-    "p {{ margin: 0 0 8px 0; }} "
-    "h1, h2, h3 {{ margin: 8px 0 4px 0; }} "
-    "hr {{ border: none; border-top: 1px solid #ccc; margin: 12px 0; }}"
-    "</style></head>"
-    '<body style="font-family: -apple-system, BlinkMacSystemFont, '
-    "'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; "
-    'color: #333;">\n{body}\n</body></html>'
-)
-
-
-def _markdown_to_html(text):
-    """Convert markdown text to email-safe HTML.
-
-    Uses the ``markdown`` library with fenced_code and tables extensions
-    when available. Falls back to basic regex substitution so emails
-    always render formatted even if the library is missing.
-    Gotcha: the fallback is intentionally minimal -- only bold, italic,
-    bullet lists, and line breaks are handled.
-    """
-    try:
-        import markdown as _md
-
-        inner = _md.markdown(text, extensions=["fenced_code", "tables"])
-    except ImportError:
-        # Minimal manual conversion when the markdown library is absent.
-        inner = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-        inner = re.sub(r"\*(.+?)\*", r"<em>\1</em>", inner)
-        inner = re.sub(r"^- (.+)$", r"<li>\1</li>", inner, flags=re.MULTILINE)
-        inner = re.sub(r"(<li>.*</li>)", r"<ul>\1</ul>", inner, flags=re.DOTALL)
-        inner = inner.replace("\n", "<br>\n")
-    return _EMAIL_HTML_TEMPLATE.format(body=inner)
-
-
 async def _send_email(extra, chat_id, message):
-    """Send email via Graph API (M365) or SMTP fallback.
+    """Send email via Microsoft Graph API (outlook-send-mail.js).
 
-    Two-path dispatch: if a FOCI device-code token and the
-    outlook-send-mail.js tool both exist, uses Microsoft Graph API
-    (POST /me/sendMail) for delivery. This handles M365 corporate
-    accounts where basic SMTP auth is deprecated. Falls back to
-    raw SMTP for non-M365 accounts or when the Graph tooling is
-    absent.
+    Requires a FOCI device-code token and the outlook-send-mail.js
+    tool. The JS tool handles markdown-to-HTML conversion internally.
+    Gotcha: SMTP fallback was removed — Graph API is the only path.
     """
     import subprocess
 
-    # -- Markdown → HTML conversion ---------------------------------------
-    # Convert markdown body to HTML so bold, bullets, tables etc. render
-    # properly in email clients instead of showing raw markdown syntax.
-    html_body = _markdown_to_html(message)
-
-    # -- Graph API path (Microsoft 365 via outlook-send-mail.js) ----------
     token_path = os.path.expanduser("~/.pm-os-foci-token.json")
     outlook_tool = os.path.expanduser("~/Code/pm_os/bin/outlook-send-mail.js")
 
-    if os.path.exists(token_path) and os.path.exists(outlook_tool):
-        cmd = [
-            "node", outlook_tool,
-            "--to", chat_id,
-            "--subject", "Hermes Agent",
-            "--body", html_body,
-            "--content-type", "HTML",
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                return {"success": True, "platform": "email", "method": "graph-api"}
-            else:
-                return {"error": f"Graph API email failed: {result.stderr.strip()}"}
-        except subprocess.TimeoutExpired:
-            return {"error": "Graph API email timed out after 30s"}
+    if not os.path.exists(token_path) or not os.path.exists(outlook_tool):
+        return {"error": "Email not configured — Graph API token or outlook-send-mail.js not found. Run FOCI device-code enrollment."}
 
-    # -- SMTP fallback (non-M365 accounts) --------------------------------
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.utils import formatdate
-
-    address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
-    smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
+    cmd = [
+        "node", outlook_tool,
+        "--to", chat_id,
+        "--subject", "Hermes Agent",
+        "--body", message,
+    ]
     try:
-        smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
-    except (ValueError, TypeError):
-        smtp_port = 587
-
-    if not all([address, password, smtp_host]):
-        return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
-
-    try:
-        msg = MIMEText(html_body, "html", "utf-8")
-        msg["From"] = address
-        msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
-        msg["Date"] = formatdate(localtime=True)
-
-        server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls(context=ssl.create_default_context())
-        server.login(address, password)
-        server.send_message(msg)
-        server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
-    except Exception as e:
-        return _error(f"Email send failed: {e}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return {"success": True, "platform": "email", "method": "graph-api"}
+        else:
+            return {"error": f"Graph API email failed: {result.stderr.strip()}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "Graph API email timed out after 30s"}
 
 
 async def _send_sms(auth_token, chat_id, message):

@@ -319,12 +319,9 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `SMS_ALLOW_ALL_USERS` | Allow all SMS senders without an allowlist |
 | `SMS_HOME_CHANNEL` | Phone number for cron job / notification delivery |
 | `SMS_HOME_CHANNEL_NAME` | Display name for the SMS home channel |
-| `EMAIL_ADDRESS` | Email address for the Email gateway adapter |
-| `EMAIL_PASSWORD` | Password or app password for the email account |
+| `EMAIL_ADDRESS` | Email address for the Email gateway adapter (sender identity) |
 | `EMAIL_IMAP_HOST` | IMAP hostname for the email adapter |
 | `EMAIL_IMAP_PORT` | IMAP port |
-| `EMAIL_SMTP_HOST` | SMTP hostname for the email adapter |
-| `EMAIL_SMTP_PORT` | SMTP port |
 | `EMAIL_ALLOWED_USERS` | Comma-separated email addresses allowed to message the bot |
 | `EMAIL_HOME_ADDRESS` | Default recipient for proactive email delivery |
 | `EMAIL_HOME_ADDRESS_NAME` | Display name for the email home target |

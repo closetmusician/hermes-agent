@@ -950,68 +950,60 @@ class TestPollLoop(unittest.TestCase):
 
 
 class TestSendEmailStandalone(unittest.TestCase):
-    """Test the standalone _send_email function in send_message_tool."""
+    """Test the standalone _send_email function in send_message_tool.
 
-    @patch.dict(os.environ, {
-        "EMAIL_ADDRESS": "hermes@test.com",
-        "EMAIL_PASSWORD": "secret",
-        "EMAIL_SMTP_HOST": "smtp.test.com",
-        "EMAIL_SMTP_PORT": "587",
-    })
-    def test_send_email_tool_success(self):
-        """_send_email should use verified STARTTLS when sending."""
+    _send_email uses Graph API (outlook-send-mail.js) exclusively.
+    There is no SMTP fallback.
+    """
+
+    def test_send_email_graph_success(self):
+        """_send_email should use Graph API via outlook-send-mail.js."""
         import asyncio
-        import ssl
         from tools.send_message_tool import _send_email
 
-        with patch("smtplib.SMTP") as mock_smtp:
-            mock_server = MagicMock()
-            mock_smtp.return_value = mock_server
+        with patch("os.path.exists", return_value=True), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="OK", stderr="")
 
             result = asyncio.run(
-                _send_email({"address": "hermes@test.com", "smtp_host": "smtp.test.com"}, "user@test.com", "Hello")
+                _send_email({}, "user@test.com", "Hello")
             )
 
             self.assertTrue(result["success"])
             self.assertEqual(result["platform"], "email")
-            _, kwargs = mock_server.starttls.call_args
-            self.assertIsInstance(kwargs["context"], ssl.SSLContext)
-            send_call = mock_server.send_message.call_args[0][0]
-            self.assertEqual(send_call["Subject"], "Hermes Agent")
-            self.assertIn("Date", send_call)
-            self.assertEqual(send_call["To"], "user@test.com")
-            self.assertEqual(send_call["From"], "hermes@test.com")
+            self.assertEqual(result["method"], "graph-api")
+            mock_run.assert_called_once()
 
-    @patch.dict(os.environ, {
-        "EMAIL_ADDRESS": "hermes@test.com",
-        "EMAIL_PASSWORD": "secret",
-        "EMAIL_SMTP_HOST": "smtp.test.com",
-    })
-    def test_send_email_tool_failure(self):
-        """SMTP failure should return error dict."""
+    def test_send_email_graph_failure(self):
+        """Graph API failure should return error dict."""
         import asyncio
         from tools.send_message_tool import _send_email
 
-        with patch("smtplib.SMTP", side_effect=Exception("SMTP error")):
+        with patch("os.path.exists", return_value=True), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stdout="", stderr="Token expired"
+            )
+
             result = asyncio.run(
-                _send_email({"address": "hermes@test.com", "smtp_host": "smtp.test.com"}, "user@test.com", "Hello")
+                _send_email({}, "user@test.com", "Hello")
             )
 
             self.assertIn("error", result)
-            self.assertIn("SMTP error", result["error"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_email_tool_not_configured(self):
-        """Missing config should return error."""
+        """Missing Graph config should return error."""
         import asyncio
         from tools.send_message_tool import _send_email
 
-        result = asyncio.run(
-            _send_email({}, "user@test.com", "Hello")
-        )
+        with patch("os.path.exists", return_value=False):
+            result = asyncio.run(
+                _send_email({}, "user@test.com", "Hello")
+            )
 
-        self.assertIn("error", result)
-        self.assertIn("not configured", result["error"])
+            self.assertIn("error", result)
+            self.assertIn("not configured", result["error"])
 
 
 class TestSmtpConnectionCleanup(unittest.TestCase):

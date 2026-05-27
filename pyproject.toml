@@ -64,9 +64,9 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
-  # Markdown → HTML for email bodies (used by tools/send_message_tool.py).
-  # Also present in the matrix extra at the same pin; kept here because
-  # _send_email is a core tool available in every session.
+  # Markdown → HTML for Matrix rich message rendering (used by
+  # tools/send_message_tool.py::_send_matrix and gateway/platforms/matrix.py).
+  # Also present in the matrix extra at the same pin.
   "Markdown==3.10.2",
 ]
 
