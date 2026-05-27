@@ -124,16 +124,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         block_result = None
         blocked_by_guardrail = False
+        _conc_block_halt_turn = False
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
+            _conc_block_result = get_pre_tool_call_block_message(
                 function_name, function_args, task_id=effective_task_id or "",
             )
         except Exception:
-            block_message = None
+            _conc_block_result = None
 
-        if block_message is not None:
+        if _conc_block_result is not None:
+            block_message, _conc_block_halt_turn = _conc_block_result
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            if _conc_block_halt_turn:
+                agent._tool_guardrail_halt_decision = ToolGuardrailDecision(
+                    action="halt",
+                    tool_name=function_name,
+                    code="plugin_block_halt",
+                    message=block_message,
+                )
         else:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
@@ -498,11 +507,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
+        _block_halt_turn: bool = False
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
-            _block_msg = get_pre_tool_call_block_message(
+            _block_result = get_pre_tool_call_block_message(
                 function_name, function_args, task_id=effective_task_id or "",
             )
+            if _block_result is not None:
+                _block_msg, _block_halt_turn = _block_result
         except Exception:
             pass
 
@@ -590,6 +602,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
+            if _block_halt_turn:
+                agent._tool_guardrail_halt_decision = ToolGuardrailDecision(
+                    action="halt",
+                    tool_name=function_name,
+                    code="plugin_block_halt",
+                    message=_block_msg,
+                )
         elif _guardrail_block_decision is not None:
             # Tool blocked by tool-loop guardrail — synthesize exactly one
             # tool result for the original tool_call_id without executing.

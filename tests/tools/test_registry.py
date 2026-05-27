@@ -64,6 +64,63 @@ class TestGetDefinitions:
         names = {d["function"]["name"] for d in defs}
         assert names == {"t1", "t2"}
 
+    def test_plugin_schema_properties_nested_under_parameters(self):
+        """Plugin schemas with top-level properties/required must be wrapped
+        under 'parameters' in the OpenAI function-calling format.
+
+        Plugins register raw JSON Schema objects ({type, properties, required})
+        without the OpenAI wrapper. get_definitions() must nest these under
+        'parameters' so the LLM sees correct function signatures.
+        """
+        reg = ToolRegistry()
+        plugin_schema = {
+            "type": "object",
+            "properties": {
+                "body": {"type": "string", "description": "Email body"},
+                "recipient": {"type": "string", "description": "Recipient"},
+            },
+            "required": ["body"],
+        }
+        reg.register(
+            name="email_load_draft",
+            toolset="email_send_guard",
+            schema=plugin_schema,
+            handler=_dummy_handler,
+            description="Load an email draft for review.",
+        )
+        defs = reg.get_definitions({"email_load_draft"})
+        assert len(defs) == 1
+        func = defs[0]["function"]
+        # properties must be nested inside parameters, not at function level
+        assert "properties" not in func, (
+            "properties leaked to function level instead of being inside parameters"
+        )
+        assert "required" not in func or func.get("required") != ["body"], (
+            "required leaked to function level"
+        )
+        assert func["name"] == "email_load_draft"
+        params = func["parameters"]
+        assert params["type"] == "object"
+        assert "body" in params["properties"]
+        assert "recipient" in params["properties"]
+        assert params["required"] == ["body"]
+
+    def test_builtin_schema_with_parameters_unchanged(self):
+        """Built-in tools that already have 'parameters' nested correctly
+        must not be double-wrapped or broken by the plugin fix."""
+        reg = ToolRegistry()
+        reg.register(
+            name="read_file",
+            toolset="file",
+            schema=_make_schema("read_file"),
+            handler=_dummy_handler,
+        )
+        defs = reg.get_definitions({"read_file"})
+        func = defs[0]["function"]
+        assert func["name"] == "read_file"
+        assert func["parameters"] == {"type": "object", "properties": {}}
+        assert "properties" not in func or func.get("properties") == func["parameters"].get("properties")
+
     def test_skips_unavailable_tools(self):
         reg = ToolRegistry()
         reg.register(
@@ -643,7 +700,7 @@ class TestDispatchPreToolCallEnforcement:
         # Mock get_pre_tool_call_block_message to block this tool
         with patch(
             "hermes_cli.plugins.get_pre_tool_call_block_message",
-            return_value="BLOCKED: dangerous_tool is not allowed",
+            return_value=("BLOCKED: dangerous_tool is not allowed", False),
         ):
             result = json.loads(reg.dispatch("dangerous_tool", {}))
 
@@ -718,7 +775,7 @@ class TestDispatchPreToolCallEnforcement:
         # Even with a blocking hook, _dispatch_unchecked should execute
         with patch(
             "hermes_cli.plugins.get_pre_tool_call_block_message",
-            return_value="BLOCKED: not allowed",
+            return_value=("BLOCKED: not allowed", False),
         ):
             result = json.loads(reg._dispatch_unchecked("internal_tool", {}))
 

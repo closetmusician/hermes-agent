@@ -68,6 +68,8 @@ class TestIsWriteDenied:
             "webhook_subscriptions.json",
             "mcp-tokens/token1.json",
             "mcp-tokens/subdir/token2.json",
+            "email-send-guard/state.json",
+            "email-send-guard/drafts/draft_abc.json",
         ],
     )
     def test_hermes_control_files_and_mcp_tokens_denied(self, path):
@@ -139,6 +141,18 @@ class TestIsWriteDenied:
         assert _is_write_denied(str(root / "mcp-tokens" / "tok.json")) is True
         # The directory itself must also be denied (not just files inside)
         assert _is_write_denied(str(root / "mcp-tokens")) is True
+
+    def test_email_guard_dir_protected_in_profile_mode(self, tmp_path, monkeypatch):
+        """email-send-guard/ under profile AND under root must both be denied."""
+        root = tmp_path / "hermes"
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        assert _is_write_denied(str(profile / "email-send-guard" / "state.json")) is True
+        assert _is_write_denied(str(root / "email-send-guard" / "state.json")) is True
+        # The directory itself must also be denied (not just files inside)
+        assert _is_write_denied(str(root / "email-send-guard")) is True
 
 
 

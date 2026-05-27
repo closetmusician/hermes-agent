@@ -1,9 +1,9 @@
 """
 ABOUTME: Email send guard plugin for Hermes.
 ABOUTME: Blocks send_message(email) until draft is loaded, previewed, and
-ABOUTME: explicitly user-approved. State machine: EMPTY -> LOADED -> PREVIEWED
-ABOUTME: -> APPROVED -> ALLOWED. Approvals expire after 15 minutes.
-ABOUTME: Uses SHA256 hashing over (recipient, body) to bind approval to exact content+target.
+ABOUTME: explicitly user-approved. Drafts stored as individual JSON files in a
+ABOUTME: configurable directory (default: ~/.hermes/email-send-guard/drafts/).
+ABOUTME: Approvals and current-pointer live in state.json. Approvals expire after 15 min.
 """
 
 from __future__ import annotations
@@ -42,15 +42,93 @@ def _state_path() -> Path:
     return _state_dir() / "state.json"
 
 
+def _get_drafts_dir() -> Path:
+    """Return the directory for individual draft JSON files, creating it if needed.
+
+    Reads drafts_dir from hermes config (plugins.entries.email-send-guard.drafts_dir).
+    Falls back to _state_dir()/drafts/ if config unavailable or unset.
+    Gotchas: Lazy-imports hermes_cli.config to avoid circular imports.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        value = (
+            cfg.get("plugins", {})
+            .get("entries", {})
+            .get("email-send-guard", {})
+            .get("drafts_dir")
+        )
+        if value:
+            d = Path(value).expanduser()
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+    except Exception:
+        pass
+    d = _state_dir() / "drafts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_draft(body_hash: str) -> dict | None:
+    """Load a single draft file by body hash.
+
+    Returns the parsed dict, or None if the file is missing.
+    Gotchas: Logs a warning and returns None on corrupt JSON.
+    """
+    p = _get_drafts_dir() / f"draft_{body_hash}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("email-send-guard: corrupt draft file %s: %s", p.name, exc)
+        return None
+
+
+def _save_draft(body_hash: str, draft: dict) -> None:
+    """Persist a single draft file atomically (tmp + rename).
+
+    Uses the same write-then-rename pattern as _save_state to avoid
+    partial writes on crash.
+    Gotchas: Overwrites any existing draft with the same hash.
+    """
+    p = _get_drafts_dir() / f"draft_{body_hash}.json"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(draft, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _migrate_drafts_from_state(state: dict) -> dict:
+    """Move legacy inline drafts from state.json into individual files.
+
+    Idempotent: skips drafts that already have a corresponding file.
+    After migration, removes the "drafts" key from state and persists.
+    Returns the cleaned state dict.
+    """
+    drafts = state.get("drafts", {})
+    migrated = 0
+    for body_hash, draft_data in drafts.items():
+        target = _get_drafts_dir() / f"draft_{body_hash}.json"
+        if target.exists():
+            continue
+        _save_draft(body_hash, draft_data)
+        migrated += 1
+    if migrated:
+        logger.info("email-send-guard: migrated %d draft(s) to individual files", migrated)
+    state.pop("drafts", None)
+    _save_state(state)
+    return state
+
+
 def _empty_state() -> dict:
     """Return a blank state structure.
 
     Structure:
-      drafts:    {hash: {body, loaded_at, previewed_at}}
       current:   hash | None
       approvals: {hash: {approved_at, expires_at}}
+    Drafts are stored as individual files via _save_draft/_load_draft.
     """
-    return {"drafts": {}, "current": None, "approvals": {}}
+    return {"current": None, "approvals": {}}
 
 
 def _load_state() -> dict:
@@ -60,10 +138,15 @@ def _load_state() -> dict:
         return _empty_state()
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
+        # Migrate legacy drafts stored inline in state.json
+        if "drafts" in data:
+            data = _migrate_drafts_from_state(data)
         # Ensure all top-level keys present
-        for key in ("drafts", "current", "approvals"):
+        for key in ("current", "approvals"):
             if key not in data:
                 data[key] = _empty_state()[key]
+        # Drop any lingering drafts key
+        data.pop("drafts", None)
         return data
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("email-send-guard: corrupt state file, resetting: %s", exc)
@@ -72,6 +155,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     """Persist state to disk atomically (write-then-rename)."""
+    state.pop("drafts", None)  # Defensive: drafts live in individual files
     p = _state_path()
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -140,7 +224,7 @@ def _pre_tool_call(
     state = _load_state()
 
     # Gate 1: draft must be loaded (keyed by body hash — content review)
-    draft = state["drafts"].get(bh)
+    draft = _load_draft(bh)
     if not draft or "loaded_at" not in draft:
         return {
             "action": "block",
@@ -171,21 +255,22 @@ def _pre_tool_call(
     if not approval:
         return {
             "action": "block",
+            "halt_turn": True,
             "message": (
-                "Email send blocked: draft has been previewed but not yet approved by the user. "
-                "Wait for the user to run /approve-email. "
-                "Do not attempt to send again until the user explicitly approves."
+                "Email send blocked: draft previewed but not yet approved. "
+                "The user must run /approve-email in Telegram — you cannot do this. "
+                "STOP here. Do not call send_message again or attempt alternative transports (SMTP, himalaya CLI, etc.). "
+                "Only the send_message tool is permitted for outbound email."
             ),
         }
     if approval.get("expires_at", 0) < time.time():
         return {
             "action": "block",
+            "halt_turn": True,
             "message": (
-                "Email send blocked: the previous approval has expired. Start the workflow again:\n"
-                "1. Call email_load_draft(body='your message', recipient='recipient@example.com')\n"
-                "2. Call email_show_preview\n"
-                "3. Wait for the user to run /approve-email\n"
-                "4. Then call send_message to send"
+                "Email send blocked: previous approval expired. The user must restart the workflow. "
+                "STOP here. Do not call send_message again or attempt alternative transports (SMTP, himalaya CLI, etc.). "
+                "Only the send_message tool is permitted for outbound email."
             ),
         }
 
@@ -210,13 +295,13 @@ def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
         return json.dumps({"error": "body is required"})
 
     h = _body_hash(body)
-    state = _load_state()
-    state["drafts"][h] = {
+    _save_draft(h, {
         "body": body,
         "recipient": recipient.strip().lower(),
         "loaded_at": time.time(),
         "previewed_at": None,
-    }
+    })
+    state = _load_state()
     state["current"] = h
     _save_state(state)
 
@@ -243,12 +328,12 @@ def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
     if not draft_id:
         return json.dumps({"error": "No draft to preview. Load a draft first with email_load_draft."})
 
-    draft = state["drafts"].get(draft_id)
+    draft = _load_draft(draft_id)
     if not draft:
         return json.dumps({"error": f"No draft found with id {draft_id}"})
 
     draft["previewed_at"] = time.time()
-    _save_state(state)
+    _save_draft(draft_id, draft)
 
     return json.dumps({
         "status": "draft_previewed",
@@ -283,7 +368,7 @@ def _handle_approve(raw_args: str) -> str:
     if not draft_id:
         return "No draft to approve. Load a draft first with email_load_draft."
 
-    draft = state["drafts"].get(draft_id)
+    draft = _load_draft(draft_id)
     if not draft:
         return f"No draft found with id {draft_id}."
     if not draft.get("previewed_at"):

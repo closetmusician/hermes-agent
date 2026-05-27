@@ -502,7 +502,11 @@ class TestPreToolCallBlocking:
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: [{"action": "block", "message": "blocked by plugin"}],
         )
-        assert get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
+        result = get_pre_tool_call_block_message("todo", {}, task_id="t1")
+        assert result is not None
+        msg, halt = result
+        assert msg == "blocked by plugin"
+        assert halt is False
 
     def test_invalid_returns_are_ignored(self, monkeypatch):
         """Various malformed hook returns should not trigger a block."""
@@ -535,7 +539,11 @@ class TestPreToolCallBlocking:
                 {"action": "block", "message": "second blocker"},
             ],
         )
-        assert get_pre_tool_call_block_message("terminal", {}) == "first blocker"
+        result = get_pre_tool_call_block_message("terminal", {})
+        assert result is not None
+        msg, halt = result
+        assert msg == "first blocker"
+        assert halt is False
 
 
 class TestThreadToolWhitelist:
@@ -571,8 +579,11 @@ class TestThreadToolWhitelist:
             {"memory"}, deny_msg_fmt="denied: {tool_name}"
         )
         try:
-            msg = get_pre_tool_call_block_message("terminal", {})
+            result = get_pre_tool_call_block_message("terminal", {})
+            assert result is not None
+            msg, halt = result
             assert msg == "denied: terminal"
+            assert halt is False
         finally:
             clear_thread_tool_whitelist()
 

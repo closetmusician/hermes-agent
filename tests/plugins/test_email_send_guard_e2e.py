@@ -142,6 +142,8 @@ class TestColdSendBlocked:
         result = results[0]
         assert result["action"] == "block"
         assert "email_load_draft" in result["message"]
+        # No-draft block should NOT halt the turn (agent can fix this)
+        assert result.get("halt_turn") is not True
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +175,8 @@ class TestLoadWithoutPreviewBlocked:
         assert len(results) == 1
         assert results[0]["action"] == "block"
         assert "preview" in results[0]["message"].lower()
+        # Not-previewed block should NOT halt the turn (agent can fix this)
+        assert results[0].get("halt_turn") is not True
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +208,8 @@ class TestLoadPreviewNoApprovalBlocked:
         assert len(results) == 1
         assert results[0]["action"] == "block"
         assert "approv" in results[0]["message"].lower()
+        # Not-approved block should halt the turn (requires user action)
+        assert results[0].get("halt_turn") is True
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +288,8 @@ class TestApprovalExpiry:
         assert len(results) == 1
         assert results[0]["action"] == "block"
         assert "expir" in results[0]["message"].lower()
+        # Expired approval block should halt the turn (requires user action)
+        assert results[0].get("halt_turn") is True
 
 
 # ---------------------------------------------------------------------------
@@ -562,12 +570,40 @@ class TestGlobalSingletonPipeline:
         # Inject our manager as the global singleton
         monkeypatch.setattr(pm_mod, "_plugin_manager", mgr)
 
-        msg = get_pre_tool_call_block_message(
+        result = get_pre_tool_call_block_message(
             tool_name="send_message",
             args={"target": "email:test@example.com", "message": "Blocked!"},
         )
-        assert msg is not None
+        assert result is not None
+        msg, halt_turn = result
         assert "email_load_draft" in msg
+        assert halt_turn is False  # No-draft block should not halt
+
+    def test_not_approved_block_halts_turn_via_singleton(self, plugin_module, monkeypatch):
+        """Not-approved block through the singleton pipeline returns halt_turn=True."""
+        import hermes_cli.plugins as pm_mod
+
+        mgr = PluginManager()
+        manifest = _make_manifest()
+        ctx = PluginContext(manifest, mgr)
+        plugin_module.register(ctx)
+        monkeypatch.setattr(pm_mod, "_plugin_manager", mgr)
+
+        body = "Singleton halt test"
+        draft_id = _body_hash(body)
+
+        from tools.registry import registry
+        registry.get_entry("email_load_draft").handler(body=body, recipient="halt@example.com")
+        registry.get_entry("email_show_preview").handler(draft_id=draft_id)
+
+        # Do NOT approve — should block with halt_turn=True
+        result = get_pre_tool_call_block_message(
+            tool_name="send_message",
+            args={"target": "email:halt@example.com", "message": body},
+        )
+        assert result is not None
+        msg, halt_turn = result
+        assert halt_turn is True
 
     def test_allowed_via_global_singleton(self, plugin_module, monkeypatch):
         """Full happy path through the singleton pipeline returns None."""
@@ -588,11 +624,11 @@ class TestGlobalSingletonPipeline:
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
         mgr._plugin_commands["approve-email"]["handler"](draft_id)
 
-        msg = get_pre_tool_call_block_message(
+        result = get_pre_tool_call_block_message(
             tool_name="send_message",
             args={"target": f"email:{recipient}", "message": body},
         )
-        assert msg is None
+        assert result is None
 
     def test_non_email_passes_via_global_singleton(self, plugin_module, monkeypatch):
         """Non-email tool calls pass through the singleton pipeline."""
@@ -604,11 +640,11 @@ class TestGlobalSingletonPipeline:
         plugin_module.register(ctx)
         monkeypatch.setattr(pm_mod, "_plugin_manager", mgr)
 
-        msg = get_pre_tool_call_block_message(
+        result = get_pre_tool_call_block_message(
             tool_name="terminal",
             args={"command": "whoami"},
         )
-        assert msg is None
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -734,3 +770,43 @@ class TestApproveWithFreetext:
             args={"target": f"email:{recipient}", "message": body},
         )
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# 15. Draft file persistence across PluginManager lifecycle
+# ---------------------------------------------------------------------------
+
+class TestDraftFilePersistence:
+    """Verify draft files survive PluginManager re-registration.
+
+    Drafts are stored as individual files on disk, so they must remain
+    readable even after the PluginManager singleton is reset (simulating
+    a process restart).
+    """
+
+    def test_draft_persists_after_plugin_reload(self, plugin_module):
+        """A draft saved by one plugin instance is loadable after re-registration."""
+        body = "persistence test"
+        recipient = "test@x.com"
+
+        # First instance: register and load a draft
+        mgr1 = PluginManager()
+        manifest = _make_manifest()
+        ctx1 = PluginContext(manifest, mgr1)
+        plugin_module.register(ctx1)
+
+        from tools.registry import registry
+        result = json.loads(
+            registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
+        )
+        draft_hash = result["draft_id"]
+
+        # Reset the plugin manager (simulates process restart)
+        import hermes_cli.plugins as _pm_mod
+        _pm_mod._plugin_manager = None
+
+        # Draft file should still be readable directly from disk
+        draft = plugin_module._load_draft(draft_hash)
+        assert draft is not None
+        assert draft["body"] == "persistence test"
+        assert draft["recipient"] == "test@x.com"

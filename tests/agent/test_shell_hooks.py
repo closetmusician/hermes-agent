@@ -332,10 +332,12 @@ class TestCallbackSubprocess:
         registered = shell_hooks.register_from_config(cfg, accept_hooks=True)
         assert len(registered) == 1
 
-        msg = plugins.get_pre_tool_call_block_message(
+        result = plugins.get_pre_tool_call_block_message(
             tool_name="terminal",
             args={"command": "rm"},
         )
+        assert result is not None
+        msg, halt = result
         assert msg == "blocked-by-shell"
 
     def test_matcher_regex_filters_callback(self, tmp_path, monkeypatch):

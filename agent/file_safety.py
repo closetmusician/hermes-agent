@@ -104,6 +104,7 @@ def is_write_denied(path: str) -> bool:
     # files that every profile inherits from (same shape as #15981).
     control_file_names = ("auth.json", "config.yaml", "webhook_subscriptions.json")
     mcp_tokens_dir_name = "mcp-tokens"
+    email_guard_dir_name = "email-send-guard"
 
     hermes_dirs = []
     for base in (_hermes_home_path(), _hermes_root_path()):
@@ -124,6 +125,12 @@ def is_write_denied(path: str) -> bool:
         try:
             mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
             if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
+                return True
+        except Exception:
+            pass
+        try:
+            guard_real = os.path.realpath(os.path.join(base_real, email_guard_dir_name))
+            if resolved == guard_real or resolved.startswith(guard_real + os.sep):
                 return True
         except Exception:
             pass
@@ -249,6 +256,29 @@ def get_read_block_error(path: str) -> Optional[str]:
             continue
         return (
             f"Access denied: {path} is a Hermes MCP token file "
+            "and cannot be read directly. (Defense-in-depth — not a "
+            "security boundary; the terminal tool can still bypass.)"
+        )
+
+    # email-send-guard/: directory prefix match — approval state and
+    # draft files that the agent must not inspect or tamper with.
+    for hd in hermes_dirs:
+        try:
+            email_guard = (hd / "email-send-guard").resolve()
+        except Exception:
+            continue
+        if resolved == email_guard:
+            return (
+                f"Access denied: {path} is the Hermes email-send-guard state directory "
+                "and cannot be read directly. (Defense-in-depth — not a "
+                "security boundary; the terminal tool can still bypass.)"
+            )
+        try:
+            resolved.relative_to(email_guard)
+        except ValueError:
+            continue
+        return (
+            f"Access denied: {path} is a Hermes email-send-guard state file "
             "and cannot be read directly. (Defense-in-depth — not a "
             "security boundary; the terminal tool can still bypass.)"
         )

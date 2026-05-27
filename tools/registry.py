@@ -435,8 +435,23 @@ class ToolRegistry:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue
-            # Ensure schema always has a "name" field — use entry.name as fallback
-            schema_with_name = {**entry.schema, "name": entry.name}
+            # Ensure schema always has a "name" field — use entry.name as fallback.
+            # Plugin-registered tools provide raw JSON Schema objects
+            # ({type, properties, required}) without the OpenAI wrapper.
+            # Detect this and nest them under "parameters" so the LLM
+            # sees the correct function-calling format.
+            raw = entry.schema
+            if "properties" in raw and "parameters" not in raw:
+                schema_with_name = {
+                    "name": entry.name,
+                    "description": raw.get("description", entry.description),
+                    "parameters": {
+                        k: v for k, v in raw.items()
+                        if k not in ("name", "description")
+                    },
+                }
+            else:
+                schema_with_name = {**raw, "name": entry.name}
             # Apply runtime-dynamic overrides (e.g. delegate_task description
             # depends on current delegation.max_concurrent_children /
             # max_spawn_depth). Caller side (model_tools.get_tool_definitions)
@@ -478,18 +493,20 @@ class ToolRegistry:
         should use ``_dispatch_unchecked()`` to avoid double-firing.
         """
         # -- pre_tool_call guard ------------------------------------
+        block_message = None
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
+            _block_result = get_pre_tool_call_block_message(
                 name,
                 args if isinstance(args, dict) else {},
                 task_id=kwargs.get("task_id", ""),
                 session_id=kwargs.get("session_id", ""),
                 tool_call_id=kwargs.get("tool_call_id", ""),
             )
+            if _block_result is not None:
+                block_message = _block_result[0]
         except Exception as _hook_err:
             logger.debug("pre_tool_call hook error in dispatch: %s", _hook_err)
-            block_message = None
 
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)

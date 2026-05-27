@@ -229,6 +229,42 @@ def test_identically_named_files_outside_hermes_home_not_blocked(
     assert get_read_block_error(str(tok_file)) is None
 
 
+# ---------------------------------------------------------------------------
+# email-send-guard/: approval state and drafts
+# ---------------------------------------------------------------------------
+
+
+def test_email_guard_state_blocked(fake_home):
+    """state.json under email-send-guard/ holds approval records — blocked."""
+    from agent.file_safety import get_read_block_error
+
+    state = _create(fake_home, Path("email-send-guard") / "state.json")
+    err = get_read_block_error(str(state))
+    assert err is not None
+    assert "email-send-guard" in err
+
+
+def test_email_guard_draft_blocked(fake_home):
+    """Draft files under email-send-guard/drafts/ — blocked."""
+    from agent.file_safety import get_read_block_error
+
+    draft = _create(fake_home, Path("email-send-guard") / "drafts" / "draft_abc.json")
+    err = get_read_block_error(str(draft))
+    assert err is not None
+    assert "email-send-guard" in err
+
+
+def test_email_guard_dir_itself_blocked(fake_home):
+    """The email-send-guard directory itself is blocked."""
+    from agent.file_safety import get_read_block_error
+
+    guard_dir = fake_home / "email-send-guard"
+    guard_dir.mkdir(parents=True, exist_ok=True)
+    err = get_read_block_error(str(guard_dir))
+    assert err is not None
+    assert "email-send-guard" in err
+
+
 def test_config_yaml_not_blocked(fake_home):
     """config.yaml is NOT a credential file — agent should still be
     able to read it for debugging.  (Writes are denied separately by
@@ -273,3 +309,9 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
     assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+
+    # Root-level email-send-guard: blocked
+    root_guard = root / "email-send-guard" / "state.json"
+    root_guard.parent.mkdir(parents=True, exist_ok=True)
+    root_guard.write_text("x")
+    assert "email-send-guard" in (get_read_block_error(str(root_guard)) or "")

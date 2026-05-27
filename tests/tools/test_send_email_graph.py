@@ -48,7 +48,7 @@ class TestGraphApiPath:
     @patch("os.path.exists")
     def test_command_construction(self, mock_exists, mock_run):
         """Subprocess command includes correct --to, --subject, --body,
-        --content-type args."""
+        --content-type args. Body is HTML-converted markdown."""
         mock_exists.return_value = True
         mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
@@ -61,9 +61,11 @@ class TestGraphApiPath:
         assert "--subject" in cmd
         assert cmd[cmd.index("--subject") + 1] == "Hermes Agent"
         assert "--body" in cmd
-        assert cmd[cmd.index("--body") + 1] == "Test body"
+        body = cmd[cmd.index("--body") + 1]
+        assert "<html>" in body
+        assert "Test body" in body
         assert "--content-type" in cmd
-        assert cmd[cmd.index("--content-type") + 1] == "Text"
+        assert cmd[cmd.index("--content-type") + 1] == "HTML"
 
     @patch("subprocess.run")
     @patch("os.path.exists")

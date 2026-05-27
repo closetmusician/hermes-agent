@@ -1493,7 +1493,7 @@ def get_pre_tool_call_block_message(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
-) -> Optional[str]:
+) -> Optional[tuple[str, bool]]:
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
     Plugins that need to enforce policy (rate limiting, security
@@ -1501,14 +1501,20 @@ def get_pre_tool_call_block_message(
 
         {"action": "block", "message": "Reason the tool was blocked"}
 
-    from their ``pre_tool_call`` callback.  The first valid block
-    directive wins.  Invalid or irrelevant hook return values are
-    silently ignored so existing observer-only hooks are unaffected.
+    from their ``pre_tool_call`` callback.  Optionally, a plugin may
+    include ``"halt_turn": True`` to signal the agent should stop its
+    current turn entirely (the blocked action requires user intervention
+    and retrying would loop forever).
+
+    Returns ``(message, halt_turn)`` on block, or ``None`` if allowed.
+    The first valid block directive wins.  Invalid or irrelevant hook
+    return values are silently ignored so existing observer-only hooks
+    are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return fmt.format(tool_name=tool_name)
+        return (fmt.format(tool_name=tool_name), False)
 
     hook_results = invoke_hook(
         "pre_tool_call",
@@ -1526,7 +1532,8 @@ def get_pre_tool_call_block_message(
             continue
         message = result.get("message")
         if isinstance(message, str) and message:
-            return message
+            halt_turn = bool(result.get("halt_turn", False))
+            return (message, halt_turn)
 
     return None
 

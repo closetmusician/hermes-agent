@@ -210,6 +210,16 @@ class TestGateLoaded:
         assert result["action"] == "block"
         assert "email_load_draft" in result["message"]
 
+    def test_no_draft_block_does_not_halt_turn(self, pre_hook):
+        """No-draft block should NOT halt the turn (agent can fix by loading a draft)."""
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "email:user@example.com", "message": "Hello"},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert result.get("halt_turn") is not True
+
 
 # ---------------------------------------------------------------------------
 # 4. Email send with loaded but not previewed draft -> blocked
@@ -226,6 +236,18 @@ class TestGatePreviewed:
         assert result is not None
         assert result["action"] == "block"
         assert "email_show_preview" in result["message"]
+
+    def test_not_previewed_block_does_not_halt_turn(self, pre_hook, load_draft):
+        """Not-previewed block should NOT halt the turn (agent can fix by previewing)."""
+        body = "Not previewed body"
+        load_draft(body=body)
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "email:me@test.com", "message": body},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert result.get("halt_turn") is not True
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +267,19 @@ class TestGateApproved:
         assert result is not None
         assert result["action"] == "block"
         assert "approve-email" in result["message"].lower() or "approval" in result["message"].lower()
+
+    def test_not_approved_block_has_halt_turn(self, pre_hook, load_draft, show_preview):
+        """Not-approved block should include halt_turn=True (requires user action)."""
+        body = "Halt turn draft"
+        load_draft(body=body)
+        show_preview(draft_id=_body_hash(body))
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": "email:halt@example.com", "message": body},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert result.get("halt_turn") is True
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +328,28 @@ class TestExpiredApproval:
         assert result["action"] == "block"
         assert "expir" in result["message"].lower() or "approval" in result["message"].lower()
 
+    def test_expired_approval_block_has_halt_turn(self, plugin, pre_hook, load_draft, show_preview, approve_cmd):
+        """Expired approval block should include halt_turn=True (requires user action)."""
+        body = "Expiring halt draft"
+        recipient = "halt-expire@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        ah = plugin._approval_hash(recipient, body)
+        state = plugin._load_state()
+        state["approvals"][ah]["expires_at"] = time.time() - 1
+        plugin._save_state(state)
+
+        result = pre_hook(
+            tool_name="send_message",
+            args={"target": f"email:{recipient}", "message": body},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+        assert result.get("halt_turn") is True
+
 
 # ---------------------------------------------------------------------------
 # 8. email_load_draft stores draft and computes hash
@@ -306,11 +363,14 @@ class TestLoadDraft:
         # Tool should return something containing the hash
         assert expected_hash in result
 
-        # Verify state file
+        # Verify draft stored as individual file
+        draft = plugin._load_draft(expected_hash)
+        assert draft is not None
+        assert draft["body"] == body
+        assert draft["loaded_at"] is not None
+
+        # Verify state tracks current pointer
         state = plugin._load_state()
-        assert expected_hash in state["drafts"]
-        assert state["drafts"][expected_hash]["body"] == body
-        assert state["drafts"][expected_hash]["loaded_at"] is not None
         assert state["current"] == expected_hash
 
 
@@ -328,8 +388,8 @@ class TestShowPreview:
         result = show_preview(draft_id=draft_id)
         after = time.time()
 
-        state = plugin._load_state()
-        previewed = state["drafts"][draft_id]["previewed_at"]
+        draft = plugin._load_draft(draft_id)
+        previewed = draft["previewed_at"]
         assert previewed is not None
         assert before <= previewed <= after
         # Preview should contain the body text
@@ -631,3 +691,125 @@ class TestApproveRejectsInvalidHashGracefully:
         result = approve_cmd("not-a-hash-at-all")
 
         assert "approved" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 19. Drafts stored as individual files, not in state.json
+# ---------------------------------------------------------------------------
+
+class TestDraftFiles:
+    """Verify drafts are stored as individual files, not in state.json."""
+
+    def test_draft_saved_as_individual_file(self, plugin, load_draft):
+        """Loading a draft creates a file in the drafts directory."""
+        body = "Test draft body for file storage"
+        result_json = plugin._email_load_draft(body=body, recipient="test@example.com")
+        result = json.loads(result_json)
+        draft_hash = result["draft_id"]
+
+        drafts_dir = plugin._get_drafts_dir()
+        draft_file = drafts_dir / f"draft_{draft_hash}.json"
+        assert draft_file.exists()
+
+        data = json.loads(draft_file.read_text())
+        assert data["body"] == body
+        assert data["recipient"] == "test@example.com"
+        assert data["loaded_at"] is not None
+        assert data["previewed_at"] is None
+
+    def test_state_json_has_no_drafts_key(self, plugin, load_draft):
+        """After loading a draft, state.json should not contain 'drafts'."""
+        plugin._email_load_draft(body="No drafts in state", recipient="a@b.com")
+        state = plugin._load_state()
+        assert "drafts" not in state
+
+    def test_load_draft_returns_none_for_missing(self, plugin):
+        """_load_draft returns None for a hash that doesn't exist."""
+        assert plugin._load_draft("nonexistent_hash_abc123") is None
+
+
+# ---------------------------------------------------------------------------
+# 20. Drafts dir is configurable via hermes config
+# ---------------------------------------------------------------------------
+
+class TestConfigOverride:
+    """Verify drafts_dir is configurable via hermes config."""
+
+    def test_custom_drafts_dir(self, plugin, tmp_path, monkeypatch):
+        """When config sets drafts_dir, drafts land there."""
+        custom_dir = tmp_path / "custom_drafts"
+        # Monkeypatch the config to return our custom dir
+        monkeypatch.setattr(
+            plugin, "_get_drafts_dir",
+            lambda: (custom_dir.mkdir(parents=True, exist_ok=True) or custom_dir),
+        )
+        result = json.loads(plugin._email_load_draft(body="custom dir test", recipient="x@y.com"))
+        draft_file = custom_dir / f"draft_{result['draft_id']}.json"
+        assert draft_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# 21. Migration from legacy state.json with inline drafts
+# ---------------------------------------------------------------------------
+
+class TestMigration:
+    """Verify automatic migration from legacy state.json with inline drafts."""
+
+    def test_migrates_legacy_drafts_to_files(self, plugin):
+        """Old state.json with 'drafts' key triggers migration to individual files."""
+        body = "legacy draft body"
+        bh = hashlib.sha256(body.encode()).hexdigest()
+
+        # Write legacy-format state.json
+        state_dir = plugin._state_dir()
+        state_path = state_dir / "state.json"
+        legacy_state = {
+            "drafts": {
+                bh: {
+                    "body": body,
+                    "recipient": "old@example.com",
+                    "loaded_at": 1700000000.0,
+                    "previewed_at": None,
+                }
+            },
+            "current": bh,
+            "approvals": {},
+        }
+        state_path.write_text(json.dumps(legacy_state))
+
+        # Trigger load — should auto-migrate
+        state = plugin._load_state()
+
+        # Verify migration happened
+        assert "drafts" not in state
+        assert state["current"] == bh
+
+        # Verify individual file created
+        draft = plugin._load_draft(bh)
+        assert draft is not None
+        assert draft["body"] == body
+        assert draft["recipient"] == "old@example.com"
+
+    def test_migration_is_idempotent(self, plugin):
+        """Running migration twice doesn't error or duplicate."""
+        body = "idempotent test"
+        bh = hashlib.sha256(body.encode()).hexdigest()
+
+        state_dir = plugin._state_dir()
+        state_path = state_dir / "state.json"
+        legacy_state = {
+            "drafts": {bh: {"body": body, "recipient": "x@y.com", "loaded_at": 1.0, "previewed_at": None}},
+            "current": bh,
+            "approvals": {},
+        }
+
+        # First migration
+        state_path.write_text(json.dumps(legacy_state))
+        plugin._load_state()
+
+        # Re-write legacy state (simulating incomplete previous run)
+        state_path.write_text(json.dumps(legacy_state))
+        state = plugin._load_state()
+
+        assert "drafts" not in state
+        assert plugin._load_draft(bh)["body"] == body

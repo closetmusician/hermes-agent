@@ -239,6 +239,25 @@ def _handle_send(args):
                 )
             else:
                 return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+        # Email can be configured via env vars (SMTP) or Graph API token;
+        # synthesize a pconfig so send_message works without gateway.yaml.
+        elif platform_name == "email":
+            email_addr = os.getenv("EMAIL_ADDRESS", "").strip()
+            email_smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
+            token_path = os.path.expanduser("~/.pm-os-foci-token.json")
+            outlook_tool = os.path.expanduser("~/Code/pm_os/bin/outlook-send-mail.js")
+            has_graph = os.path.exists(token_path) and os.path.exists(outlook_tool)
+            if (email_addr and email_smtp) or has_graph:
+                from gateway.config import PlatformConfig
+                pconfig = PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "address": email_addr,
+                        "smtp_host": email_smtp,
+                    },
+                )
+            else:
+                return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
@@ -394,6 +413,9 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit
     if platform_name == "matrix" and (target_ref.startswith("!") or target_ref.startswith("@")):
+        return target_ref, None, True
+    # Email addresses are already the chat_id (recipient address)
+    if platform_name == "email" and "@" in target_ref:
         return target_ref, None, True
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
@@ -1268,6 +1290,43 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         return _error(f"Signal send failed: {e}")
 
 
+_EMAIL_HTML_TEMPLATE = (
+    "<html><head><style>"
+    "ul, ol {{ margin: 0; padding-left: 24px; }} "
+    "li {{ margin: 0 0 2px 0; }} "
+    "p {{ margin: 0 0 8px 0; }} "
+    "h1, h2, h3 {{ margin: 8px 0 4px 0; }} "
+    "hr {{ border: none; border-top: 1px solid #ccc; margin: 12px 0; }}"
+    "</style></head>"
+    '<body style="font-family: -apple-system, BlinkMacSystemFont, '
+    "'Segoe UI', Roboto, sans-serif; font-size: 14px; line-height: 1.6; "
+    'color: #333;">\n{body}\n</body></html>'
+)
+
+
+def _markdown_to_html(text):
+    """Convert markdown text to email-safe HTML.
+
+    Uses the ``markdown`` library with fenced_code and tables extensions
+    when available. Falls back to basic regex substitution so emails
+    always render formatted even if the library is missing.
+    Gotcha: the fallback is intentionally minimal -- only bold, italic,
+    bullet lists, and line breaks are handled.
+    """
+    try:
+        import markdown as _md
+
+        inner = _md.markdown(text, extensions=["fenced_code", "tables"])
+    except ImportError:
+        # Minimal manual conversion when the markdown library is absent.
+        inner = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+        inner = re.sub(r"\*(.+?)\*", r"<em>\1</em>", inner)
+        inner = re.sub(r"^- (.+)$", r"<li>\1</li>", inner, flags=re.MULTILINE)
+        inner = re.sub(r"(<li>.*</li>)", r"<ul>\1</ul>", inner, flags=re.DOTALL)
+        inner = inner.replace("\n", "<br>\n")
+    return _EMAIL_HTML_TEMPLATE.format(body=inner)
+
+
 async def _send_email(extra, chat_id, message):
     """Send email via Graph API (M365) or SMTP fallback.
 
@@ -1280,6 +1339,11 @@ async def _send_email(extra, chat_id, message):
     """
     import subprocess
 
+    # -- Markdown → HTML conversion ---------------------------------------
+    # Convert markdown body to HTML so bold, bullets, tables etc. render
+    # properly in email clients instead of showing raw markdown syntax.
+    html_body = _markdown_to_html(message)
+
     # -- Graph API path (Microsoft 365 via outlook-send-mail.js) ----------
     token_path = os.path.expanduser("~/.pm-os-foci-token.json")
     outlook_tool = os.path.expanduser("~/Code/pm_os/bin/outlook-send-mail.js")
@@ -1289,8 +1353,8 @@ async def _send_email(extra, chat_id, message):
             "node", outlook_tool,
             "--to", chat_id,
             "--subject", "Hermes Agent",
-            "--body", message,
-            "--content-type", "Text",
+            "--body", html_body,
+            "--content-type", "HTML",
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1318,7 +1382,7 @@ async def _send_email(extra, chat_id, message):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEText(html_body, "html", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"

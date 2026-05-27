@@ -1191,14 +1191,14 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
+            "Before replying, scan the skills below. If a skill matches your task, "
+            "load it with skill_view(name) and follow its instructions.\n"
+            "**Exception — native tools take priority:** If you already have a tool that directly "
+            "handles the task (e.g. send_message for email, web_search for lookups), use the tool. "
+            "Do NOT load a skill that wraps the same capability via a CLI or alternative path. "
+            "Skills are for specialized workflows, domain knowledge, and user conventions that "
+            "tools alone cannot provide.\n"
+            "Skills encode the user's preferred approach, conventions, and quality standards "
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
@@ -1215,7 +1215,7 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "Only proceed without loading a skill if none are relevant or a native tool already covers the task."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
