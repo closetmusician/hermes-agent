@@ -351,7 +351,13 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
 
 
 def should_bypass_active_session(command_name: str | None) -> bool:
-    """Return True for any resolvable slash command.
+    """Return True for any resolvable slash command (built-in or plugin).
+
+    Checks the built-in COMMAND_REGISTRY first, then falls back to
+    plugin-registered commands (via ctx.register_command()).  Without
+    the plugin fallback, commands like /approve-email are enqueued
+    behind the active-session guard instead of dispatched immediately,
+    which deadlocks approval flows that block on Event.wait().
 
     Rationale: every gateway-registered slash command either has a
     specific Level-2 handler in gateway/run.py (/stop, /new, /model,
@@ -370,7 +376,24 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     ACTIVE_SESSION_BYPASS_COMMANDS remains the subset of commands with
     explicit Level-2 handlers; the rest fall through to the catch-all.
     """
-    return resolve_command(command_name) is not None if command_name else False
+    if not command_name:
+        return False
+    if resolve_command(command_name) is not None:
+        return True
+    # Plugin-registered commands (e.g. /approve-email) must also bypass
+    # the active-session guard — they have handlers in gateway/run.py's
+    # plugin dispatch path and must not be queued.
+    # Normalize underscores to hyphens: Telegram converts hyphenated
+    # command names to underscores (see _sanitize_telegram_name), so
+    # /approve_email must match the plugin-registered "approve-email".
+    from hermes_cli.plugins import get_plugin_command_handler
+
+    if get_plugin_command_handler(command_name) is not None:
+        return True
+    normalized = command_name.replace("_", "-")
+    if normalized != command_name:
+        return get_plugin_command_handler(normalized) is not None
+    return False
 
 
 def _resolve_config_gates() -> set[str]:

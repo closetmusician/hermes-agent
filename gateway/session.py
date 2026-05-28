@@ -374,6 +374,20 @@ def build_session_context_prompt(
             "and target='yuanbao:group:<group_code>' for group chat."
         )
 
+    # Delivery policy — prevent silent platform switching on send failures
+    if context.source.platform != Platform.LOCAL:
+        lines.append("")
+        lines.append("**Delivery policy:**")
+        lines.append(f"- You are responding via {platform_name}. Always deliver responses on this platform.")
+        lines.append(
+            "- If send_message fails, retry the SAME platform 2-3 times. "
+            "Never try a different platform without explicitly asking the user first."
+        )
+        lines.append(
+            "- Do not claim a message was delivered to a platform unless "
+            "send_message returned success: true for that platform."
+        )
+
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
     for p in context.connected_platforms:

@@ -7494,7 +7494,33 @@ class GatewayRunner:
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
-                    return str(result) if result else None
+
+                    # Plugin handlers may return a dict with
+                    # ``followup_agent_message`` to trigger a new agent turn
+                    # after the command completes (e.g. /approve-email needs
+                    # the LLM to call send_message). Send the user-facing
+                    # confirmation immediately, then fall through to agent
+                    # processing with the follow-up as the user message.
+                    if isinstance(result, dict) and result.get("followup_agent_message"):
+                        _followup_text = result["followup_agent_message"]
+                        _user_msg = result.get("user_message", "")
+                        # Send the confirmation to the user immediately.
+                        if _user_msg:
+                            adapter = self.adapters.get(source.platform)
+                            if adapter:
+                                _meta = self._thread_metadata_for_source(source)
+                                try:
+                                    await adapter.send(source.chat_id, _user_msg, metadata=_meta)
+                                except Exception as _send_exc:
+                                    logger.debug("Plugin followup user-msg send failed: %s", _send_exc)
+                        # Rewrite the event so the agent sees the follow-up
+                        # as a user message and can act on it. Clear command
+                        # so downstream skill/command checks don't fire.
+                        event.text = _followup_text
+                        command = None
+                        # Fall through to agent processing below.
+                    else:
+                        return str(result) if result else None
             except Exception as e:
                 logger.debug("Plugin command dispatch failed (non-fatal): %s", e)
 
@@ -9304,6 +9330,117 @@ class GatewayRunner:
                 "or to set user_allowed_commands."
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+
+    async def _dispatch_plugin_command(
+        self,
+        command: str,
+        args: str,
+        source: "SessionSource",
+    ) -> dict:
+        """Run a plugin-registered slash command through access control and hooks.
+
+        Called from the pending-queue replay path where the dequeued text
+        bypasses ``_process_message``'s top-level dispatch.  Mirrors the
+        same access-control check (``_check_slash_access``) and
+        ``command:<name>`` hook invocation that the normal inbound path
+        runs at its top, so plugin commands cannot circumvent gating by
+        arriving while the agent is busy.
+
+        Returns a dict with ``{"handled": True/False, ...}`` plus optional
+        ``result``, ``followup_agent_message``, ``user_message``, or
+        ``denied_message`` keys.
+
+        Gotchas: hook ``rewrite`` decisions are NOT followed — plugin
+        commands don't participate in the built-in command cascade so a
+        rewrite would be silently lost. Only ``deny`` and ``handled`` are
+        honored.
+        """
+        from hermes_cli.commands import (
+            is_gateway_known_command,
+            resolve_command as _resolve_cmd,
+        )
+        from hermes_cli.plugins import get_plugin_command_handler
+
+        # Normalize Telegram underscore -> hyphen.
+        norm_command = command.replace("_", "-")
+
+        # Canonical name resolution (mirrors _process_message).
+        _cmd_def = _resolve_cmd(command) if command else None
+        canonical = _cmd_def.name if _cmd_def else command
+
+        # --- 1. Slash access control ---
+        if canonical and is_gateway_known_command(canonical):
+            denied = self._check_slash_access(source, canonical)
+            if denied is not None:
+                return {"handled": True, "denied_message": denied}
+
+        # --- 2. command:<canonical> hook ---
+        if canonical and is_gateway_known_command(canonical):
+            hook_ctx = {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "command": canonical,
+                "raw_command": command,
+                "args": args,
+                "raw_args": args,
+            }
+            try:
+                hook_results = await self.hooks.emit_collect(
+                    f"command:{canonical}", hook_ctx
+                )
+            except Exception as _hook_err:
+                logger.debug(
+                    "command:%s hook dispatch failed (non-fatal): %s",
+                    canonical, _hook_err,
+                )
+                hook_results = []
+
+            for hook_result in hook_results:
+                if not isinstance(hook_result, dict):
+                    continue
+                decision = str(hook_result.get("decision", "")).strip().lower()
+                if not decision or decision == "allow":
+                    continue
+                if decision == "deny":
+                    message = hook_result.get("message")
+                    if isinstance(message, str) and message:
+                        return {"handled": True, "denied_message": message}
+                    return {
+                        "handled": True,
+                        "denied_message": f"Command `/{command}` was blocked by a hook.",
+                    }
+                if decision == "handled":
+                    message = hook_result.get("message")
+                    return {
+                        "handled": True,
+                        "result": message if isinstance(message, str) and message else None,
+                    }
+                # ``rewrite`` is ignored for plugin commands — they don't
+                # participate in the built-in command cascade.
+
+        # --- 3. Plugin handler execution ---
+        plugin_handler = get_plugin_command_handler(norm_command)
+        if not plugin_handler:
+            return {"handled": False}
+
+        result = plugin_handler(args)
+        if asyncio.iscoroutine(result):
+            result = await result
+
+        # Plugin handlers may return a dict with ``followup_agent_message``
+        # to trigger a new agent turn after the command completes.
+        if isinstance(result, dict) and result.get("followup_agent_message"):
+            return {
+                "handled": True,
+                "followup_agent_message": result["followup_agent_message"],
+                "user_message": result.get("user_message", ""),
+            }
+
+        return {
+            "handled": True,
+            "result": str(result) if result else None,
+        }
 
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
@@ -17434,6 +17571,13 @@ class GatewayRunner:
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
+            #
+            # Plugin commands (e.g. /approve-email) also need special handling
+            # here.  The normal inbound path dispatches them at the top of
+            # _process_message before the agent is invoked, but the pending-
+            # queue replay path bypasses that dispatch entirely — the dequeued
+            # text is fed straight to _run_agent().  Without this check the
+            # LLM receives "/approve-email" as free text and hallucinates.
             if pending and pending.strip().startswith("/"):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
@@ -17450,6 +17594,78 @@ class GatewayRunner:
                             pending = None
                     except Exception:
                         pass
+
+                # Plugin-registered slash commands: dispatch through access
+                # control, command:<name> hooks, and the handler — mirroring
+                # the full pipeline that the normal inbound path runs.
+                if pending and _pending_cmd_word:
+                    try:
+                        _plugin_args = _pending_parts[1].strip() if len(_pending_parts) > 1 else ""
+                        _dispatch = await self._dispatch_plugin_command(
+                            _pending_cmd_word, _plugin_args, source,
+                        )
+                        if _dispatch.get("handled"):
+                            # Access-control denial or hook denial.
+                            _denied_msg = _dispatch.get("denied_message")
+                            if _denied_msg:
+                                if adapter:
+                                    try:
+                                        await adapter.send(
+                                            source.chat_id,
+                                            str(_denied_msg),
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to send denial for '/%s': %s",
+                                            _pending_cmd_word, e,
+                                        )
+                                pending_event = None
+                                pending = None
+                            # followup_agent_message: send the user-facing
+                            # confirmation, then keep ``pending`` set with
+                            # the follow-up text so the agent processes it.
+                            elif _dispatch.get("followup_agent_message"):
+                                _user_msg = _dispatch.get("user_message", "")
+                                if _user_msg and adapter:
+                                    try:
+                                        await adapter.send(
+                                            source.chat_id,
+                                            _user_msg,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    except Exception as _send_exc:
+                                        logger.debug(
+                                            "Plugin followup user-msg send failed: %s",
+                                            _send_exc,
+                                        )
+                                pending = _dispatch["followup_agent_message"]
+                                pending_event = None
+                            else:
+                                # Normal result — deliver to user and clear.
+                                _plugin_result = _dispatch.get("result")
+                                logger.info(
+                                    "Executed plugin command '/%s' from pending queue",
+                                    _pending_cmd_word,
+                                )
+                                if _plugin_result and adapter:
+                                    try:
+                                        await adapter.send(
+                                            source.chat_id,
+                                            str(_plugin_result),
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to send plugin command result for '/%s': %s",
+                                            _pending_cmd_word, e,
+                                        )
+                                pending_event = None
+                                pending = None
+                    except Exception as e:
+                        logger.debug(
+                            "Plugin command dispatch in pending queue failed (non-fatal): %s", e
+                        )
 
             if self._draining and (pending_event or pending):
                 logger.info(

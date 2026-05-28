@@ -350,7 +350,7 @@ def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _handle_approve(raw_args: str) -> str:
+def _handle_approve(raw_args: str) -> str | dict:
     """Approve an email draft for sending. Sets a 15-minute approval window.
 
     Usage: /approve-email [draft_id]
@@ -358,6 +358,8 @@ def _handle_approve(raw_args: str) -> str:
     (most recently loaded) draft. Approval is bound to the (recipient, body)
     tuple stored in the draft so it cannot be replayed to a different recipient.
     Gotchas: Only works after the draft has been loaded and previewed.
+    On success returns a dict with ``followup_agent_message`` so the gateway
+    can trigger a new agent turn that calls send_message.
     """
     raw = raw_args.strip() if raw_args else ""
     draft_id = raw if _SHA256_RE.match(raw) else ""
@@ -387,11 +389,28 @@ def _handle_approve(raw_args: str) -> str:
     }
     _save_state(state)
 
-    recipient_note = f" for {recipient}" if recipient else ""
-    return (
+    recipient_note = f" to {recipient}" if recipient else ""
+    user_message = (
         f"Email draft approved{recipient_note} (id: {draft_id[:12]}...). "
         f"Approval valid for {APPROVAL_TTL_SECONDS // 60} minutes."
     )
+
+    # Build a follow-up message for the agent so it knows to call
+    # send_message now that approval has been granted. Include enough
+    # context for the LLM to construct the send_message call.
+    body_preview = draft["body"][:200]
+    if len(draft["body"]) > 200:
+        body_preview += "..."
+    followup = (
+        f"The user has approved sending the email{recipient_note}. "
+        f"Call send_message now with target='email:{recipient}' and the approved body. "
+        f"Draft id: {draft_id[:12]}... | Body preview: {body_preview}"
+    )
+
+    return {
+        "user_message": user_message,
+        "followup_agent_message": followup,
+    }
 
 
 # ---------------------------------------------------------------------------

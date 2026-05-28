@@ -668,19 +668,35 @@ class GatewayStreamConsumer:
         """Send a new message chunk, optionally threaded to a previous message.
 
         Returns the message_id so callers can thread subsequent chunks.
+        Retries up to 2 times with exponential backoff on transient errors
+        (result.retryable=True or network-like error strings) so overflow
+        chunks are not silently dropped.
         """
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
         try:
             meta = dict(self.metadata) if self.metadata else {}
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=text,
-                reply_to=reply_to_id,
-                metadata=meta,
-            )
-            if result.success and result.message_id:
+            result = None
+            for attempt in range(3):
+                result = await self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=text,
+                    reply_to=reply_to_id,
+                    metadata=meta,
+                )
+                if result.success:
+                    break
+                if not self._is_retryable_send(result):
+                    break  # permanent failure — no point retrying
+                delay = 2.0 * (2 ** attempt)
+                logger.warning(
+                    "Stream chunk send failed (attempt %d/3, retrying in %.0fs): %s",
+                    attempt + 1, delay, getattr(result, "error", "unknown"),
+                )
+                await asyncio.sleep(delay)
+
+            if result and result.success and result.message_id:
                 self._message_id = str(result.message_id)
                 self._already_sent = True
                 self._last_sent_text = text
@@ -859,6 +875,26 @@ class GatewayStreamConsumer:
         err = getattr(result, "error", "") or ""
         err_lower = err.lower()
         return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
+
+    def _is_retryable_send(self, result) -> bool:
+        """Check if a failed SendResult warrants a retry.
+
+        Returns True for transient errors: explicit retryable flag, flood
+        control, or network-like error strings (connect error, DNS, etc.).
+        Timeout errors are excluded — the request may have landed.
+        """
+        if getattr(result, "retryable", False):
+            return True
+        if self._is_flood_error(result):
+            return True
+        err = getattr(result, "error", "") or ""
+        err_lower = err.lower()
+        if "timed out" in err_lower or "timeout" in err_lower:
+            return False
+        # Match the retryable-error patterns used by BasePlatformAdapter
+        return any(
+            p in err_lower for p in ("connect", "dns", "network", "reset", "refused")
+        )
 
     def _resolve_draft_streaming(self) -> bool:
         """Decide whether this run should use native draft streaming.
@@ -1273,13 +1309,28 @@ class GatewayStreamConsumer:
                     return False
             else:
                 # First message — send new, threaded to the original user message
-                # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
-                )
+                # so it lands in the correct topic/thread.  Retry up to 2 times
+                # on transient errors so the first visible message is not
+                # silently dropped (e.g. brief network blip, DNS hiccup).
+                result = None
+                for attempt in range(3):
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self.metadata,
+                    )
+                    if result.success:
+                        break
+                    if not self._is_retryable_send(result):
+                        break  # permanent failure — no point retrying
+                    delay = 2.0 * (2 ** attempt)
+                    logger.warning(
+                        "Stream first-send failed (attempt %d/3, retrying in %.0fs): %s",
+                        attempt + 1, delay, getattr(result, "error", "unknown"),
+                    )
+                    await asyncio.sleep(delay)
+
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id

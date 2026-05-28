@@ -816,3 +816,76 @@ Patterns matched: smtplib, SMTP(), nodemailer, sendgrid, mailgun, .sendmail(), s
 **Gap:** Phase 4 policies block known email-sending *code patterns* (regex blocklist) but do NOT prevent reading `~/.pm-os-foci-token.json` or other auth token files. A novel sending mechanism not in the regex patterns could still grab the token and send email.
 
 **Potential fix:** Add read-deny policies for sensitive credential files (`~/.pm-os-foci-token.json`, `~/.pm-os-foci-office-token.json`) or move token access behind a gated tool that requires approval (similar to email-send-guard's approval workflow).
+
+## Phase 5: Fix Silent Channel Routing (2026-05-27)
+
+**Incident:** User messaged Hermes on Telegram requesting a daily briefing. Hermes hit a transient SSL handshake error on Telegram delivery, then silently fell back to WhatsApp without informing the user. Subsequent deliveries kept going to WhatsApp without retrying Telegram.
+
+**Root Cause Analysis (Codex-verified):**
+
+### 5.1 [P1] No delivery-failure guidance in session context prompt
+
+- **File:** `gateway/session.py` — `build_session_context_prompt()` (~line 231)
+- **Bug:** The session context prompt lists connected platforms and home channels but gives NO instruction about what the agent should do when a `send_message` call fails. The agent sees WhatsApp as an available platform and autonomously routes there after Telegram fails — without asking the user.
+- **Codex verdict:** AGREE — P1, direct cause of the incident
+- **Fix:** Add delivery-failure policy to `build_session_context_prompt()`:
+  - [ ] Add section: "When a message delivery fails, retry the SAME platform 2-3 times before giving up"
+  - [ ] Add section: "NEVER silently switch to a different platform. If delivery fails after retries, inform the user and ask which platform to use"
+  - [ ] Add section: "Do not claim a message was delivered to a platform unless the send_message tool returned success for that platform"
+
+### 5.2 [P2] SSL/TLS errors not classified as retryable
+
+- **File:** `gateway/platforms/base.py` — `_RETRYABLE_ERROR_PATTERNS` (~line 1266)
+- **Bug:** The retryable error pattern list includes "connecterror", "connectionreset", "network", etc. but NOT "ssl", "handshake", or "certificate". SSL handshake failures are transient network errors that should be retried.
+- **Codex verdict:** AGREE — P2, real gap but Telegram adapter partially compensates (marks most non-timeout exceptions as retryable=True at telegram.py:1913). The standalone `send_message` tool's `_telegram_retry_delay()` has the same gap (send_message_tool.py:82).
+- **Fix:**
+  - [ ] Add "ssl", "handshake", "certificate" to `_RETRYABLE_ERROR_PATTERNS` in `gateway/platforms/base.py`
+  - [ ] Verify `_telegram_retry_delay()` in `tools/send_message_tool.py` also covers SSL errors
+
+### 5.3 [NOT A BUG] No cross-platform fallback in code
+
+- **Codex verdict:** AGREE — NOT A BUG. The code correctly does NOT implement cross-platform fallback. `send_message_tool.py` routes to the requested platform and returns error on failure. `_send_with_retry` only retries the same platform. The silent channel switch was LLM agent behavior, not a code defect.
+- **Action:** No code change needed. The P1 fix (prompt guidance) addresses this.
+
+### Implementation Checklist
+
+- [ ] **P1 — Session context prompt** (`gateway/session.py`): Add delivery-failure policy section to `build_session_context_prompt()`
+- [ ] **P2 — Retryable errors** (`gateway/platforms/base.py`): Add SSL/TLS patterns to `_RETRYABLE_ERROR_PATTERNS`
+- [ ] **P2 — Send tool retry** (`tools/send_message_tool.py`): Verify `_telegram_retry_delay()` covers SSL errors
+- [ ] **Tests**: Add test for SSL error retry classification in `tests/gateway/test_platform_base.py`
+- [ ] **Tests**: Add test for delivery-failure prompt content in `tests/gateway/test_session_context.py`
+
+### 5.4 [P1] "mirrored" field semantically ambiguous (Codex-found)
+
+- **File:** `tools/send_message_tool.py` — line ~343
+- **Bug:** When `send_message` succeeds and `mirror_to_session()` writes to the session transcript, the result includes `"mirrored": true`. The LLM interprets "mirrored" as "also sent to another platform" and falsely claims "Mirrored to telegram" — when it actually means "recorded in the receiving session's transcript". This is the direct cause of the false "Mirrored to telegram" claim in the incident.
+- **Codex verdict:** AGREE — P1, recommends renaming to `"transcript_mirrored"` or `"session_mirrored"`
+- **Fix:**
+  - [ ] Rename `"mirrored"` key to `"transcript_mirrored"` in send_message result JSON
+  - [ ] OR add a clarifying note: `"mirror_note": "mirrored means recorded in session transcript, not sent to another platform"`
+
+### 5.5 [P2] Stream consumer bypasses retry logic (Codex-found)
+
+- **File:** `gateway/stream_consumer.py` — lines 1277-1310
+- **Bug:** The stream consumer calls `adapter.send()` directly instead of `adapter._send_with_retry()`. When Telegram returns `SendResult(success=False, retryable=True)` for a transient SSL error, the stream consumer ignores the `retryable` flag, disables streaming, and returns `False`. The message is silently lost.
+- **Codex verdict:** AGREE — P2, the streaming path bypasses the retry logic that exists in the non-streaming path
+- **Fix:**
+  - [ ] Check `result.retryable` in stream_consumer before giving up
+  - [ ] Use `_send_with_retry()` or implement retry loop for transient errors
+
+### 5.6 [P2] Telegram media sends skip retry entirely
+
+- **File:** `tools/send_message_tool.py` — lines ~962-1030
+- **Bug:** `_send_telegram_message_with_retry()` only wraps `bot.send_message()`. Media sends (`send_photo`, `send_video`, etc.) have no retry wrapper, making them fragile to transient errors.
+- **Codex verdict:** AGREE — P2
+- **Fix:**
+  - [ ] Add retry wrapper around Telegram media sends
+
+### Updated Implementation Checklist
+
+- [ ] **P1 — Session context prompt** (`gateway/session.py`): Add delivery-failure policy to `build_session_context_prompt()`
+- [ ] **P1 — Rename "mirrored" field** (`tools/send_message_tool.py`): Rename to `transcript_mirrored` to prevent LLM misinterpretation
+- [ ] **P2 — Retryable errors** (`gateway/platforms/base.py`): Add SSL/TLS patterns to `_RETRYABLE_ERROR_PATTERNS`
+- [ ] **P2 — Stream consumer retry** (`gateway/stream_consumer.py`): Check `retryable` flag before giving up
+- [ ] **P2 — Send tool retry** (`tools/send_message_tool.py`): Add SSL to `_telegram_retry_delay()` and wrap media sends
+- [ ] **Tests**: SSL error retry classification, delivery-failure prompt content, stream consumer retry behavior

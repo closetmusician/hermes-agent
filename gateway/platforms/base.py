@@ -1273,6 +1273,9 @@ _RETRYABLE_ERROR_PATTERNS = (
     "broken pipe",
     "remotedisconnected",
     "eoferror",
+    "ssl",
+    "handshake",
+    "certificate",
 )
 
 

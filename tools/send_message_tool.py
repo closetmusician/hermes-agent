@@ -113,6 +113,30 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
             await asyncio.sleep(delay)
 
 
+async def _send_telegram_media_with_retry(send_fn, file_handle, *, attempts: int = 3, **kwargs):
+    """Retry wrapper for Telegram media sends (photo, video, voice, audio, document).
+
+    Re-seeks the file handle before each retry so the Bot API receives
+    the full payload again. Uses the same back-off logic as text sends.
+    """
+    for attempt in range(attempts):
+        try:
+            return await send_fn(**kwargs)
+        except Exception as exc:
+            delay = _telegram_retry_delay(exc, attempt)
+            if delay is None or attempt >= attempts - 1:
+                raise
+            logger.warning(
+                "Transient Telegram media send failure (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1,
+                attempts,
+                delay,
+                _sanitize_error_text(exc),
+            )
+            await asyncio.sleep(delay)
+            file_handle.seek(0)
+
+
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
@@ -325,6 +349,16 @@ def _handle_send(args):
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
+        # Warn when sending to a different platform than the session originated on
+        if isinstance(result, dict) and result.get("success"):
+            try:
+                from gateway.session_context import get_session_env
+                session_platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+                if session_platform and session_platform not in ("cli", "local", "") and session_platform != platform_name:
+                    result["warning"] = f"You are sending to {platform_name} but this session originated on {session_platform}. Are you sure?"
+            except Exception:
+                pass
+
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:
             try:
@@ -340,7 +374,7 @@ def _handle_send(args):
                     thread_id=thread_id,
                     user_id=user_id,
                 ):
-                    result["mirrored"] = True
+                    result["transcript_mirrored"] = True
             except Exception:
                 pass
 
@@ -972,23 +1006,28 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     media_kwargs = dict(thread_kwargs)
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
-                            last_msg = await bot.send_photo(
+                            last_msg = await _send_telegram_media_with_retry(
+                                bot.send_photo, f,
                                 chat_id=int_chat_id, photo=f, **media_kwargs
                             )
                         elif ext in _VIDEO_EXTS:
-                            last_msg = await bot.send_video(
+                            last_msg = await _send_telegram_media_with_retry(
+                                bot.send_video, f,
                                 chat_id=int_chat_id, video=f, **media_kwargs
                             )
                         elif ext in _VOICE_EXTS and is_voice:
-                            last_msg = await bot.send_voice(
+                            last_msg = await _send_telegram_media_with_retry(
+                                bot.send_voice, f,
                                 chat_id=int_chat_id, voice=f, **media_kwargs
                             )
                         elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                            last_msg = await bot.send_audio(
+                            last_msg = await _send_telegram_media_with_retry(
+                                bot.send_audio, f,
                                 chat_id=int_chat_id, audio=f, **media_kwargs
                             )
                         else:
-                            last_msg = await bot.send_document(
+                            last_msg = await _send_telegram_media_with_retry(
+                                bot.send_document, f,
                                 chat_id=int_chat_id, document=f, **media_kwargs
                             )
                     except Exception as media_err:
@@ -1003,23 +1042,28 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
                             if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
+                                last_msg = await _send_telegram_media_with_retry(
+                                    bot.send_photo, f,
                                     chat_id=int_chat_id, photo=f, **media_kwargs
                                 )
                             elif ext in _VIDEO_EXTS:
-                                last_msg = await bot.send_video(
+                                last_msg = await _send_telegram_media_with_retry(
+                                    bot.send_video, f,
                                     chat_id=int_chat_id, video=f, **media_kwargs
                                 )
                             elif ext in _VOICE_EXTS and is_voice:
-                                last_msg = await bot.send_voice(
+                                last_msg = await _send_telegram_media_with_retry(
+                                    bot.send_voice, f,
                                     chat_id=int_chat_id, voice=f, **media_kwargs
                                 )
                             elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                                last_msg = await bot.send_audio(
+                                last_msg = await _send_telegram_media_with_retry(
+                                    bot.send_audio, f,
                                     chat_id=int_chat_id, audio=f, **media_kwargs
                                 )
                             else:
-                                last_msg = await bot.send_document(
+                                last_msg = await _send_telegram_media_with_retry(
+                                    bot.send_document, f,
                                     chat_id=int_chat_id, document=f, **media_kwargs
                                 )
                         else:

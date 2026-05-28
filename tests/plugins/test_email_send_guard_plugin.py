@@ -647,7 +647,9 @@ class TestApproveIgnoresNonHashArgs:
         # Freetext arg — not a valid sha256 hash
         result = approve_cmd("to yu_kuan@yahoo.com")
 
-        assert "approved" in result.lower()
+        # Handler returns dict on success with user_message + followup_agent_message
+        msg = result["user_message"] if isinstance(result, dict) else result
+        assert "approved" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +668,9 @@ class TestApproveAcceptsValidHash:
 
         result = approve_cmd(draft_id)
 
-        assert "approved" in result.lower()
+        # Handler returns dict on success with user_message + followup_agent_message
+        msg = result["user_message"] if isinstance(result, dict) else result
+        assert "approved" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +694,9 @@ class TestApproveRejectsInvalidHashGracefully:
         # "not-a-hash-at-all" is not hex and not 64 chars — should be ignored
         result = approve_cmd("not-a-hash-at-all")
 
-        assert "approved" in result.lower()
+        # Handler returns dict on success with user_message + followup_agent_message
+        msg = result["user_message"] if isinstance(result, dict) else result
+        assert "approved" in msg.lower()
 
 
 # ---------------------------------------------------------------------------
