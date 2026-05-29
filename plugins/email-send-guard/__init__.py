@@ -128,7 +128,7 @@ def _empty_state() -> dict:
       approvals: {hash: {approved_at, expires_at}}
     Drafts are stored as individual files via _save_draft/_load_draft.
     """
-    return {"current": None, "approvals": {}}
+    return {"current": None, "current_by_session": {}, "approvals": {}}
 
 
 def _load_state() -> dict:
@@ -142,9 +142,11 @@ def _load_state() -> dict:
         if "drafts" in data:
             data = _migrate_drafts_from_state(data)
         # Ensure all top-level keys present
-        for key in ("current", "approvals"):
+        for key in ("current", "current_by_session", "approvals"):
             if key not in data:
                 data[key] = _empty_state()[key]
+        if not isinstance(data.get("current_by_session"), dict):
+            data["current_by_session"] = {}
         # Drop any lingering drafts key
         data.pop("drafts", None)
         return data
@@ -169,6 +171,41 @@ def _body_hash(body: str) -> str:
     since the review step is about inspecting what will be sent.
     """
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _scope_key(session_id: str = "", session_key: str = "") -> str:
+    """Return a stable draft-current scope for a conversation, if available."""
+    return (session_id or session_key or "").strip()
+
+
+def _get_current_draft_id(state: dict, session_id: str = "", session_key: str = "") -> str:
+    """Return the current draft for this session, falling back only for unscoped callers."""
+    scope = _scope_key(session_id, session_key)
+    if scope:
+        current_by_session = state.get("current_by_session") or {}
+        return str(current_by_session.get(scope) or "")
+    return str(state.get("current") or "")
+
+
+def _set_current_draft_id(state: dict, draft_id: str, session_id: str = "", session_key: str = "") -> None:
+    """Set the current draft globally for legacy callers and per-session when scoped."""
+    state["current"] = draft_id
+    scope = _scope_key(session_id, session_key)
+    if scope:
+        current_by_session = state.setdefault("current_by_session", {})
+        if isinstance(current_by_session, dict):
+            current_by_session[scope] = draft_id
+
+
+def _clear_current_draft_id(state: dict, draft_id: str) -> None:
+    """Clear current pointers that still point at a successfully sent draft."""
+    if state.get("current") == draft_id:
+        state["current"] = None
+    current_by_session = state.get("current_by_session") or {}
+    if isinstance(current_by_session, dict):
+        for scope, current in list(current_by_session.items()):
+            if current == draft_id:
+                del current_by_session[scope]
 
 
 def _extract_recipient(target: str) -> str:
@@ -254,55 +291,29 @@ def _pre_tool_call(
             ),
         }
 
-    # Gate 3: user must have approved (and approval must not be expired).
-    # Approval is keyed by draft_id (body hash) so we look up the current
-    # draft's approval status directly, not via a separate approval hash.
+    # Gate 3: user must have approved this exact body hash (and approval
+    # must not be expired). Do not rely on the mutable "current" pointer here:
+    # "current" is only a UI convenience for /approve-email with no draft id.
     current_draft_id = state.get("current")
     logger.warning(
         "[EMAIL-TRACE] Gate 3: body_hash=%s, current_draft_id=%s, matching=%s",
         bh, current_draft_id, bh == current_draft_id,
     )
-    if not current_draft_id:
-        return {
-            "action": "block",
-            "halt_turn": True,
-            "message": (
-                "Email send blocked: no current draft set. "
-                "Load a draft first with email_load_draft, then preview and approve."
-            ),
-        }
 
-    # Body-hash enforcement: the send body must match the approved draft.
-    # Without this, an approved draft could authorize a completely different body.
-    if bh != current_draft_id:
-        logger.warning(
-            "[EMAIL-TRACE] Gate 3: body hash mismatch — send body hash=%s, approved draft=%s",
-            bh, current_draft_id,
-        )
-        return {
-            "action": "block",
-            "halt_turn": True,
-            "message": (
-                "Email send blocked: the message body does not match the approved draft. "
-                "The approved draft has a different body than what you're trying to send. "
-                "Call email_load_draft with the exact body you want to send, then get approval again."
-            ),
-        }
-
-    approval = state["approvals"].get(current_draft_id)
+    approval = state["approvals"].get(bh)
     logger.warning(
         "[EMAIL-TRACE] Gate 3: draft_id=%s, approval_found=%s, approval=%s",
-        current_draft_id, approval is not None, approval,
+        bh, approval is not None, approval,
     )
     if not approval:
         return {
             "action": "block",
             "halt_turn": True,
             "message": (
-                "Email send blocked: draft previewed but not yet approved. "
-                "The user must run /approve-email in Telegram — you cannot do this. "
-                "STOP here. Do not call send_message again or attempt alternative transports (SMTP, himalaya CLI, etc.). "
-                "Only the send_message tool is permitted for outbound email."
+                "Email send blocked: draft previewed but not yet approved by the user. "
+                "NEXT STEP: Wait for the user to run /approve-email — only they can do this. "
+                "Once approved, call send_message with the same body and recipient to send. "
+                "The send_message tool is still available; it will succeed after user approval."
             ),
         }
 
@@ -315,9 +326,12 @@ def _pre_tool_call(
             "action": "block",
             "halt_turn": True,
             "message": (
-                "Email send blocked: previous approval expired. The user must restart the workflow. "
-                "STOP here. Do not call send_message again or attempt alternative transports (SMTP, himalaya CLI, etc.). "
-                "Only the send_message tool is permitted for outbound email."
+                "Email send blocked: previous approval has expired (15-minute TTL). "
+                "To resend, restart the approval workflow:\n"
+                "1. Call email_load_draft(body=..., recipient=...) to reload the draft\n"
+                "2. Call email_show_preview() to show it to the user\n"
+                "3. Wait for the user to run /approve-email\n"
+                "4. Then call send_message to send"
             ),
         }
 
@@ -334,7 +348,8 @@ def _pre_tool_call(
             "halt_turn": True,
             "message": (
                 f"Email send blocked: recipient mismatch. Approved for '{approved_recipient}' "
-                f"but send target is '{send_recipient}'. Load a new draft for this recipient."
+                f"but send target is '{send_recipient}'. "
+                f"Call email_load_draft(body=..., recipient='{send_recipient}') to start a new approval for this recipient."
             ),
         }
 
@@ -343,7 +358,7 @@ def _pre_tool_call(
     # doesn't burn the approval.
     logger.warning(
         "[EMAIL-TRACE] Gate 3: all gates passed for draft_id=%s — send allowed (approval preserved until post_tool_call)",
-        current_draft_id,
+        bh,
     )
     return None
 
@@ -390,25 +405,22 @@ def _post_tool_call(
     body = args.get("message", "")
     bh = _body_hash(body)
     state = _load_state()
-    current_draft_id = state.get("current")
-
-    if not current_draft_id or bh != current_draft_id:
-        return
 
     if send_failed:
         logger.warning(
             "[EMAIL-TRACE] post_tool_call: send_message failed — approval preserved for draft_id=%s",
-            current_draft_id,
+            bh,
         )
         return
 
     # Send succeeded — consume the one-time approval
-    if current_draft_id in state.get("approvals", {}):
-        del state["approvals"][current_draft_id]
+    if bh in state.get("approvals", {}):
+        del state["approvals"][bh]
+        _clear_current_draft_id(state, bh)
         _save_state(state)
         logger.warning(
             "[EMAIL-TRACE] post_tool_call: approval consumed after successful send for draft_id=%s",
-            current_draft_id,
+            bh,
         )
 
 
@@ -416,7 +428,13 @@ def _post_tool_call(
 # Registered tools (agent-callable)
 # ---------------------------------------------------------------------------
 
-def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
+def _email_load_draft(
+    body: str = "",
+    recipient: str = "",
+    session_id: str = "",
+    session_key: str = "",
+    **_kw: Any,
+) -> str:
     """Store a draft email body for review. Computes and returns the content hash.
 
     Usage: Agent calls this before sending any email. The hash identifies the
@@ -436,7 +454,7 @@ def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
         "previewed_at": None,
     })
     state = _load_state()
-    state["current"] = h
+    _set_current_draft_id(state, h, session_id=session_id, session_key=session_key)
     _save_state(state)
 
     return json.dumps({
@@ -448,7 +466,12 @@ def _email_load_draft(body: str = "", recipient: str = "", **_kw: Any) -> str:
     })
 
 
-def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
+def _email_show_preview(
+    draft_id: str = "",
+    session_id: str = "",
+    session_key: str = "",
+    **_kw: Any,
+) -> str:
     """Show a formatted preview of a loaded draft and mark it as previewed.
 
     Usage: Agent calls this after email_load_draft. Omit draft_id to preview
@@ -458,7 +481,7 @@ def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
     state = _load_state()
 
     if not draft_id:
-        draft_id = state.get("current", "")
+        draft_id = _get_current_draft_id(state, session_id=session_id, session_key=session_key)
     if not draft_id:
         return json.dumps({"error": "No draft to preview. Load a draft first with email_load_draft."})
 
@@ -484,7 +507,12 @@ def _email_show_preview(draft_id: str = "", **_kw: Any) -> str:
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _handle_approve(raw_args: str) -> str | dict:
+def _handle_approve(
+    raw_args: str,
+    session_id: str = "",
+    session_key: str = "",
+    **_kw: Any,
+) -> str | dict:
     """Approve an email draft for sending. Sets a 15-minute approval window.
 
     Usage: /approve-email [draft_id]
@@ -502,10 +530,16 @@ def _handle_approve(raw_args: str) -> str | dict:
     state = _load_state()
 
     if not draft_id:
-        draft_id = state.get("current", "")
-        logger.warning("[EMAIL-TRACE] No draft_id in args, using state['current']=%s", draft_id)
+        draft_id = _get_current_draft_id(state, session_id=session_id, session_key=session_key)
+        logger.warning(
+            "[EMAIL-TRACE] No draft_id in args, using scoped current=%s session_id=%s session_key=%s",
+            draft_id, session_id, session_key,
+        )
     if not draft_id:
-        return "No draft to approve. Load a draft first with email_load_draft."
+        return (
+            "No draft to approve for this session. Load and preview a draft first with "
+            "email_load_draft/email_show_preview, or run /approve-email <draft_id>."
+        )
 
     draft = _load_draft(draft_id)
     if not draft:
@@ -517,6 +551,8 @@ def _handle_approve(raw_args: str) -> str | dict:
     # look it up directly from the current draft pointer.
     recipient = draft.get("recipient", "")
     logger.warning("[EMAIL-TRACE] _handle_approve: draft_id=%s, recipient=%s", draft_id, recipient)
+    if not recipient:
+        return "Draft has no recipient. Load a new draft with a required recipient before approving."
 
     now = time.time()
     state["approvals"][draft_id] = {
