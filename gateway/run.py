@@ -7490,10 +7490,17 @@ class GatewayRunner:
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
+                    logger.warning("[EMAIL-TRACE] _process_message: plugin command handler found for /%s", command)
                     user_args = event.get_command_args().strip()
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
+
+                    logger.warning(
+                        "[EMAIL-TRACE] _process_message: plugin handler raw result type=%s keys=%s",
+                        type(result).__name__,
+                        list(result.keys()) if isinstance(result, dict) else "N/A",
+                    )
 
                     # Plugin handlers may return a dict with
                     # ``followup_agent_message`` to trigger a new agent turn
@@ -7502,6 +7509,7 @@ class GatewayRunner:
                     # confirmation immediately, then fall through to agent
                     # processing with the follow-up as the user message.
                     if isinstance(result, dict) and result.get("followup_agent_message"):
+                        logger.warning("[EMAIL-TRACE] _process_message: followup_agent_message detected, rewriting event.text")
                         _followup_text = result["followup_agent_message"]
                         _user_msg = result.get("user_message", "")
                         # Send the confirmation to the user immediately.
@@ -7517,9 +7525,15 @@ class GatewayRunner:
                         # as a user message and can act on it. Clear command
                         # so downstream skill/command checks don't fire.
                         event.text = _followup_text
+                        logger.warning(
+                            "[EMAIL-TRACE] _process_message: event.text rewritten to: %.200s",
+                            _followup_text,
+                        )
                         command = None
+                        logger.warning("[EMAIL-TRACE] _process_message: falling through to agent processing with followup")
                         # Fall through to agent processing below.
                     else:
+                        logger.warning("[EMAIL-TRACE] _process_message: plugin returned non-followup, returning early")
                         return str(result) if result else None
             except Exception as e:
                 logger.debug("Plugin command dispatch failed (non-fatal): %s", e)
@@ -9004,6 +9018,14 @@ class GatewayRunner:
             )
         finally:
             # Restore session context variables to their pre-handler state
+            try:
+                from gateway.session_context import get_session_env
+                logger.warning(
+                    "[EMAIL-TRACE] _clear_session_env: clearing HERMES_SESSION_PLATFORM (was: %s)",
+                    get_session_env("HERMES_SESSION_PLATFORM", ""),
+                )
+            except Exception:
+                pass
             self._clear_session_env(_session_env_tokens)
 
     def _format_session_info(self) -> str:
@@ -9362,6 +9384,8 @@ class GatewayRunner:
         )
         from hermes_cli.plugins import get_plugin_command_handler
 
+        logger.warning("[EMAIL-TRACE] _dispatch_plugin_command: entry command=%s args=%.100s", command, args)
+
         # Normalize Telegram underscore -> hyphen.
         norm_command = command.replace("_", "-")
 
@@ -9422,21 +9446,37 @@ class GatewayRunner:
         # --- 3. Plugin handler execution ---
         plugin_handler = get_plugin_command_handler(norm_command)
         if not plugin_handler:
+            logger.warning("[EMAIL-TRACE] _dispatch_plugin_command: no handler found for %s", norm_command)
             return {"handled": False}
 
+        logger.warning("[EMAIL-TRACE] _dispatch_plugin_command: handler found for %s, invoking", norm_command)
         result = plugin_handler(args)
         if asyncio.iscoroutine(result):
             result = await result
 
+        logger.warning(
+            "[EMAIL-TRACE] _dispatch_plugin_command: raw result type=%s",
+            type(result).__name__,
+        )
+
         # Plugin handlers may return a dict with ``followup_agent_message``
         # to trigger a new agent turn after the command completes.
         if isinstance(result, dict) and result.get("followup_agent_message"):
+            logger.warning(
+                "[EMAIL-TRACE] _dispatch_plugin_command: returning followup_agent_message=%.200s user_message=%.100s",
+                result["followup_agent_message"],
+                result.get("user_message", ""),
+            )
             return {
                 "handled": True,
                 "followup_agent_message": result["followup_agent_message"],
                 "user_message": result.get("user_message", ""),
             }
 
+        logger.warning(
+            "[EMAIL-TRACE] _dispatch_plugin_command: returning handled=True result=%s",
+            "present" if result else "None",
+        )
         return {
             "handled": True,
             "result": str(result) if result else None,
@@ -15674,6 +15714,13 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        logger.warning(
+            "[EMAIL-TRACE] _run_agent: entry message=%.200s _interrupt_depth=%s",
+            message, _interrupt_depth,
+        )
+        if "approved" in (message or "").lower() or "send_message" in (message or "").lower():
+            logger.warning("[EMAIL-TRACE] _run_agent: message looks like email approval followup")
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -17599,10 +17646,15 @@ class GatewayRunner:
                 # control, command:<name> hooks, and the handler — mirroring
                 # the full pipeline that the normal inbound path runs.
                 if pending and _pending_cmd_word:
+                    logger.warning("[EMAIL-TRACE] pending queue: identified plugin command /%s", _pending_cmd_word)
                     try:
                         _plugin_args = _pending_parts[1].strip() if len(_pending_parts) > 1 else ""
                         _dispatch = await self._dispatch_plugin_command(
                             _pending_cmd_word, _plugin_args, source,
+                        )
+                        logger.warning(
+                            "[EMAIL-TRACE] pending queue: dispatch result keys=%s",
+                            list(_dispatch.keys()) if isinstance(_dispatch, dict) else "N/A",
                         )
                         if _dispatch.get("handled"):
                             # Access-control denial or hook denial.
@@ -17626,6 +17678,7 @@ class GatewayRunner:
                             # confirmation, then keep ``pending`` set with
                             # the follow-up text so the agent processes it.
                             elif _dispatch.get("followup_agent_message"):
+                                logger.warning("[EMAIL-TRACE] pending queue: followup_agent_message path taken")
                                 _user_msg = _dispatch.get("user_message", "")
                                 if _user_msg and adapter:
                                     try:
@@ -17640,6 +17693,10 @@ class GatewayRunner:
                                             _send_exc,
                                         )
                                 pending = _dispatch["followup_agent_message"]
+                                logger.warning(
+                                    "[EMAIL-TRACE] pending queue: pending set to followup=%.200s",
+                                    pending,
+                                )
                                 pending_event = None
                             else:
                                 # Normal result — deliver to user and clear.
@@ -17807,6 +17864,10 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+                logger.warning(
+                    "[EMAIL-TRACE] pending queue: about to call recursive _run_agent with message=%.200s depth=%s",
+                    next_message, _interrupt_depth + 1,
+                )
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,

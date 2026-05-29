@@ -125,6 +125,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         block_result = None
         blocked_by_guardrail = False
         _conc_block_halt_turn = False
+        if function_name == "send_message":
+            _conc_target = function_args.get("target", "")
+            if "email" in _conc_target.lower():
+                logger.warning("[EMAIL-TRACE] concurrent pre_tool_call check for send_message, target=%s", _conc_target)
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             _conc_block_result = get_pre_tool_call_block_message(
@@ -135,8 +139,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         if _conc_block_result is not None:
             block_message, _conc_block_halt_turn = _conc_block_result
+            if function_name == "send_message" and "email" in function_args.get("target", "").lower():
+                logger.warning("[EMAIL-TRACE] concurrent pre_tool_call BLOCKED send_message: message=%s, halt_turn=%s", block_message, _conc_block_halt_turn)
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             if _conc_block_halt_turn:
+                logger.warning("[EMAIL-TRACE] concurrent guardrail halt triggered for send_message tool=%s, code=plugin_block_halt", function_name) if function_name == "send_message" else None
                 agent._tool_guardrail_halt_decision = ToolGuardrailDecision(
                     action="halt",
                     tool_name=function_name,
@@ -144,6 +151,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     message=block_message,
                 )
         else:
+            if function_name == "send_message" and "email" in function_args.get("target", "").lower():
+                logger.warning("[EMAIL-TRACE] concurrent pre_tool_call returned None (allowed) for send_message, target=%s", function_args.get("target", ""))
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 block_result = agent._guardrail_block_result(guardrail_decision)
@@ -508,6 +517,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         _block_halt_turn: bool = False
+        if function_name == "send_message":
+            _seq_target = function_args.get("target", "")
+            if "email" in _seq_target.lower():
+                logger.warning("[EMAIL-TRACE] sequential pre_tool_call check for send_message, target=%s", _seq_target)
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             _block_result = get_pre_tool_call_block_message(
@@ -515,11 +528,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
             if _block_result is not None:
                 _block_msg, _block_halt_turn = _block_result
+                if function_name == "send_message" and "email" in function_args.get("target", "").lower():
+                    logger.warning("[EMAIL-TRACE] sequential pre_tool_call BLOCKED send_message: message=%s, halt_turn=%s", _block_msg, _block_halt_turn)
         except Exception:
             pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
+            if function_name == "send_message" and "email" in function_args.get("target", "").lower():
+                logger.warning("[EMAIL-TRACE] sequential pre_tool_call returned None (allowed) for send_message, target=%s", function_args.get("target", ""))
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
@@ -603,6 +620,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
             if _block_halt_turn:
+                if function_name == "send_message":
+                    logger.warning("[EMAIL-TRACE] sequential guardrail halt triggered for send_message, code=plugin_block_halt, message=%s", _block_msg)
                 agent._tool_guardrail_halt_decision = ToolGuardrailDecision(
                     action="halt",
                     tool_name=function_name,

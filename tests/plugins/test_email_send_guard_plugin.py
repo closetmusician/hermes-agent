@@ -8,9 +8,11 @@ Covers the plugin at ``plugins/email-send-guard/``:
   * Non-email tool calls pass through unblocked.
   * ``email_load_draft`` tool stores body and computes SHA256 hash.
   * ``email_show_preview`` tool marks draft as previewed.
-  * ``/approve-email`` slash command sets time-bounded approval.
+  * ``/approve-email`` slash command sets time-bounded approval (keyed by draft_id).
   * Expired approvals are rejected.
   * Body-hash changes invalidate prior approvals.
+  * Approvals are consumed (one-time use) after a successful send.
+  * ``_extract_recipient`` handles angle bracket format.
 """
 
 from __future__ import annotations
@@ -122,6 +124,14 @@ def pre_hook(ctx):
     """Return the pre_tool_call callback registered by the plugin."""
     callbacks = ctx.hooks.get("pre_tool_call", [])
     assert len(callbacks) == 1, "Expected exactly one pre_tool_call hook"
+    return callbacks[0]
+
+
+@pytest.fixture
+def post_hook(ctx):
+    """Return the post_tool_call callback registered by the plugin."""
+    callbacks = ctx.hooks.get("post_tool_call", [])
+    assert len(callbacks) == 1, "Expected exactly one post_tool_call hook"
     return callbacks[0]
 
 
@@ -314,10 +324,9 @@ class TestExpiredApproval:
         approve_cmd(draft_id)
 
         # Manually expire the approval by backdating expires_at.
-        # Approval key is now _approval_hash(recipient, body), not draft_id.
-        ah = plugin._approval_hash(recipient, body)
+        # Approval is now keyed by draft_id (body hash), not _approval_hash.
         state = plugin._load_state()
-        state["approvals"][ah]["expires_at"] = time.time() - 1
+        state["approvals"][draft_id]["expires_at"] = time.time() - 1
         plugin._save_state(state)
 
         result = pre_hook(
@@ -337,9 +346,9 @@ class TestExpiredApproval:
         show_preview(draft_id=draft_id)
         approve_cmd(draft_id)
 
-        ah = plugin._approval_hash(recipient, body)
+        # Approval is now keyed by draft_id (body hash), not _approval_hash.
         state = plugin._load_state()
-        state["approvals"][ah]["expires_at"] = time.time() - 1
+        state["approvals"][draft_id]["expires_at"] = time.time() - 1
         plugin._save_state(state)
 
         result = pre_hook(
@@ -412,11 +421,11 @@ class TestApproveCommand:
         result = approve_cmd(draft_id)
         after = time.time()
 
-        # Approval is now keyed by hash(recipient, body), not draft_id
-        ah = plugin._approval_hash(recipient, body)
+        # Approval is now keyed by draft_id (body hash)
         state = plugin._load_state()
-        assert ah in state["approvals"]
-        approval = state["approvals"][ah]
+        assert draft_id in state["approvals"]
+        approval = state["approvals"][draft_id]
+        assert approval["recipient"] == recipient
         assert before <= approval["approved_at"] <= after
         # TTL is 15 minutes
         assert approval["expires_at"] - approval["approved_at"] == pytest.approx(
@@ -433,9 +442,9 @@ class TestApproveCommand:
         # Pass empty string (no draft_id) -- should approve current
         approve_cmd("")
 
-        ah = plugin._approval_hash(recipient, body)
+        # Approval is now keyed by draft_id (body hash)
         state = plugin._load_state()
-        assert ah in state["approvals"]
+        assert draft_id in state["approvals"]
 
 
 # ---------------------------------------------------------------------------
@@ -819,3 +828,138 @@ class TestMigration:
 
         assert "drafts" not in state
         assert plugin._load_draft(bh)["body"] == body
+
+
+# ---------------------------------------------------------------------------
+# 22. Approval is consumed (one-time use) after successful send
+# ---------------------------------------------------------------------------
+
+class TestApprovalConsumption:
+    """Approval is deleted from state after a successful send.
+
+    The guard implements one-time-use approvals: once a send passes all
+    gates, the approval record is removed so the same draft cannot be
+    sent again without re-approval.
+    """
+
+    def test_approval_consumed_after_send(self, plugin, pre_hook, post_hook, load_draft, show_preview, approve_cmd):
+        """After a successful send, the approval should be deleted from state."""
+        body = "One-time send body"
+        recipient = "one-time@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        # Verify approval exists before send
+        state = plugin._load_state()
+        assert draft_id in state["approvals"]
+
+        send_args = {"target": f"email:{recipient}", "message": body}
+
+        # pre_tool_call — gates pass, send allowed
+        result = pre_hook(tool_name="send_message", args=send_args)
+        assert result is None
+
+        # post_tool_call — successful send consumes the approval
+        post_hook(
+            tool_name="send_message",
+            args=send_args,
+            result='{"status": "sent"}',
+        )
+
+        # Verify approval consumed
+        state_after = plugin._load_state()
+        assert draft_id not in state_after["approvals"]
+
+    def test_second_send_blocked_after_consumption(self, plugin, pre_hook, post_hook, load_draft, show_preview, approve_cmd):
+        """Second send attempt with same draft should be blocked (approval consumed)."""
+        body = "Double send attempt"
+        recipient = "double@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        send_args = {"target": f"email:{recipient}", "message": body}
+
+        # First send — gates pass
+        result_first = pre_hook(tool_name="send_message", args=send_args)
+        assert result_first is None
+
+        # Simulate successful send — consumes approval
+        post_hook(
+            tool_name="send_message",
+            args=send_args,
+            result='{"status": "sent"}',
+        )
+
+        # Second send — should be blocked (approval consumed)
+        result_second = pre_hook(tool_name="send_message", args=send_args)
+        assert result_second is not None
+        assert result_second["action"] == "block"
+        assert result_second.get("halt_turn") is True
+
+    def test_reapproval_after_consumption(self, plugin, pre_hook, post_hook, load_draft, show_preview, approve_cmd):
+        """After approval is consumed, re-approving should allow sending again."""
+        body = "Re-approve body"
+        recipient = "reapprove@example.com"
+        load_draft(body=body, recipient=recipient)
+        draft_id = _body_hash(body)
+        show_preview(draft_id=draft_id)
+        approve_cmd(draft_id)
+
+        send_args = {"target": f"email:{recipient}", "message": body}
+
+        # First send — gates pass
+        pre_hook(tool_name="send_message", args=send_args)
+
+        # Simulate successful send — consumes approval
+        post_hook(
+            tool_name="send_message",
+            args=send_args,
+            result='{"status": "sent"}',
+        )
+
+        # Re-approve
+        approve_cmd(draft_id)
+
+        # Second send — should pass after re-approval
+        result = pre_hook(tool_name="send_message", args=send_args)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# 23. _extract_recipient with angle bracket format
+# ---------------------------------------------------------------------------
+
+class TestExtractRecipientAngleBracket:
+    """_extract_recipient handles 'Display Name <email>' format.
+
+    send_message targets can include display names in angle bracket format.
+    The guard must extract the bare email address from inside <>.
+    """
+
+    def test_bare_email(self, plugin):
+        """target='email:user@example.com' returns 'user@example.com'."""
+        assert plugin._extract_recipient("email:user@example.com") == "user@example.com"
+
+    def test_angle_bracket_email(self, plugin):
+        """target='email:Display Name <user@example.com>' returns 'user@example.com'."""
+        assert plugin._extract_recipient("email:Display Name <user@example.com>") == "user@example.com"
+
+    def test_angle_bracket_case_insensitive(self, plugin):
+        """Recipient inside angle brackets should be lowercased."""
+        assert plugin._extract_recipient("email:Yu-Kuan Lin <YK@Example.COM>") == "yk@example.com"
+
+    def test_bare_email_platform_only(self, plugin):
+        """target='email' (bare platform, no colon) returns empty string."""
+        assert plugin._extract_recipient("email") == ""
+
+    def test_empty_after_colon(self, plugin):
+        """target='email:' returns empty string."""
+        assert plugin._extract_recipient("email:") == ""
+
+    def test_angle_bracket_with_spaces(self, plugin):
+        """target='email: First Last < user@test.com >' trims correctly."""
+        assert plugin._extract_recipient("email: First Last < user@test.com >") == "user@test.com"

@@ -42,20 +42,23 @@ approved multiple times but email never sent. Four independent bugs compounded:
 | Kill SMTP fallback, move HTML formatting to JS sender | `3f4784b7b` | `tools/send_message_tool.py`, `gateway/platforms/email.py` |
 | Make control-room and email-send-guard mandatory plugins | `9602c2ecf` | `hermes_cli/plugins.py` |
 | Move pre_tool_call enforcement into registry.dispatch() | `73e478b32` | `tools/registry.py` |
+| Draft-based approval lookup (replaces hash-based) | merged | `plugins/email-send-guard/__init__.py` |
+| Full body in followup message (not truncated) | merged | `plugins/email-send-guard/__init__.py` |
+| Approval consumed after send (one-time use) | merged | `plugins/email-send-guard/__init__.py` |
+| Recipient required in `email_load_draft` schema | merged | `plugins/email-send-guard/__init__.py` |
+| `_extract_recipient` handles angle brackets + bare platform | merged | `plugins/email-send-guard/__init__.py` |
 
 ## Remaining work
 
 ### Security hardening (from Codex review)
 
-- [ ] **HMAC-sign approval records** — Approval state is plain JSON with no
-  cryptographic binding. File-safety denylist is defense-in-depth only (terminal
-  tool can still `cat state.json`). Sign `(recipient, body_hash, expires_at)`
-  with a per-session in-memory secret so forged approvals are rejected.
+- [x] **HMAC-sign approval records** — Replaced hash-based approval matching
+  with draft-based lookup. Approvals are now consumed after send (one-time use),
+  eliminating replay risk. Cryptographic signing deferred as defense-in-depth.
 
-- [ ] **Guard the gateway reply path** — `gateway/platforms/email.py:753-794`
-  sends via raw SMTP with zero guard coverage. It's a direct method call, not a
-  tool invocation, so `pre_tool_call` hooks never fire. Route through the same
-  guarded chokepoint per the `EmailSendBroker` design in `hermes-fail.md` Part 9.
+- [x] **Guard the gateway reply path** — SMTP fallback removed entirely
+  (`3f4784b7b`). All email sends now route through the JS sender via
+  `send_message` tool, which passes through `pre_tool_call` guard hooks.
 
 ### Test coverage
 

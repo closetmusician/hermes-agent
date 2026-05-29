@@ -238,10 +238,11 @@ class TestHappyPath:
         preview_result = json.loads(preview_entry.handler(draft_id=draft_id))
         assert preview_result["status"] == "draft_previewed"
 
-        # Step 3: approve via slash command
+        # Step 3: approve via slash command (returns dict with user_message + followup_agent_message)
         approve_handler = manager._plugin_commands.get("approve-email", {}).get("handler")
         assert approve_handler is not None, "/approve-email must be registered"
-        approval_msg = approve_handler(draft_id)
+        approval_result = approve_handler(draft_id)
+        approval_msg = approval_result["user_message"] if isinstance(approval_result, dict) else approval_result
         assert "approved" in approval_msg.lower()
 
         # Step 4: send -- should pass (hook returns None => empty list)
@@ -266,7 +267,6 @@ class TestApprovalExpiry:
         body = "Expiring email"
         recipient = "expired@example.com"
         draft_id = _body_hash(body)
-        ah = _approval_hash(recipient, body)
 
         from tools.registry import registry
         registry.get_entry("email_load_draft").handler(body=body, recipient=recipient)
@@ -275,9 +275,9 @@ class TestApprovalExpiry:
         approve_handler = manager._plugin_commands["approve-email"]["handler"]
         approve_handler(draft_id)
 
-        # Backdate the approval to make it expired (keyed by approval hash)
+        # Backdate the approval to make it expired (keyed by draft_id / body hash)
         state = plugin_module._load_state()
-        state["approvals"][ah]["expires_at"] = time.time() - 1
+        state["approvals"][draft_id]["expires_at"] = time.time() - 1
         plugin_module._save_state(state)
 
         results = manager.invoke_hook(
@@ -451,7 +451,7 @@ class TestStatePersistence:
         recipient = "persist@example.com"
         draft_id = _body_hash(body)
 
-        # First instance: full approval flow
+        # First instance: full approval flow but do NOT send (approval not consumed)
         mgr1 = PluginManager()
         manifest = _make_manifest()
         ctx1 = PluginContext(manifest, mgr1)
@@ -462,13 +462,9 @@ class TestStatePersistence:
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
         mgr1._plugin_commands["approve-email"]["handler"](draft_id)
 
-        # Verify first instance allows
-        results1 = mgr1.invoke_hook(
-            "pre_tool_call",
-            tool_name="send_message",
-            args={"target": f"email:{recipient}", "message": body},
-        )
-        assert results1 == []
+        # Verify approval exists in state (but don't send — approval is one-time use)
+        state = plugin_module._load_state()
+        assert draft_id in state["approvals"]
 
         # Second instance: new manager, re-register plugin
         mgr2 = PluginManager()
@@ -476,6 +472,7 @@ class TestStatePersistence:
         plugin_module.register(ctx2)
 
         # The second instance should read state from disk and allow
+        # (approval persists because we didn't send in the first instance)
         results2 = mgr2.invoke_hook(
             "pre_tool_call",
             tool_name="send_message",
@@ -515,12 +512,13 @@ class TestApproveEmailCommand:
         draft_id = _body_hash(body)
 
         from tools.registry import registry
-        registry.get_entry("email_load_draft").handler(body=body)
+        registry.get_entry("email_load_draft").handler(body=body, recipient="explicit@example.com")
         registry.get_entry("email_show_preview").handler(draft_id=draft_id)
 
         handler = manager._plugin_commands["approve-email"]["handler"]
         result = handler(draft_id)
-        assert "approved" in result.lower()
+        msg = result["user_message"] if isinstance(result, dict) else result
+        assert "approved" in msg.lower()
 
     def test_approve_current_when_no_id_given(self, registered, plugin_module):
         manager, _ = registered
@@ -534,7 +532,8 @@ class TestApproveEmailCommand:
 
         handler = manager._plugin_commands["approve-email"]["handler"]
         result = handler("")
-        assert "approved" in result.lower()
+        msg = result["user_message"] if isinstance(result, dict) else result
+        assert "approved" in msg.lower()
 
         # Verify it actually works for sending
         results = manager.invoke_hook(
@@ -757,10 +756,11 @@ class TestApproveWithFreetext:
         preview_result = json.loads(preview_entry.handler(draft_id=draft_id))
         assert preview_result["status"] == "draft_previewed"
 
-        # Step 3: approve with freetext arg (not a hash)
+        # Step 3: approve with freetext arg (not a hash) — returns dict
         approve_handler = manager._plugin_commands.get("approve-email", {}).get("handler")
         assert approve_handler is not None, "/approve-email must be registered"
-        approval_msg = approve_handler("send to yu_kuan@yahoo.com")
+        approval_result = approve_handler("send to yu_kuan@yahoo.com")
+        approval_msg = approval_result["user_message"] if isinstance(approval_result, dict) else approval_result
         assert "approved" in approval_msg.lower()
 
         # Step 4: send — should pass (hook returns None => empty list)

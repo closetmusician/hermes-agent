@@ -126,17 +126,28 @@ _check_fn_cache_lock = threading.Lock()
 
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls. Swallows exceptions as False."""
+    fn_name = getattr(fn, "__name__", str(fn))
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
+                if "send_message" in fn_name:
+                    logger.debug(
+                        "[EMAIL-TRACE] _check_fn_cached: %s -> %s (cached, age=%.1fs)",
+                        fn_name, value, now - ts,
+                    )
                 return value
     try:
         value = bool(fn())
     except Exception:
         value = False
+    if "send_message" in fn_name:
+        logger.debug(
+            "[EMAIL-TRACE] _check_fn_cached: %s -> %s (fresh eval)",
+            fn_name, value,
+        )
     with _check_fn_cache_lock:
         _check_fn_cache[fn] = (now, value)
     return value
@@ -415,7 +426,7 @@ class ToolRegistry:
         :func:`_check_fn_cached` to amortize repeat probes (check_terminal_
         requirements probes modal/docker, browser checks probe playwright,
         etc.); TTL chosen so env-var changes (``hermes tools enable foo``)
-        still take effect in near-real-time without forcing a full cache
+        still take effect within a turn or two without forcing a full cache
         flush on every call.
         """
         result = []

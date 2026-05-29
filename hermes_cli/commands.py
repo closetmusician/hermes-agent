@@ -378,7 +378,9 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     """
     if not command_name:
         return False
+    logger.warning("[EMAIL-TRACE] should_bypass_active_session: checking command=%s", command_name)
     if resolve_command(command_name) is not None:
+        logger.warning("[EMAIL-TRACE] should_bypass_active_session: matched built-in command=%s", command_name)
         return True
     # Plugin-registered commands (e.g. /approve-email) must also bypass
     # the active-session guard — they have handlers in gateway/run.py's
@@ -389,10 +391,15 @@ def should_bypass_active_session(command_name: str | None) -> bool:
     from hermes_cli.plugins import get_plugin_command_handler
 
     if get_plugin_command_handler(command_name) is not None:
+        logger.warning("[EMAIL-TRACE] should_bypass_active_session: matched plugin command=%s", command_name)
         return True
     normalized = command_name.replace("_", "-")
     if normalized != command_name:
-        return get_plugin_command_handler(normalized) is not None
+        logger.warning("[EMAIL-TRACE] should_bypass_active_session: underscore->hyphen normalized %s -> %s", command_name, normalized)
+        if get_plugin_command_handler(normalized) is not None:
+            logger.warning("[EMAIL-TRACE] should_bypass_active_session: matched plugin command after normalization=%s", normalized)
+            return True
+    logger.warning("[EMAIL-TRACE] should_bypass_active_session: no match for command=%s", command_name)
     return False
 
 

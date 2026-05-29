@@ -5,6 +5,7 @@ author: NousResearch
 mandatory: true
 hooks:
   - pre_tool_call
+  - post_tool_call
 provides_tools:
   - email_load_draft
   - email_show_preview

@@ -192,6 +192,8 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    if "email" in target.lower():
+        logger.warning("[EMAIL-TRACE] send_message called with target=%s, message_length=%d", target, len(message))
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -214,6 +216,8 @@ def _handle_send(args):
             if resolved:
                 chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
             else:
+                if platform_name == "email":
+                    logger.warning("[EMAIL-TRACE] could not resolve email target_ref=%s", target_ref)
                 return json.dumps({
                     "error": f"Could not resolve '{target_ref}' on {platform_name}. "
                     f"Use send_message(action='list') to see available targets."
@@ -380,8 +384,14 @@ def _handle_send(args):
 
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
+            if platform_name == "email":
+                logger.warning("[EMAIL-TRACE] _handle_send completed with error: %s", result["error"][:200])
+        elif platform_name == "email" and isinstance(result, dict) and result.get("success"):
+            logger.warning("[EMAIL-TRACE] _handle_send completed successfully for email target=%s", target)
         return json.dumps(result)
     except Exception as e:
+        if platform_name == "email":
+            logger.warning("[EMAIL-TRACE] _handle_send exception for email: %s", str(e)[:200])
         return json.dumps(_error(f"Send failed: {e}"))
 
 
@@ -442,6 +452,7 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         return target_ref, None, True
     # Email addresses are already the chat_id (recipient address)
     if platform_name == "email" and "@" in target_ref:
+        logger.warning("[EMAIL-TRACE] parsed email recipient=%s from target_ref", target_ref)
         return target_ref, None, True
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
@@ -806,6 +817,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
+            logger.warning("[EMAIL-TRACE] _send_to_platform routing to _send_email: chat_id=%s, chunk_length=%d", chat_id, len(chunk))
             result = await _send_email(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
@@ -1347,13 +1359,17 @@ async def _send_email(extra, chat_id, message):
         "--subject", "Hermes Agent",
         "--body", message,
     ]
+    logger.warning("[EMAIL-TRACE] _send_email invoking Graph API: recipient=%s, subject=Hermes Agent, cmd=%s", chat_id, " ".join(cmd[:3]))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
+            logger.warning("[EMAIL-TRACE] _send_email Graph API success: recipient=%s, returncode=0", chat_id)
             return {"success": True, "platform": "email", "method": "graph-api"}
         else:
+            logger.warning("[EMAIL-TRACE] _send_email Graph API failed: recipient=%s, returncode=%s, stderr=%s", chat_id, result.returncode, result.stderr.strip()[:200])
             return {"error": f"Graph API email failed: {result.stderr.strip()}"}
     except subprocess.TimeoutExpired:
+        logger.warning("[EMAIL-TRACE] _send_email Graph API timed out after 30s: recipient=%s", chat_id)
         return {"error": "Graph API email timed out after 30s"}
 
 
@@ -1728,29 +1744,44 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
 
 
 def _check_send_message():
-    """Gate send_message on gateway running (always available on messaging platforms).
+    """Decide whether send_message appears in the tool schema.
 
-    Also passes for kanban workers — the dispatcher sets ``HERMES_KANBAN_TASK``
-    on every spawned worker, but those workers run with the assignee profile's
-    ``HERMES_HOME`` which has no ``gateway.pid``, so the gateway-running check
-    would fail even though the parent gateway is alive. Honoring the env var
-    lets workers call ``send_message`` to deliver rich content directly to the
-    originating chat (paired with ``kanban_complete`` for the short notifier
-    summary), which is the canonical pattern for any worker that needs to
-    reply with more than the ~200-char first-line truncation the kanban
-    notifier applies.
+    Checks session context and gateway state to determine if a messaging
+    platform is reachable. The tool_defs_cache in model_tools.py includes
+    HERMES_SESSION_PLATFORM in its cache key, so different session contexts
+    get correctly separated cached results.
+
+    Order of checks:
+      1. Kanban worker env var (parent gateway alive by definition).
+      2. HERMES_SESSION_PLATFORM contextvar (set during active handler turn).
+      3. Gateway process running (PID file check).
     """
+    # 1. Kanban worker — parent gateway is alive by definition.
     if os.environ.get("HERMES_KANBAN_TASK"):
+        logger.debug("[EMAIL-TRACE] _check_send_message: True (kanban worker)")
         return True
-    from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-    if platform and platform != "local":
-        return True
+
+    # 2. Session contextvar (set during active handler turn).
+    try:
+        from gateway.session_context import get_session_env
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        if platform and platform != "local":
+            logger.debug("[EMAIL-TRACE] _check_send_message: True (session platform=%s)", platform)
+            return True
+    except Exception:
+        pass
+
+    # 3. Gateway process running (PID file check).
     try:
         from gateway.status import is_gateway_running
-        return is_gateway_running()
+        running = is_gateway_running()
+        logger.debug("[EMAIL-TRACE] _check_send_message: %s (gateway running check)", running)
+        return running
     except Exception:
-        return False
+        pass
+
+    logger.debug("[EMAIL-TRACE] _check_send_message: False (no gateway, no session)")
+    return False
 
 
 async def _send_qqbot(pconfig, chat_id, message):

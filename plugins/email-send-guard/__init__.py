@@ -174,21 +174,29 @@ def _body_hash(body: str) -> str:
 def _extract_recipient(target: str) -> str:
     """Extract the email recipient from a send_message target string.
 
-    Target format is "email:user@example.com" (case-insensitive prefix).
-    Returns the lowercased recipient, or empty string if unparseable.
+    Handles: "email:user@example.com", "email:Display Name <user@example.com>",
+    "email" (bare platform, home channel), "email:" (empty).
+    Returns lowercased bare email address, or empty string for home channel.
     """
     parts = target.split(":", 1)
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[1].strip():
         return ""
-    return parts[1].strip().lower()
+    raw = parts[1].strip().lower()
+    # Handle "Display Name <user@example.com>" format
+    if "<" in raw and ">" in raw:
+        match = re.search(r'<([^>]+)>', raw)
+        if match:
+            return match.group(1).strip()
+    return raw
 
 
 def _approval_hash(recipient: str, body: str) -> str:
     """Compute SHA256 hex digest binding approval to (recipient, body).
 
-    Approvals must be scoped to a specific recipient so that an approval
-    for safe@company.com cannot be replayed to evil@attacker.com with the
-    same body. The recipient is lowercased for consistency.
+    NOTE: No longer used for approval storage/lookup — approvals are now
+    keyed by draft_id (body hash) with recipient stored inside the approval
+    record. Kept for backward compatibility and potential external use.
+    The recipient is lowercased for consistency.
     """
     key = f"{recipient.lower()}\0{body}"
     return hashlib.sha256(key.encode()).hexdigest()
@@ -219,8 +227,6 @@ def _pre_tool_call(
     # This is an email send -- enforce the state machine.
     body = args.get("message", "")
     bh = _body_hash(body)
-    recipient = _extract_recipient(target)
-    ah = _approval_hash(recipient, body)
     state = _load_state()
 
     # Gate 1: draft must be loaded (keyed by body hash — content review)
@@ -249,9 +255,45 @@ def _pre_tool_call(
         }
 
     # Gate 3: user must have approved (and approval must not be expired).
-    # Approval is keyed by hash(recipient, body) so an approval for one
-    # recipient cannot be replayed to send the same body to another.
-    approval = state["approvals"].get(ah)
+    # Approval is keyed by draft_id (body hash) so we look up the current
+    # draft's approval status directly, not via a separate approval hash.
+    current_draft_id = state.get("current")
+    logger.warning(
+        "[EMAIL-TRACE] Gate 3: body_hash=%s, current_draft_id=%s, matching=%s",
+        bh, current_draft_id, bh == current_draft_id,
+    )
+    if not current_draft_id:
+        return {
+            "action": "block",
+            "halt_turn": True,
+            "message": (
+                "Email send blocked: no current draft set. "
+                "Load a draft first with email_load_draft, then preview and approve."
+            ),
+        }
+
+    # Body-hash enforcement: the send body must match the approved draft.
+    # Without this, an approved draft could authorize a completely different body.
+    if bh != current_draft_id:
+        logger.warning(
+            "[EMAIL-TRACE] Gate 3: body hash mismatch — send body hash=%s, approved draft=%s",
+            bh, current_draft_id,
+        )
+        return {
+            "action": "block",
+            "halt_turn": True,
+            "message": (
+                "Email send blocked: the message body does not match the approved draft. "
+                "The approved draft has a different body than what you're trying to send. "
+                "Call email_load_draft with the exact body you want to send, then get approval again."
+            ),
+        }
+
+    approval = state["approvals"].get(current_draft_id)
+    logger.warning(
+        "[EMAIL-TRACE] Gate 3: draft_id=%s, approval_found=%s, approval=%s",
+        current_draft_id, approval is not None, approval,
+    )
     if not approval:
         return {
             "action": "block",
@@ -263,7 +305,12 @@ def _pre_tool_call(
                 "Only the send_message tool is permitted for outbound email."
             ),
         }
+
     if approval.get("expires_at", 0) < time.time():
+        logger.warning(
+            "[EMAIL-TRACE] Gate 3: approval expired — expires_at=%s, now=%s",
+            approval.get("expires_at"), time.time(),
+        )
         return {
             "action": "block",
             "halt_turn": True,
@@ -274,8 +321,95 @@ def _pre_tool_call(
             ),
         }
 
-    # All gates passed
+    # Verify recipient matches (normalized)
+    approved_recipient = approval.get("recipient", "")
+    send_recipient = _extract_recipient(target)
+    logger.warning(
+        "[EMAIL-TRACE] Gate 3: approved_recipient=%s, send_recipient=%s",
+        approved_recipient, send_recipient,
+    )
+    if send_recipient and approved_recipient and send_recipient != approved_recipient:
+        return {
+            "action": "block",
+            "halt_turn": True,
+            "message": (
+                f"Email send blocked: recipient mismatch. Approved for '{approved_recipient}' "
+                f"but send target is '{send_recipient}'. Load a new draft for this recipient."
+            ),
+        }
+
+    # All gates passed — allow the send. Approval is consumed AFTER
+    # successful send by _post_tool_call (not here) so a failed send
+    # doesn't burn the approval.
+    logger.warning(
+        "[EMAIL-TRACE] Gate 3: all gates passed for draft_id=%s — send allowed (approval preserved until post_tool_call)",
+        current_draft_id,
+    )
     return None
+
+
+# ---------------------------------------------------------------------------
+# post_tool_call hook -- consume approval after successful send
+# ---------------------------------------------------------------------------
+
+def _post_tool_call(
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    result: Any = None,
+    **_kw: Any,
+) -> None:
+    """Consume the one-time approval AFTER a successful send_message.
+
+    Moved out of _pre_tool_call so that a failed send (Graph API timeout,
+    missing config, etc.) does not burn the approval. The user only needs
+    to re-approve if the send actually succeeded and the approval was used.
+    Gotchas: Only fires for send_message with email targets. Checks the
+    result for error indicators before consuming.
+    """
+    if tool_name != "send_message":
+        return
+    if not isinstance(args, dict):
+        return
+    target = args.get("target", "")
+    if not isinstance(target, str) or not target.lower().startswith("email"):
+        return
+
+    # Check if the send failed — don't consume approval on error.
+    # Tool results are JSON strings; errors contain "error" keys or
+    # are non-JSON exception strings.
+    send_failed = False
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                send_failed = True
+        except (json.JSONDecodeError, ValueError):
+            # Non-JSON result (e.g. raw exception message) = failure
+            send_failed = True
+
+    body = args.get("message", "")
+    bh = _body_hash(body)
+    state = _load_state()
+    current_draft_id = state.get("current")
+
+    if not current_draft_id or bh != current_draft_id:
+        return
+
+    if send_failed:
+        logger.warning(
+            "[EMAIL-TRACE] post_tool_call: send_message failed — approval preserved for draft_id=%s",
+            current_draft_id,
+        )
+        return
+
+    # Send succeeded — consume the one-time approval
+    if current_draft_id in state.get("approvals", {}):
+        del state["approvals"][current_draft_id]
+        _save_state(state)
+        logger.warning(
+            "[EMAIL-TRACE] post_tool_call: approval consumed after successful send for draft_id=%s",
+            current_draft_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -361,12 +495,14 @@ def _handle_approve(raw_args: str) -> str | dict:
     On success returns a dict with ``followup_agent_message`` so the gateway
     can trigger a new agent turn that calls send_message.
     """
+    logger.warning("[EMAIL-TRACE] _handle_approve called with raw_args=%s", raw_args)
     raw = raw_args.strip() if raw_args else ""
     draft_id = raw if _SHA256_RE.match(raw) else ""
     state = _load_state()
 
     if not draft_id:
         draft_id = state.get("current", "")
+        logger.warning("[EMAIL-TRACE] No draft_id in args, using state['current']=%s", draft_id)
     if not draft_id:
         return "No draft to approve. Load a draft first with email_load_draft."
 
@@ -376,18 +512,22 @@ def _handle_approve(raw_args: str) -> str | dict:
     if not draft.get("previewed_at"):
         return "Draft not previewed yet. Preview with email_show_preview first."
 
-    # Compute the approval key from (recipient, body) so the approval is
-    # bound to this specific recipient. If no recipient was stored (legacy
-    # drafts), fall back to body-only hash for backward compat.
+    # Store approval keyed by draft_id (body hash) so pre_tool_call can
+    # look it up directly from the current draft pointer.
     recipient = draft.get("recipient", "")
-    ah = _approval_hash(recipient, draft["body"])
+    logger.warning("[EMAIL-TRACE] _handle_approve: draft_id=%s, recipient=%s", draft_id, recipient)
 
     now = time.time()
-    state["approvals"][ah] = {
+    state["approvals"][draft_id] = {
+        "recipient": recipient.lower(),
         "approved_at": now,
         "expires_at": now + APPROVAL_TTL_SECONDS,
     }
     _save_state(state)
+    logger.warning(
+        "[EMAIL-TRACE] Stored approval: approvals[%s] = {recipient: %s, approved_at: %s, expires_at: %s}",
+        draft_id, recipient, now, now + APPROVAL_TTL_SECONDS,
+    )
 
     recipient_note = f" to {recipient}" if recipient else ""
     user_message = (
@@ -396,21 +536,23 @@ def _handle_approve(raw_args: str) -> str | dict:
     )
 
     # Build a follow-up message for the agent so it knows to call
-    # send_message now that approval has been granted. Include enough
-    # context for the LLM to construct the send_message call.
-    body_preview = draft["body"][:200]
-    if len(draft["body"]) > 200:
-        body_preview += "..."
+    # send_message now that approval has been granted. Include the FULL
+    # body so the LLM can reconstruct the exact send_message call without
+    # hash mismatches from truncation.
     followup = (
-        f"The user has approved sending the email{recipient_note}. "
-        f"Call send_message now with target='email:{recipient}' and the approved body. "
-        f"Draft id: {draft_id[:12]}... | Body preview: {body_preview}"
+        f"The user has approved sending the email to {recipient}. "
+        f"Call send_message now with target='email:{recipient}' and the following EXACT body "
+        f"(do not modify it):\n\n{draft['body']}"
     )
 
-    return {
+    logger.warning("[EMAIL-TRACE] user_message=%s", user_message)
+    logger.warning("[EMAIL-TRACE] followup_agent_message=%s", followup)
+    result = {
         "user_message": user_message,
         "followup_agent_message": followup,
     }
+    logger.warning("[EMAIL-TRACE] _handle_approve returning dict: %s", result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +571,7 @@ _LOAD_DRAFT_SCHEMA = {
             "description": "The email recipient address (e.g. user@example.com). Used to bind approval to this specific recipient.",
         },
     },
-    "required": ["body"],
+    "required": ["body", "recipient"],
 }
 
 _SHOW_PREVIEW_SCHEMA = {
@@ -446,11 +588,12 @@ _SHOW_PREVIEW_SCHEMA = {
 def register(ctx) -> None:
     """Wire the email send guard into the Hermes plugin system.
 
-    Registers: pre_tool_call hook, two agent-callable tools, and one
-    user-only slash command.
+    Registers: pre_tool_call and post_tool_call hooks, two agent-callable
+    tools, and one user-only slash command.
     Gotchas: State is per-user (stored under HERMES_HOME), not per-session.
     """
     ctx.register_hook("pre_tool_call", _pre_tool_call)
+    ctx.register_hook("post_tool_call", _post_tool_call)
 
     ctx.register_tool(
         name="email_load_draft",

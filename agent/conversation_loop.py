@@ -330,6 +330,8 @@ def run_conversation(
     agent._mute_post_response = False
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
+    if agent._tool_guardrail_halt_decision is not None:
+        logger.warning("[EMAIL-TRACE] guardrail halt decision reset for new turn (was: tool=%s, code=%s)", agent._tool_guardrail_halt_decision.tool_name, agent._tool_guardrail_halt_decision.code)
     agent._tool_guardrail_halt_decision = None
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first
@@ -3428,6 +3430,7 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    logger.warning("[EMAIL-TRACE] turn exiting due to guardrail_halt: tool=%s, code=%s, message=%s", decision.tool_name, decision.code, decision.message[:200] if decision.message else "None")
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(

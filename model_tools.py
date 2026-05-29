@@ -295,12 +295,22 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        # Include HERMES_SESSION_PLATFORM in the cache key so gateway agents
+        # with different session contexts (e.g. telegram vs local) get
+        # separate cached tool lists. Without this, _check_send_message()
+        # results from one session context pollute another's cache entry.
+        try:
+            from gateway.session_context import get_session_env
+            _session_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        except Exception:
+            _session_platform = ""
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            _session_platform,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
