@@ -48,6 +48,7 @@ approved multiple times but email never sent. Four independent bugs compounded:
 | Recipient required in `email_load_draft` schema | merged | `plugins/email-send-guard/__init__.py` |
 | `_extract_recipient` handles angle brackets + bare platform | merged | `plugins/email-send-guard/__init__.py` |
 | Approval followup, body-hash enforcement, session-scoped tool cache, and post-send approval consumption | `d97dfe04d` | `plugins/email-send-guard/__init__.py`, `model_tools.py`, `tools/send_message_tool.py`, `tools/registry.py`, `gateway/run.py`, `agent/tool_executor.py`, `agent/conversation_loop.py`, `hermes_cli/commands.py` |
+| `/approve-email` executes the approved `send_message` call directly instead of relying on an LLM followup turn | this change | `plugins/email-send-guard/__init__.py`, `gateway/run.py` |
 
 ## Remaining work
 
@@ -112,6 +113,11 @@ definition caching, and approval consumption only from `post_tool_call` after a
 successful `send_message(email)` result. Graph API failures preserve approval so
 the same approved draft can be retried during the TTL.
 
+Follow-up work changed `/approve-email` to return an `approved_tool_call` that
+the gateway executes directly through `model_tools.handle_function_call`. That
+keeps the normal pre/post hook path while removing the last unreliable step:
+asking an LLM followup turn to recreate and call `send_message` exactly.
+
 The supporting trace points remain intentionally noisy until Telegram/Yahoo live
 delivery has been verified repeatedly.
 
@@ -122,8 +128,8 @@ delivery has been verified repeatedly.
   and post-send consumption.
 - [x] Targeted email guard tests verified via `scripts/run_tests.sh`: `76/76`
   passed.
-- [ ] Live trace confirms a Telegram approval followup reaches
-  `send_message(email)`, Graph API send, and `post_tool_call` consumption.
+- [x] Live approved-tool smoke confirms the direct approval path reaches Graph
+  API send and triggers `post_tool_call` consumption.
 - [ ] Live Telegram `/approve-email` test against the running gateway.
 - [ ] Yahoo inbox delivery confirmation after the live Telegram approval.
 
@@ -139,7 +145,8 @@ Follow the trail in this order when debugging a live Telegram send:
 
 1. **Telegram slash dispatch**
    - `gateway/run.py` logs plugin command dispatch, raw handler result, and
-     whether `followup_agent_message` rewrote the event text.
+     whether `approved_tool_call` executed directly. `followup_agent_message`
+     should now be a fallback path, not the normal `/approve-email` path.
    - `hermes_cli/commands.py` logs `should_bypass_active_session()` decisions,
      including underscore-to-hyphen normalization for `/approve_email` versus
      `/approve-email`.
@@ -175,12 +182,11 @@ Follow the trail in this order when debugging a live Telegram send:
      receives the message, this is the first place to check whether Hermes thinks
      Graph succeeded.
 
-If the trace stops after `_run_agent: message looks like email approval
-followup`, the slash command was dispatched correctly but the followup agent turn
-did not reach `send_message(email)`. Check normal gateway/model errors next,
-then confirm the `model_tools.py` cache-key trace shows the Telegram session
-platform and that `send_message` is present in the tool schema for the followup
-turn.
+If the trace takes `followup_agent_message` and then stops after `_run_agent:
+message looks like email approval followup`, the direct approved-tool path did
+not run. That means the running gateway is stale or the plugin result did not
+include `approved_tool_call`. Restart the gateway, then check `_handle_approve
+returning dict` for `approved_tool_call`.
 
 Useful focused commands:
 
@@ -188,6 +194,7 @@ Useful focused commands:
 grep '\[EMAIL-TRACE\]' ~/.hermes/logs/gateway.log ~/.hermes/logs/gateway.error.log | tail -50
 grep '\[EMAIL-TRACE\].*Graph API' ~/.hermes/logs/gateway.log ~/.hermes/logs/gateway.error.log
 grep '\[EMAIL-TRACE\].*post_tool_call' ~/.hermes/logs/gateway.log ~/.hermes/logs/gateway.error.log
+grep '\[EMAIL-TRACE\].*approved_tool_call' ~/.hermes/logs/gateway.log ~/.hermes/logs/gateway.error.log
 grep '\[EMAIL-TRACE\].*_tool_defs_cache' ~/.hermes/logs/gateway.log ~/.hermes/logs/gateway.error.log
 ```
 

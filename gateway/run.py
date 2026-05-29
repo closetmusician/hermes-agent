@@ -7503,9 +7503,29 @@ class GatewayRunner:
                     )
 
                     # Plugin handlers may return a dict with
+                    # ``approved_tool_call`` to execute a user-approved tool
+                    # directly. This is used by /approve-email so delivery
+                    # does not depend on a follow-up LLM turn reproducing an
+                    # exact send_message call.
+                    if isinstance(result, dict) and result.get("approved_tool_call"):
+                        logger.warning("[EMAIL-TRACE] _process_message: approved_tool_call detected, executing directly")
+                        _user_msg = result.get("user_message", "")
+                        if _user_msg:
+                            adapter = self.adapters.get(source.platform)
+                            if adapter:
+                                _meta = self._thread_metadata_for_source(source)
+                                try:
+                                    await adapter.send(source.chat_id, _user_msg, metadata=_meta)
+                                except Exception as _send_exc:
+                                    logger.debug("Plugin approved-tool user-msg send failed: %s", _send_exc)
+                        return await self._execute_plugin_approved_tool_call(
+                            result["approved_tool_call"],
+                            source,
+                        )
+
+                    # Plugin handlers may return a dict with
                     # ``followup_agent_message`` to trigger a new agent turn
-                    # after the command completes (e.g. /approve-email needs
-                    # the LLM to call send_message). Send the user-facing
+                    # after the command completes. Send the user-facing
                     # confirmation immediately, then fall through to agent
                     # processing with the follow-up as the user message.
                     if isinstance(result, dict) and result.get("followup_agent_message"):
@@ -9370,8 +9390,8 @@ class GatewayRunner:
         arriving while the agent is busy.
 
         Returns a dict with ``{"handled": True/False, ...}`` plus optional
-        ``result``, ``followup_agent_message``, ``user_message``, or
-        ``denied_message`` keys.
+        ``result``, ``approved_tool_call``, ``followup_agent_message``,
+        ``user_message``, or ``denied_message`` keys.
 
         Gotchas: hook ``rewrite`` decisions are NOT followed — plugin
         commands don't participate in the built-in command cascade so a
@@ -9459,6 +9479,20 @@ class GatewayRunner:
             type(result).__name__,
         )
 
+        # Plugin handlers may return a dict with ``approved_tool_call`` to
+        # execute a user-approved tool directly without a follow-up LLM turn.
+        if isinstance(result, dict) and result.get("approved_tool_call"):
+            logger.warning(
+                "[EMAIL-TRACE] _dispatch_plugin_command: returning approved_tool_call=%s user_message=%.100s",
+                result["approved_tool_call"].get("name") if isinstance(result["approved_tool_call"], dict) else type(result["approved_tool_call"]).__name__,
+                result.get("user_message", ""),
+            )
+            return {
+                "handled": True,
+                "approved_tool_call": result["approved_tool_call"],
+                "user_message": result.get("user_message", ""),
+            }
+
         # Plugin handlers may return a dict with ``followup_agent_message``
         # to trigger a new agent turn after the command completes.
         if isinstance(result, dict) and result.get("followup_agent_message"):
@@ -9481,6 +9515,73 @@ class GatewayRunner:
             "handled": True,
             "result": str(result) if result else None,
         }
+
+    async def _execute_plugin_approved_tool_call(
+        self,
+        tool_call: dict,
+        source: "SessionSource",
+    ) -> str:
+        """Execute a plugin-returned approved tool call through normal hooks.
+
+        This intentionally uses ``model_tools.handle_function_call`` instead
+        of ``registry.dispatch`` so both pre_tool_call and post_tool_call hooks
+        fire. For /approve-email, that means the email-send guard verifies the
+        approved draft before send and consumes approval only after success.
+        """
+        if not isinstance(tool_call, dict):
+            return "Approved action failed: invalid tool call."
+        tool_name = str(tool_call.get("name") or "").strip()
+        tool_args = tool_call.get("args")
+        if not tool_name or not isinstance(tool_args, dict):
+            return "Approved action failed: missing tool name or arguments."
+        if tool_name != "send_message":
+            return f"Approved action failed: unsupported tool `{tool_name}`."
+
+        logger.warning(
+            "[EMAIL-TRACE] _execute_plugin_approved_tool_call: tool=%s target=%s",
+            tool_name,
+            tool_args.get("target", ""),
+        )
+
+        try:
+            from functools import partial
+            from model_tools import handle_function_call
+
+            result_text = await self._run_in_executor_with_context(
+                partial(
+                    handle_function_call,
+                    tool_name,
+                    tool_args,
+                    session_id=f"gateway:{source.platform.value}:{source.chat_id}",
+                )
+            )
+        except Exception as exc:
+            logger.exception("[EMAIL-TRACE] _execute_plugin_approved_tool_call failed")
+            return f"Approved email send failed: {exc}"
+
+        logger.warning(
+            "[EMAIL-TRACE] _execute_plugin_approved_tool_call: result=%.300s",
+            result_text,
+        )
+
+        try:
+            parsed = json.loads(result_text) if isinstance(result_text, str) else result_text
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            if parsed.get("error"):
+                return (
+                    "Approved email send failed: "
+                    f"{parsed['error']}\n\nApproval was preserved if the send did not succeed."
+                )
+            if parsed.get("success"):
+                target = str(tool_args.get("target", "email"))
+                recipient = target.split(":", 1)[1] if ":" in target else target
+                recipient = recipient or "the configured email channel"
+                return f"Email sent to {recipient}."
+
+        return str(result_text) if result_text else "Approved action completed."
 
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
@@ -17670,6 +17771,42 @@ class GatewayRunner:
                                     except Exception as e:
                                         logger.warning(
                                             "Failed to send denial for '/%s': %s",
+                                            _pending_cmd_word, e,
+                                        )
+                                pending_event = None
+                                pending = None
+                            # approved_tool_call: send the user-facing
+                            # confirmation, execute the approved tool
+                            # directly, deliver the result, and clear.
+                            elif _dispatch.get("approved_tool_call"):
+                                logger.warning("[EMAIL-TRACE] pending queue: approved_tool_call path taken")
+                                _user_msg = _dispatch.get("user_message", "")
+                                if _user_msg and adapter:
+                                    try:
+                                        await adapter.send(
+                                            source.chat_id,
+                                            _user_msg,
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    except Exception as _send_exc:
+                                        logger.debug(
+                                            "Plugin approved-tool user-msg send failed: %s",
+                                            _send_exc,
+                                        )
+                                _tool_result = await self._execute_plugin_approved_tool_call(
+                                    _dispatch["approved_tool_call"],
+                                    source,
+                                )
+                                if _tool_result and adapter:
+                                    try:
+                                        await adapter.send(
+                                            source.chat_id,
+                                            str(_tool_result),
+                                            metadata=_status_thread_metadata,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to send approved tool result for '/%s': %s",
                                             _pending_cmd_word, e,
                                         )
                                 pending_event = None

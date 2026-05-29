@@ -238,12 +238,17 @@ class TestHappyPath:
         preview_result = json.loads(preview_entry.handler(draft_id=draft_id))
         assert preview_result["status"] == "draft_previewed"
 
-        # Step 3: approve via slash command (returns dict with user_message + followup_agent_message)
+        # Step 3: approve via slash command (returns dict with user_message + approved tool call)
         approve_handler = manager._plugin_commands.get("approve-email", {}).get("handler")
         assert approve_handler is not None, "/approve-email must be registered"
         approval_result = approve_handler(draft_id)
         approval_msg = approval_result["user_message"] if isinstance(approval_result, dict) else approval_result
         assert "approved" in approval_msg.lower()
+        assert approval_result["approved_tool_call"]["name"] == "send_message"
+        assert approval_result["approved_tool_call"]["args"] == {
+            "target": f"email:{recipient}",
+            "message": body,
+        }
 
         # Step 4: send -- should pass (hook returns None => empty list)
         results = manager.invoke_hook(
@@ -762,6 +767,11 @@ class TestApproveWithFreetext:
         approval_result = approve_handler("send to yu_kuan@yahoo.com")
         approval_msg = approval_result["user_message"] if isinstance(approval_result, dict) else approval_result
         assert "approved" in approval_msg.lower()
+        assert approval_result["approved_tool_call"]["name"] == "send_message"
+        assert approval_result["approved_tool_call"]["args"] == {
+            "target": f"email:{recipient}",
+            "message": body,
+        }
 
         # Step 4: send — should pass (hook returns None => empty list)
         results = manager.invoke_hook(

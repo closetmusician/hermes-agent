@@ -492,8 +492,9 @@ def _handle_approve(raw_args: str) -> str | dict:
     (most recently loaded) draft. Approval is bound to the (recipient, body)
     tuple stored in the draft so it cannot be replayed to a different recipient.
     Gotchas: Only works after the draft has been loaded and previewed.
-    On success returns a dict with ``followup_agent_message`` so the gateway
-    can trigger a new agent turn that calls send_message.
+    On success returns a dict with ``approved_tool_call`` so the gateway can
+    execute send_message directly, plus ``followup_agent_message`` for older
+    dispatchers that still route approval through an agent turn.
     """
     logger.warning("[EMAIL-TRACE] _handle_approve called with raw_args=%s", raw_args)
     raw = raw_args.strip() if raw_args else ""
@@ -535,10 +536,20 @@ def _handle_approve(raw_args: str) -> str | dict:
         f"Approval valid for {APPROVAL_TTL_SECONDS // 60} minutes."
     )
 
-    # Build a follow-up message for the agent so it knows to call
-    # send_message now that approval has been granted. Include the FULL
-    # body so the LLM can reconstruct the exact send_message call without
-    # hash mismatches from truncation.
+    # Build the exact send_message call that the gateway can execute
+    # deterministically after approval. Keep the full follow-up message as a
+    # compatibility fallback for dispatchers that do not yet understand
+    # approved_tool_call.
+    approved_tool_call = None
+    if recipient:
+        approved_tool_call = {
+            "name": "send_message",
+            "args": {
+                "target": f"email:{recipient}",
+                "message": draft["body"],
+            },
+        }
+
     followup = (
         f"The user has approved sending the email to {recipient}. "
         f"Call send_message now with target='email:{recipient}' and the following EXACT body "
@@ -551,6 +562,8 @@ def _handle_approve(raw_args: str) -> str | dict:
         "user_message": user_message,
         "followup_agent_message": followup,
     }
+    if approved_tool_call:
+        result["approved_tool_call"] = approved_tool_call
     logger.warning("[EMAIL-TRACE] _handle_approve returning dict: %s", result)
     return result
 
