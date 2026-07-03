@@ -3,7 +3,10 @@
     "allow": [
       "WebFetch(domain:auth.openai.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(cp ~/.claude/docs/learnings/temp/hermes-attack-plan.md /Users/yklin/Code/hermes/docs/plans/hermes-attack-plan.md)",
+      "Bash(cp ~/.claude/docs/learnings/temp/hermes-research.md /Users/yklin/Code/hermes/docs/plans/hermes-research.md)",
+      "Bash(rm ~/.claude/docs/learnings/temp/hermes-attack-plan.md ~/.claude/docs/learnings/temp/hermes-research.md)"
     ]
   },
   "sandbox": {

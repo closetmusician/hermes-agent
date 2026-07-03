@@ -432,6 +432,35 @@ class TestApproveCommand:
             15 * 60, abs=1,
         )
 
+    def test_session_scoped_approve_does_not_use_global_current(self, plugin, load_draft, show_preview, approve_cmd):
+        """A gateway session must not approve a draft loaded by another context."""
+        smoke_body = "Smoke draft from another context"
+        load_draft(body=smoke_body, recipient="smoke@example.com")
+        show_preview(draft_id=_body_hash(smoke_body))
+
+        result = approve_cmd("", session_id="telegram-session")
+
+        assert isinstance(result, str)
+        assert "no draft to approve for this session" in result.lower()
+
+    def test_session_scoped_approve_uses_session_current(self, plugin, load_draft, show_preview, approve_cmd):
+        smoke_body = "Smoke draft from another context"
+        real_body = "Real draft in Telegram session"
+        recipient = "real@example.com"
+        session_id = "telegram-session"
+
+        load_draft(body=smoke_body, recipient="smoke@example.com")
+        show_preview(draft_id=_body_hash(smoke_body))
+        load_draft(body=real_body, recipient=recipient, session_id=session_id)
+        show_preview(session_id=session_id)
+
+        result = approve_cmd("", session_id=session_id)
+
+        assert result["approved_tool_call"]["args"] == {
+            "target": f"email:{recipient}",
+            "message": real_body,
+        }
+
     def test_approve_current_draft_when_no_id(self, plugin, load_draft, show_preview, approve_cmd):
         body = "Current draft"
         recipient = "current@example.com"
@@ -490,6 +519,24 @@ class TestHashInvalidation:
         assert pre_hook(
             tool_name="send_message",
             args={"target": "email:x@y.com", "message": body_b},
+        ) is None
+
+    def test_approved_body_remains_sendable_after_current_changes(self, pre_hook, load_draft, show_preview, approve_cmd):
+        """Send authorization is keyed by approved body hash, not mutable current."""
+        body_a = "Approved body A"
+        body_b = "Later current body B"
+        recipient = "x@y.com"
+
+        load_draft(body=body_a, recipient=recipient)
+        show_preview(draft_id=_body_hash(body_a))
+        approve_cmd(_body_hash(body_a))
+
+        load_draft(body=body_b, recipient=recipient)
+        show_preview(draft_id=_body_hash(body_b))
+
+        assert pre_hook(
+            tool_name="send_message",
+            args={"target": f"email:{recipient}", "message": body_a},
         ) is None
 
 

@@ -10,7 +10,7 @@ import asyncio
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from tools.send_message_tool import _send_email
+from tools.send_message_tool import _extract_email_subject_and_body, _send_email
 
 
 def _run(coro):
@@ -63,6 +63,29 @@ class TestGraphApiPath:
         assert "Test body" in body
         # No --content-type arg (JS tool auto-detects)
         assert "--content-type" not in cmd
+
+    @patch("subprocess.run")
+    @patch("os.path.exists")
+    def test_extracts_subject_header_for_graph_subject(self, mock_exists, mock_run):
+        """A draft Subject header becomes the real Outlook subject."""
+        mock_exists.return_value = True
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+        message = (
+            "Subject: Re: FW: Invitation to join Diligent Network\n\n"
+            "To: Nithya Das <ndas@diligent.com>, Daniel Layfield <dlayfield@diligent.com>\n\n"
+            "Dan -- can you share the Director Network PRD?\n"
+            "That should unblock PMM."
+        )
+
+        result = _run(_send_email({}, "alice@corp.com", message))
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[cmd.index("--subject") + 1] == "Re: FW: Invitation to join Diligent Network"
+        body = cmd[cmd.index("--body") + 1]
+        assert body.startswith("Dan -- can you share")
+        assert "Subject:" not in body
+        assert "To: Nithya" not in body
+        assert result["subject"] == "Re: FW: Invitation to join Diligent Network"
 
     @patch("subprocess.run")
     @patch("os.path.exists")
@@ -132,3 +155,22 @@ class TestNoGraphConfig:
         assert "error" in result
         assert "not configured" in result["error"].lower()
         mock_run.assert_not_called()
+
+
+class TestEmailDraftHeaderParsing:
+    def test_extracts_subject_and_strips_review_headers(self):
+        subject, body = _extract_email_subject_and_body(
+            "Subject: Weekly update\n"
+            "To: person@example.com\n"
+            "Cc: other@example.com\n\n"
+            "Actual body\nSecond line"
+        )
+
+        assert subject == "Weekly update"
+        assert body == "Actual body\nSecond line"
+
+    def test_falls_back_without_subject_header(self):
+        subject, body = _extract_email_subject_and_body("Actual body only")
+
+        assert subject == "Hermes Agent"
+        assert body == "Actual body only"

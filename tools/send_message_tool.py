@@ -70,6 +70,71 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+_EMAIL_HEADER_RE = re.compile(r"^\s*([A-Za-z][A-Za-z-]{0,30})\s*:\s*(.*)$")
+_EMAIL_DRAFT_HEADER_NAMES = frozenset({
+    "subject",
+    "to",
+    "cc",
+    "bcc",
+    "from",
+    "reply-to",
+})
+
+
+def _extract_email_subject_and_body(message: str) -> tuple[str, str]:
+    """Extract a leading draft ``Subject:`` header for Graph email sends.
+
+    Hermes email drafts often include a review-friendly header block such as
+    ``Subject: ...`` and ``To: ...`` in the approved body. Outlook needs the
+    subject as a real Graph field, not embedded in the body.
+    """
+    fallback_subject = "Hermes Agent"
+    text = message or ""
+    lines = text.splitlines()
+    if not lines:
+        return fallback_subject, text
+
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+
+    subject = ""
+    scan = idx
+    while scan < len(lines) and scan < idx + 20:
+        line = lines[scan]
+        if not line.strip():
+            scan += 1
+            continue
+        match = _EMAIL_HEADER_RE.match(line)
+        if not match:
+            break
+        name = match.group(1).lower()
+        if name == "subject":
+            subject = match.group(2).strip()
+            break
+        if name not in _EMAIL_DRAFT_HEADER_NAMES:
+            break
+        scan += 1
+
+    if not subject:
+        return fallback_subject, text
+
+    body_start = idx
+    while body_start < len(lines):
+        line = lines[body_start]
+        if not line.strip():
+            body_start += 1
+            continue
+        match = _EMAIL_HEADER_RE.match(line)
+        if match and match.group(1).lower() in _EMAIL_DRAFT_HEADER_NAMES:
+            body_start += 1
+            continue
+        break
+
+    body = "\n".join(lines[body_start:]).strip()
+    return subject or fallback_subject, body or text
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -1353,18 +1418,22 @@ async def _send_email(extra, chat_id, message):
     if not os.path.exists(token_path) or not os.path.exists(outlook_tool):
         return {"error": "Email not configured — Graph API token or outlook-send-mail.js not found. Run FOCI device-code enrollment."}
 
+    subject, body = _extract_email_subject_and_body(message)
     cmd = [
         "node", outlook_tool,
         "--to", chat_id,
-        "--subject", "Hermes Agent",
-        "--body", message,
+        "--subject", subject,
+        "--body", body,
     ]
-    logger.warning("[EMAIL-TRACE] _send_email invoking Graph API: recipient=%s, subject=Hermes Agent, cmd=%s", chat_id, " ".join(cmd[:3]))
+    logger.warning(
+        "[EMAIL-TRACE] _send_email invoking Graph API: recipient=%s, subject=%r, cmd=%s",
+        chat_id, subject, " ".join(cmd[:3]),
+    )
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
-            logger.warning("[EMAIL-TRACE] _send_email Graph API success: recipient=%s, returncode=0", chat_id)
-            return {"success": True, "platform": "email", "method": "graph-api"}
+            logger.warning("[EMAIL-TRACE] _send_email Graph API success: recipient=%s, subject=%r, returncode=0", chat_id, subject)
+            return {"success": True, "platform": "email", "method": "graph-api", "subject": subject}
         else:
             logger.warning("[EMAIL-TRACE] _send_email Graph API failed: recipient=%s, returncode=%s, stderr=%s", chat_id, result.returncode, result.stderr.strip()[:200])
             return {"error": f"Graph API email failed: {result.stderr.strip()}"}

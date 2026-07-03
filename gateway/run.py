@@ -7492,7 +7492,11 @@ class GatewayRunner:
                 if plugin_handler:
                     logger.warning("[EMAIL-TRACE] _process_message: plugin command handler found for /%s", command)
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    result = self._invoke_plugin_command_handler(
+                        plugin_handler,
+                        user_args,
+                        source,
+                    )
                     if asyncio.iscoroutine(result):
                         result = await result
 
@@ -9373,6 +9377,48 @@ class GatewayRunner:
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
+    def _plugin_command_context(self, source: "SessionSource") -> dict:
+        """Build optional context kwargs for plugin slash commands."""
+        context = {
+            "platform": source.platform.value if source.platform else "",
+            "chat_id": source.chat_id,
+            "user_id": source.user_id or "",
+            "thread_id": source.thread_id or "",
+        }
+        try:
+            session_entry = self.session_store.get_or_create_session(source)
+            context["session_id"] = session_entry.session_id
+            context["session_key"] = session_entry.session_key
+        except Exception:
+            logger.debug("Could not build plugin command session context", exc_info=True)
+        return context
+
+    def _invoke_plugin_command_handler(
+        self,
+        handler,
+        raw_args: str,
+        source: "SessionSource",
+    ):
+        """Invoke a plugin slash command, passing context only when accepted."""
+        context = self._plugin_command_context(source)
+        accepted = None
+        accepts_kwargs = False
+        try:
+            import inspect
+            sig = inspect.signature(handler)
+            params = sig.parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in params.values()
+            )
+            accepted = {k: v for k, v in context.items() if k in params}
+        except (TypeError, ValueError):
+            pass
+        if accepts_kwargs:
+            return handler(raw_args, **context)
+        if accepted:
+            return handler(raw_args, **accepted)
+        return handler(raw_args)
 
     async def _dispatch_plugin_command(
         self,
@@ -9470,7 +9516,7 @@ class GatewayRunner:
             return {"handled": False}
 
         logger.warning("[EMAIL-TRACE] _dispatch_plugin_command: handler found for %s, invoking", norm_command)
-        result = plugin_handler(args)
+        result = self._invoke_plugin_command_handler(plugin_handler, args, source)
         if asyncio.iscoroutine(result):
             result = await result
 
