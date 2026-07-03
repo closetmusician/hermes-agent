@@ -22,7 +22,7 @@
 
 ### The product is the factory; comms is the control panel
 
-The Telegram/email/pm_os surface is how you *talk to* the factory (drop a voice note that becomes a spec'd task; approve a pull request with one tap; read a morning briefing) and how the factory *reaches out* (updating a Jira ticket, sending a message you approved). v1 built an excellent assistant and added a pull-request bot as an afterthought; v2 builds the factory and repurposes that assistant work as the factory's control panel (§P6).
+The Telegram/email/pm_os surface is how you *talk to* the factory (drop a voice note that becomes a spec'd task; approve a pull request with one tap; read a morning briefing) and how the factory *reaches out* (updating a Jira ticket, sending a message you approved). v1 built an excellent assistant and added a pull-request bot as an afterthought; v2 builds the factory and repurposes that assistant work in two stages: the daily chief-of-staff essentials — morning triage, calendar prep, approved sends — land early in **§P1c** (about day 25–30, running as a parallel lane alongside the first-factory phase), and the assistant channel graduates into full factory mission control in **§P6** once the fleet exists.
 
 > **Term:** *pm_os* — a separate personal-assistant codebase Yu-Kuan already owns that handles email, calendar, and Jira. This plan reuses its plumbing rather than rebuilding those integrations.
 > **Term:** *pull request (PR)* — a proposed set of code changes submitted for review before being merged into the main codebase. The factory produces PRs; you approve or reject them.
@@ -131,7 +131,7 @@ Six layers. The control logic is plain code over Markdown files and SQLite; AI r
                         │  revocation · fails closed                 │  surface for every gate (send/push/merge)
                         └───────────────────┬────────────────────────┘
                                             ▼
-   ┌─────────────────── MORNING SURFACES (the control panel / comms, §P6) ────────────────┐
+   ┌─────────────────── MORNING SURFACES (factory mission control, §P6) ───────────────────┐
    │ standup briefing · one-tap PR cards (summary · reasoning · reversibility · risk)       │
    │ question queue · decision replay · demo-reel-of-the-night (later phase)                │
    └───────────────────────────────────────────────────────────────────────────────────────┘
@@ -164,7 +164,7 @@ Six layers. The control logic is plain code over Markdown files and SQLite; AI r
 
 The order is deliberately "factory first," but split so the first result you can see and use lands early:
 
-**P0 → Phase R → P1a → P2 (first overnight PR, about day 26–30) → P1b → P3 → P4 → P5 → P6 → P7.**
+**P0 → Phase R → P1a → P1c ∥ P2 (first overnight PR, about day 26–30) → P1b → P3 → P4 → P5 → P6 → P7.** (The ∥ means P1c — the daily-assistant essentials — runs as a parallel lane alongside P2; it doesn't block P2's first-magic gate.)
 
 Trust graduation (P1b) deliberately comes *after* the first real merges (P2) it learns from. Each phase lists: **goal · what it builds on · deliverables · a binding exit gate (measurable) · rough effort.** Effort figures are focused solo-dev days — directional, not commitments; dependencies are hard gates. Every binding gate is **fresh-context verified** (checked by someone/something with no prior knowledge of the task) — never self-verified.
 
@@ -228,6 +228,22 @@ Trust graduation (P1b) deliberately comes *after* the first real merges (P2) it 
 
 **Binding exit gate (fresh-context verified):** from Telegram, approve a held action (including one long payload) and confirm it executes; the safe-lane correctly auto-sends one recoverable/operational action and holds one strategic one; attempt a direct assistant bypass (send-CLI + token-file read + a raw `git push`) and confirm all three are impossible; the `remote-worker` stub compiles and is dispatched-to by the same supervisor code path as a real local subprocess; a local subprocess is demonstrably killed via SIGTERM-to-process-group.
 **Effort:** 7–9 days (broker + approval + safe-lane + subprocess launcher; trust ledger deferred to P1b).
+
+### PHASE 1c — Assistant essentials (parallel lane with P2)
+
+> **Parallel lane.** P1c runs alongside P2 — they touch different code (P1c wires the daily comms/inbox layer on top of the P1a broker; P2 builds the code-building spine), so one person or agent team can work each lane. **P1c must not delay P2's first-magic gate.** If effort is contended, P2 wins the schedule; P1c yields.
+
+**Goal:** Deliver daily chief-of-staff value early — morning triage, calendar visibility, and approved sends — so the owner gets a working personal assistant by about day 25–30 instead of ~day 90. This lands here (not earlier, not later) for two reasons: every send routes through the P1a broker from day one, so the approval machinery already exists and is built once; and none of these features need the factory (P3/P4), so they don't have to wait for it.
+**Builds on:** the P1a broker approval surface (every send is a held action on that one path); the P1a generic held-action surface (stable action IDs, durable broker-side records); pm_os pipelines (email, calendar, Jira) via one-line skill prompts; the gateway's existing message and audio paths; v1's control-plane Markdown pattern.
+**Deliverables:**
+- **1c.1 Morning triage with a no-reprocess ledger.** A daily inbox sweep that never handles the same item twice. A canonical `tasks.md` plus a `processed.json` idempotency ledger records which items were already handled, so a re-run doesn't double-send, double-file, or double-notify. (Carried over from v1.)
+  > **Term:** *idempotent* — safe to do more than once with the same result. The `processed.json` ledger records which items were already handled so a repeated sweep doesn't act on the same inbox item twice.
+- **1c.2 Morning-triage reference skill (ACTION / FYI / NOISE).** The reference anatomy for the triage layer: closed ACTION/FYI/NOISE buckets, literal pm_os commands, and the no-reprocess ledger from 1c.1. Teams/Outlook items flow through pm_os → a priority map (`priority-map.md`: senders/topics → action tier) → the right bucket. (Carried over from v1.)
+- **1c.3 Exactly-one-approval-per-send reconciliation.** Every consequential send routes through the P1a broker from day one — which is *why* this phase sits after P1a and not before. Draft replies go out only through the broker safe-lane, and pm-send's confirm-gate reconciliation guarantees **exactly one approval per send**, so a retry can't double-send a draft. (Carried over from v1.)
+- **1c.4 Calendar visibility + meeting prep.** The system reads the owner's calendars and assembles a short prep note before each meeting — who's attending, any related email or Teams threads from the past week, and open action items — delivered via the same Telegram morning channel. Rides the existing pm_os calendar and mail plumbing (no new integrations needed). (This was explicitly requested as a deliverable; it appeared in v1, sat in v2's final phase, and is pulled forward here so meeting prep arrives with the other daily-assistant essentials.)
+
+**Binding exit gate:** a repeated inbox sweep processes no item twice (the idempotency ledger holds); every consequential comms action rides the same P1a broker approval surface, with **exactly one approval per send** (a retry cannot double-send); at least one real meeting gets a prep note assembled with zero manual steps (calendar read → attendees + related threads + open items → delivered to Telegram before the meeting).
+**Effort:** 4–6 days.
 
 ### PHASE 2 — One worker, end to end (first magic)
 
@@ -308,20 +324,17 @@ Trust graduation (P1b) deliberately comes *after* the first real merges (P2) it 
 **Binding exit gate:** the routing table demonstrably changes from scorecard data (a task type re-routes to a cheaper model that still clears the bar); one owner-approved skill diff from the nightly retro measurably reduces a recurring failure class; the drift watchdog pauses a synthetically-churning worker; the regression sentinel opens a revert on an injected post-merge break; two representative weeks show cost-per-merged-PR trending down.
 **Effort:** 12–16 days.
 
-### PHASE 6 — Chief-of-staff control panel
+### PHASE 6 — Factory mission control
 
-**Goal:** Repurpose v1's assistant content as the factory's control panel — Telegram/email as the command surface, voice-note → spec'd task, comms triage layered on the working factory.
-**Builds on:** the P1a broker approval surface (reused, not rebuilt); the P4.7 voice-note intake (extended here); pm_os pipelines via one-line skill prompts; v1's control-plane Markdown pattern (`priority-map.md`, `proactive-contract.md`); the gateway audio path.
+**Goal:** Turn the assistant channel into the factory's mission control — the surfaces and control cards through which the owner drives and steers the running factory. The daily chief-of-staff features (triage, calendar, approved sends) already shipped in P1c; what remains here is everything that genuinely needs the factory (the P3 task-splitter and the P4 fleet), so it can only land after them.
+**Builds on:** the P1a broker approval surface (reused, not rebuilt); the P3 task-splitter (voice-note → spec'd task depends on it); the P4 fleet + morning surfaces (the cards steer live jobs); the P4.7 voice-note intake (extended here); v1's control-plane Markdown pattern (`priority-map.md`, `proactive-contract.md`); the gateway audio path.
 **Deliverables:**
-- **6.1 Control-plane comms + files.** Telegram/email as the factory's command + notification surface, plus the canonical control-plane files: `priority-map.md` (senders/topics → action tier), the safe-lane spec, `trust-policy.md` (content the assistant *reads* is data, not instructions), and — carried over from v1 — a canonical `tasks.md` + a `processed.json` idempotency ledger so repeated sweeps never process the same inbox item twice. A quiet-by-default proactive contract (alert on anomaly, one nudge maximum, never repeat) governs all fleet-completion events and the morning replay.
-  > **Term:** *idempotent* — safe to do more than once with the same result. The `processed.json` ledger records which items were already handled so a re-run doesn't double-send or double-build.
-- **6.2 Voice-note → spec'd task, full comms surface.** The core capability already landed as the P4.7 early taste; here it consolidates into the control panel (multi-note threading, question-back flow, priority tagging). Mumble an idea to Telegram at 11pm → transcribe → task-splitter → wake to a task card (or a question if too vague).
-- **6.3 Comms triage layer.** Teams/Outlook triage via pm_os → the priority map → draft replies through the broker safe-lane. Carried over from v1: the morning-triage reference skill (closed ACTION/FYI/NOISE buckets, literal pm_os commands, and the no-reprocess ledger) as the anatomy for this layer; and pm-send's confirm-gate reconciliation — **exactly one approval per send**, so a draft can't be double-sent by a retry. This is now a *convenience layer on the control panel*, not the product.
-- **6.4 pm_os orchestration (harvested, not full parity).** Wire only the pm_os pipelines the factory actually uses (Jira intake already in P3; the morning-briefing generator reused in P4). Full pm_os parity (pulse/weekly/exec-narrative) is parked (§9), built only when a concrete weekly need is named.
-- **6.5 Calendar visibility + meeting prep.** The system reads the owner's calendars and assembles a short prep note before each meeting — who's attending, any related email or Teams threads from the past week, open action items — delivered via the same Telegram morning channel. Rides the existing pm_os calendar and mail plumbing (no new integrations needed). This was explicitly requested as a deliverable (it appeared in v1, was deferred in v2, and is now restored).
+- **6.1 Voice-note → spec'd task, full surface.** The core capability already landed as the P4.7 early taste (which depends on the P3 task-splitter); here it consolidates into mission control (multi-note threading, question-back flow, priority tagging). Mumble an idea to Telegram at 11pm → transcribe → task-splitter → wake to a task card (or a question if too vague).
+- **6.2 Mission-control surfaces + factory control cards.** The command + notification surface for driving the running factory: control cards that let the owner steer live jobs (approve/reject/re-scope, tail a running worker, reprioritize the queue), plus the canonical control-plane files that govern how the factory reaches out — the safe-lane spec, `trust-policy.md` (content the assistant *reads* is data, not instructions), and a quiet-by-default proactive contract (alert on anomaly, one nudge maximum, never repeat) governing all fleet-completion events and the morning replay.
+- **6.3 pm_os orchestration for the factory (harvested, not full parity).** Wire only the pm_os pipelines the factory actually uses (Jira intake already in P3; the morning-briefing generator reused in P4). Full pm_os parity (pulse/weekly/exec-narrative) is parked (§9), built only when a concrete weekly need is named.
 
-**Binding exit gate:** a voice note becomes a spec'd factory task by morning; the triage layer drafts ≥1 safe-lane reply through the broker with zero misroutes over a week and with exactly one approval per send; every consequential comms action rides the same broker approval surface as merges (one UX, fresh-context-verified no-bypass); a repeated inbox sweep processes no item twice (idempotency ledger holds); at least one real meeting gets a prep note assembled with zero manual steps (calendar read → attendees + related threads + open items → delivered to Telegram before the meeting).
-**Effort:** 8–12 days.
+**Binding exit gate:** a voice note becomes a spec'd factory task by morning; the mission-control cards steer at least one live factory job end to end (approve/reject/re-scope through the broker); every consequential factory-control action rides the same broker approval surface as merges (one UX, fresh-context-verified no-bypass).
+**Effort:** 4–6 days.
 
 ### PHASE 7 — Compounding assets
 
@@ -382,19 +395,20 @@ The line is: the factory writes software, so forbidding it from proposing improv
 
 ## §7 — Milestones (binding gates)
 
-Phase order: P0 → **Phase R** → **P1a** → **P2** → **P1b** → P3 → P4 → P5 → P6 → P7 (resequenced so the first owner-visible win lands around day 26–30, before the full trust machinery). Cumulative day estimates are directional (focused solo-dev days, not commitments).
+Phase order: P0 → **Phase R** → **P1a** → **P1c ∥ P2** → **P1b** → P3 → P4 → P5 → P6 → P7 (resequenced so the first owner-visible win lands around day 26–30, before the full trust machinery; P1c — the daily-assistant essentials — runs as a parallel lane alongside P2 and does not push out the first-magic date). Cumulative day estimates are directional (focused solo-dev days, not commitments).
 
 | Milestone | Ships after | ~Cum. day | You can use it for | Binding gate |
 |---|---|---|---|---|
 | **M1 — Factory-ready host** | P0 | ~5 | A box that can run a fleet and honestly report its compute/fleet state | 24h uptime; `probe.py` + `capabilities.json` + measured `compute.md` truthful; a gateway-independent caffeinate holds through a job |
 | **M1.5 — Broken holes closed** | Phase R | ~9 | A host that refuses to run half-configured and surfaces auth problems instead of looping | Fail-closed config load; WhatsApp paired-and-verified or off; single token-refresh owner; SSO expiry surfaced; degraded lanes; preflight + setup-checklist gates pass |
 | **M2 — Enforcement + dispatch** | P1a | ~17 | Every consequential action gated; a second machine retrofittable | Bypass impossible incl. raw `git push` (fresh-context); safe-lane auto-sends one / holds one; remote-worker stub dispatched by the same path as a real subprocess; SIGTERM-to-process-group kill works |
+| **M2.5 — Assistant essentials live** | P1c | ~25–30 (parallel with P2) | Daily chief-of-staff value — morning triage, calendar prep, approved sends — while the factory spine is still being built | Repeated inbox sweep processes no item twice; exactly one approval per send; ≥1 real meeting gets a zero-manual-step prep note |
 | **M-Magic — First overnight PR** | P2 | **~27–31** | **You wake to a real, overnight-built PR and approve it from your phone** | One real feature intake→merge with a single approval; no ungated protected-branch merge; immutable-ring diff rejected; cost stops fire |
 | **M3 — Earned autonomy** | P1b | ~33 | Autonomy earnable *and* revocable from real merge outcomes | Graduate held→auto after the *configured* threshold + demote on an injected bad outcome; Diligent repos stay tier-0 |
 | **M4 — Queue eater** | P3 | ~48 | A spec/Jira epic → a scheduled fleet across a task graph | Epic splits; ambiguity parks to questions; spec held for review; fan-out + serialize; a repo onboards |
 | **M5 — Overnight autonomy** | P4 | ~65 | Throw a queue at night, wake to merged/held with cost + confidence | 3 nights on the committed `p4-gate-queue.md` (≥2 feature + ≥1 refactor, ≥2 repos): ≥5 tasks intake→PR, zero human before 7am, under ceiling, ≥1 failover, ≥1 phase-resume, digest ranked by confidence |
 | **M6 — Self-improving** | P5 | ~80 | Routing + trust + skills learn from outcomes | Routing changes from data; a retro diff cuts a failure class (immutable-ring-gated); watchdog + sentinel fire; cost-per-PR trending down |
-| **M7 — Control panel** | P6 | ~91 | Comms as the control panel; full voice-note surface | Broker gates all comms; one UX, no bypass; idempotency ledger holds (voice-note→task already live since P4.7) |
+| **M7 — Mission control** | P6 | ~85 | The assistant channel becomes the factory's mission control; full voice-note surface + live-job control cards | Voice note → spec'd task by morning; control cards steer ≥1 live job through the broker; one UX, no bypass (daily-assistant essentials already live since P1c) |
 | **M8 — Compounding** | P7 | ongoing | Cheap upkeep + demo reels + cross-repo transfer + retro + the end-to-end capstone | Upstream pull <1 day; demo reel in a PR card; cross-repo transfer; weekly retro trends; the thread→spec→Jira→merge capstone runs |
 
 ---
@@ -479,6 +493,7 @@ The 8 spine ideas are woven into core phases: PRD decomposition (P3), voice-note
 
 **Revision history:**
 - **v1** (git commit `58f5e56ad`, chief-of-staff-first, factory as Phase 6) — preserved verbatim in git.
-- **v2** — factory-first rewrite; inverts the spine. Adversarial-panel review resolved all P0/P1 findings: worker-launcher reclassified as new code, prompt-injection scan moved to runtime + broker-only pushes, probe-validated model names, and the P1a/P2/P1b resequence for an earlier first win. Then a superset pass folded back seven v1 reliability items into a new Phase R and restored calendar/meeting-prep to the parked list, and a plain-English pass rewrote the whole document for a zero-context reader.
+- **v2** — factory-first rewrite; inverts the spine. Adversarial-panel review resolved all P0/P1 findings: worker-launcher reclassified as new code, prompt-injection scan moved to runtime + broker-only pushes, probe-validated model names, and the P1a/P2/P1b resequence for an earlier first win. Then a superset pass folded back seven v1 reliability items into a new Phase R and restored calendar/meeting-prep to the plan, and a plain-English pass rewrote the whole document for a zero-context reader.
+- **v3** — split the old P6 (chief-of-staff control plane) in two to deliver daily-assistant value ~day 25–30 instead of ~day 90: a new **P1c — Assistant essentials** (morning triage + no-reprocess ledger, ACTION/FYI/NOISE reference skill, exactly-one-approval-per-send, calendar + meeting prep) runs as a parallel lane alongside P2 on top of the already-built P1a broker; the slimmed **P6 — Factory mission control** keeps only what needs the factory (voice-note → spec'd task, mission-control surfaces + live-job control cards, factory-scoped pm_os orchestration). Milestone M2.5 added; M7 renamed and its day estimate dropped as P6 shrank.
 
 No code is written under this document; it is a plan only.
