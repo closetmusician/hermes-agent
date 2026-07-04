@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes — The Autonomous Software Factory, explained</title>
+<style>
+  /* ---- Design tokens ---------------------------------------------------- */
+  :root {
+    --bg:          #14161c;
+    --bg-raise:    #1b1e26;
+    --bg-card:     #20242e;
+    --bg-inset:    #10121799;
+    --line:        #2c313d;
+    --line-soft:   #262b35;
+    --ink:         #e7e9ee;
+    --ink-dim:     #a4abba;
+    --ink-faint:   #6f7688;
+    --accent:      #f0a24b;   /* single warm accent */
+    --accent-dim:  #b6773322;
+    --accent-ink:  #f7c68a;
+    --good:        #6fce9f;
+    --warn:        #e0b25a;
+    --bad:         #e0796b;
+    --radius:      12px;
+    --radius-sm:   8px;
+    /* spacing scale (4px base) */
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+    --s6: 32px; --s7: 48px; --s8: 64px; --s9: 96px;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --maxw: 1080px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#f6f5f2; --bg-raise:#fff; --bg-card:#fff; --bg-inset:#f0efeb;
+      --line:#e2ded6; --line-soft:#eae7e0; --ink:#20242c; --ink-dim:#565e6e;
+      --ink-faint:#8b90a0; --accent:#c06a12; --accent-dim:#c06a1214;
+      --accent-ink:#a1560c; --bg-inset:#efece5;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--font); font-size: 16px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  h1,h2,h3,h4 { line-height: 1.2; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  p { margin: 0 0 var(--s4); }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--bg-inset);
+         padding: 1px 5px; border-radius: 5px; border: 1px solid var(--line-soft); }
+
+  /* ---- Top nav --------------------------------------------------------- */
+  .topnav {
+    position: sticky; top: 0; z-index: 40;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topnav-inner {
+    max-width: var(--maxw); margin: 0 auto; padding: 0 var(--s5);
+    height: 58px; display: flex; align-items: center; gap: var(--s5);
+  }
+  .brand { font-weight: 700; letter-spacing: -0.02em; white-space: nowrap; }
+  .brand .dot { color: var(--accent); }
+  .navlinks { display: flex; gap: var(--s4); overflow-x: auto; margin-left: auto;
+              -ms-overflow-style: none; scrollbar-width: none; }
+  .navlinks::-webkit-scrollbar { display: none; }
+  .navlinks a { color: var(--ink-dim); font-size: 14px; white-space: nowrap; padding: 4px 2px;
+                border-bottom: 2px solid transparent; }
+  .navlinks a:hover { color: var(--ink); text-decoration: none; }
+  .navlinks a.active { color: var(--accent-ink); border-bottom-color: var(--accent); }
+  @media (max-width: 720px) { .navlinks { display: none; } }
+
+  /* ---- Layout ---------------------------------------------------------- */
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--s5); }
+  section { padding: var(--s8) 0; border-top: 1px solid var(--line-soft); }
+  section:first-of-type { border-top: none; }
+  .eyebrow { font-size: 12.5px; letter-spacing: 0.09em; text-transform: uppercase;
+             color: var(--accent-ink); font-weight: 650; margin-bottom: var(--s3); }
+  .sec-title { font-size: clamp(24px, 3vw, 32px); margin-bottom: var(--s3); }
+  .lede { font-size: 18px; color: var(--ink-dim); max-width: 62ch; margin-bottom: var(--s6); }
+
+  /* ---- Plan link chip -------------------------------------------------- */
+  .plan-link {
+    display: inline-flex; align-items: center; gap: var(--s2);
+    font-size: 13.5px; color: var(--ink-dim);
+    background: var(--accent-dim); border: 1px solid var(--line);
+    padding: 6px 12px; border-radius: 100px; margin-top: var(--s2);
+  }
+  .plan-link:hover { color: var(--accent-ink); text-decoration: none; border-color: var(--accent); }
+  .plan-link .arw { color: var(--accent); }
+
+  /* ---- Hero ------------------------------------------------------------ */
+  .hero { padding-top: var(--s9); padding-bottom: var(--s8); }
+  .hero h1 { font-size: clamp(30px, 5.2vw, 52px); letter-spacing: -0.025em; max-width: 16ch; }
+  .hero .sub { font-size: clamp(17px, 2.2vw, 21px); color: var(--ink-dim);
+               max-width: 60ch; margin-top: var(--s5); }
+  .hero .tag { display:inline-block; font-family: var(--mono); font-size: 12px;
+               color: var(--ink-faint); letter-spacing: 0.06em; margin-bottom: var(--s5);
+               text-transform: uppercase; }
+
+  /* ---- Night-in-the-life timeline ------------------------------------- */
+  .night {
+    margin-top: var(--s7); background: var(--bg-raise);
+    border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+  }
+  .night-head { display: flex; align-items: center; justify-content: space-between;
+                gap: var(--s4); padding: var(--s4) var(--s5); border-bottom: 1px solid var(--line-soft); flex-wrap: wrap; }
+  .night-head h3 { font-size: 16px; }
+  .night-head p { margin: 0; font-size: 13.5px; color: var(--ink-faint); }
+  .stepper { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .step-btn { appearance: none; border: none; background: none; cursor: pointer;
+              text-align: left; padding: var(--s4) var(--s5); color: var(--ink-dim);
+              border-bottom: 3px solid transparent; border-right: 1px solid var(--line-soft);
+              font-family: inherit; transition: background .15s; }
+  .step-btn:last-child { border-right: none; }
+  .step-btn:hover { background: var(--bg-card); }
+  .step-btn .when { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+                    color: var(--ink-faint); display: block; margin-bottom: 2px; }
+  .step-btn .what { font-size: 15px; font-weight: 600; color: var(--ink); }
+  .step-btn[aria-selected="true"] { border-bottom-color: var(--accent); background: var(--bg-card); }
+  .step-btn[aria-selected="true"] .when { color: var(--accent-ink); }
+  .step-body { padding: var(--s6) var(--s5); font-size: 16.5px; color: var(--ink-dim);
+               min-height: 88px; }
+  .step-body strong { color: var(--ink); font-weight: 600; }
+  @media (max-width: 620px) {
+    .stepper { grid-template-columns: 1fr; }
+    .step-btn { border-right: none; border-bottom: 1px solid var(--line-soft); border-left: 3px solid transparent; }
+    .step-btn[aria-selected="true"] { border-bottom-color: var(--line-soft); border-left-color: var(--accent); }
+  }
+
+  /* ---- Cards / grids --------------------------------------------------- */
+  .grid { display: grid; gap: var(--s4); }
+  .cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 760px) { .cols-2, .cols-3 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: var(--s5);
+  }
+  .card h3 { font-size: 16.5px; margin-bottom: var(--s2); }
+  .card p { font-size: 14.5px; color: var(--ink-dim); margin-bottom: 0; }
+  .card .k+ { color: var(--good); } .card .kx { color: var(--bad); }
+
+  /* ---- Architecture flow ---------------------------------------------- */
+  .flow { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s5); }
+  .flow-row {
+    display: grid; grid-template-columns: 150px 1fr; gap: var(--s4);
+    align-items: stretch;
+  }
+  .flow-stage {
+    background: var(--bg-card); border: 1px solid var(--line);
+    border-radius: var(--radius-sm); padding: var(--s4); position: relative;
+    transition: border-color .15s, transform .15s;
+  }
+  .flow-stage:hover { border-color: var(--accent); transform: translateX(2px); }
+  .flow-name { display: flex; align-items: baseline; gap: var(--s2); }
+  .flow-name b { font-size: 15px; color: var(--ink); }
+  .flow-name .n { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+  .flow-desc { font-size: 13.5px; color: var(--ink-dim); margin-top: 4px; }
+  .flow-label { display: flex; align-items: center; font-family: var(--mono);
+                font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase;
+                color: var(--ink-faint); }
+  .flow-gate .flow-stage { border-color: var(--accent); background:
+    linear-gradient(0deg, var(--accent-dim), var(--accent-dim)), var(--bg-card); }
+  .flow-arrow { text-align: center; color: var(--line); font-size: 15px; line-height: 1;
+                padding: 2px 0; margin-left: 150px; }
+  @media (max-width: 620px) {
+    .flow-row { grid-template-columns: 1fr; gap: var(--s1); }
+    .flow-label { padding-top: var(--s2); }
+    .flow-arrow { margin-left: 0; }
+  }
+  .gauntlet { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--s3); }
+  .gauntlet span { font-size: 12px; font-family: var(--mono); color: var(--ink-dim);
+                   background: var(--bg-inset); border: 1px solid var(--line-soft);
+                   padding: 3px 8px; border-radius: 6px; }
+
+  /* ---- Trust ladder ---------------------------------------------------- */
+  .trust { margin-top: var(--s5); display: grid; grid-template-columns: 1fr; gap: var(--s4); }
+  .trust-track { display: grid; grid-template-columns: repeat(12, 1fr); gap: 5px; margin: var(--s3) 0; }
+  .pip { height: 30px; border-radius: 5px; background: var(--bg-inset);
+         border: 1px solid var(--line-soft); }
+  .pip.on { background: linear-gradient(180deg, var(--good), color-mix(in srgb,var(--good) 70%, #000));
+            border-color: transparent; }
+  .pip.bad { background: linear-gradient(180deg, var(--bad), color-mix(in srgb,var(--bad) 70%, #000));
+             border-color: transparent; }
+  .trust-tiers { display: grid; grid-template-columns: repeat(3,1fr); gap: var(--s4); margin-top: var(--s4); }
+  @media (max-width: 700px){ .trust-tiers { grid-template-columns: 1fr; } }
+  .tier { border: 1px solid var(--line); border-radius: var(--radius-sm);
+          padding: var(--s4); background: var(--bg-card); }
+  .tier .lvl { font-family: var(--mono); font-size: 12px; color: var(--accent-ink);
+               letter-spacing: .06em; text-transform: uppercase; }
+  .tier h4 { font-size: 15px; margin: 4px 0 6px; }
+  .tier p { font-size: 13.5px; color: var(--ink-dim); margin: 0; }
+  .btnrow { display: flex; gap: var(--s3); flex-wrap: wrap; margin-top: var(--s4); }
+  .btn { appearance: none; font-family: inherit; font-size: 13.5px; cursor: pointer;
+         background: var(--bg-card); color: var(--ink); border: 1px solid var(--line);
+         padding: 8px 14px; border-radius: 8px; transition: border-color .15s; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: #1a1204; border-color: var(--accent); font-weight: 600; }
+  .verdict { font-size: 14px; color: var(--ink-dim); margin-top: var(--s3); min-height: 22px; }
+  .verdict b { color: var(--ink); }
+
+  /* ---- Phase timeline -------------------------------------------------- */
+  .timeline { margin-top: var(--s5); display: flex; flex-direction: column; gap: var(--s3); }
+  .phase {
+    background: var(--bg-card); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .phase.magic { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-dim); }
+  .phase-top { width: 100%; text-align: left; background: none; border: none; cursor: pointer;
+               font-family: inherit; color: inherit; padding: var(--s4) var(--s5);
+               display: grid; grid-template-columns: auto 1fr auto; gap: var(--s4);
+               align-items: center; }
+  .phase-top:hover { background: var(--bg-raise); }
+  .pid { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--accent-ink);
+         background: var(--accent-dim); border: 1px solid var(--line); border-radius: 7px;
+         padding: 3px 9px; white-space: nowrap; min-width: 54px; text-align: center; }
+  .phase.magic .pid { background: var(--accent); color:#1a1204; border-color: var(--accent); }
+  .phase-title { font-size: 15.5px; font-weight: 600; }
+  .phase-title .par { font-size: 12px; color: var(--accent-ink); font-family: var(--mono);
+                      margin-left: var(--s2); }
+  .phase-meta { display: flex; align-items: center; gap: var(--s4); color: var(--ink-faint);
+                font-size: 12.5px; font-family: var(--mono); white-space: nowrap; }
+  .phase-meta .ms { color: var(--accent-ink); }
+  .chev { color: var(--ink-faint); transition: transform .2s; font-size: 13px; }
+  .phase[open-state="1"] .chev { transform: rotate(90deg); }
+  .phase-body { padding: 0 var(--s5) var(--s5); display: none; }
+  .phase[open-state="1"] .phase-body { display: block; }
+  .phase-body p { font-size: 14.5px; color: var(--ink-dim); margin-bottom: var(--s3); }
+  .phase-body .goal { color: var(--ink); }
+  @media (max-width: 720px) {
+    .phase-top { grid-template-columns: auto 1fr; grid-template-areas: "id title" "meta meta"; row-gap: var(--s2); }
+    .phase-meta { grid-area: meta; margin-left: 0; }
+    .chev { display: none; }
+  }
+  .parallel-note { font-size: 13px; color: var(--ink-faint); margin-top: var(--s4);
+                   border-left: 2px solid var(--accent); padding-left: var(--s4); }
+
+  /* ---- Safety card ----------------------------------------------------- */
+  .never { display: grid; grid-template-columns: repeat(2,1fr); gap: var(--s3); margin-top: var(--s5); }
+  @media (max-width: 700px){ .never { grid-template-columns: 1fr; } }
+  .never-item { display: flex; gap: var(--s3); align-items: flex-start;
+                background: var(--bg-card); border: 1px solid var(--line);
+                border-radius: var(--radius-sm); padding: var(--s4); }
+  .never-item .x { color: var(--bad); font-weight: 700; font-family: var(--mono);
+                   font-size: 15px; line-height: 1.5; flex-shrink: 0; }
+  .never-item div b { font-size: 14.5px; display: block; margin-bottom: 2px; }
+  .never-item div span { font-size: 13.5px; color: var(--ink-dim); }
+
+  /* ---- Rings (self-improvement) --------------------------------------- */
+  .rings { display: grid; grid-template-columns: 1fr; gap: var(--s3); margin-top: var(--s5); }
+  .ring { border-left: 3px solid; border-radius: var(--radius-sm);
+          background: var(--bg-card); border: 1px solid var(--line);
+          padding: var(--s4) var(--s5); }
+  .ring.r1 { border-left: 3px solid var(--good); }
+  .ring.r2 { border-left: 3px solid var(--warn); }
+  .ring.r3 { border-left: 3px solid var(--bad); }
+  .ring h4 { font-size: 15px; margin-bottom: 4px; }
+  .ring .tagline { font-size: 12px; font-family: var(--mono); text-transform: uppercase;
+                   letter-spacing: .05em; color: var(--ink-faint); margin-bottom: var(--s2); }
+  .ring p { font-size: 14px; color: var(--ink-dim); margin: 0; }
+
+  /* ---- Glossary -------------------------------------------------------- */
+  .glossary { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s3) var(--s5);
+              margin-top: var(--s5); }
+  @media (max-width: 700px){ .glossary { grid-template-columns: 1fr; } }
+  .gterm { border-bottom: 1px solid var(--line-soft); padding-bottom: var(--s3); }
+  .gterm dt { font-weight: 650; font-size: 14.5px; color: var(--ink); }
+  .gterm dd { margin: 3px 0 0; font-size: 13.5px; color: var(--ink-dim); }
+
+  /* ---- Footer ---------------------------------------------------------- */
+  footer { border-top: 1px solid var(--line); padding: var(--s7) 0 var(--s9);
+           color: var(--ink-faint); font-size: 13.5px; }
+  footer a { color: var(--ink-dim); }
+  .footgrid { display:flex; justify-content: space-between; gap: var(--s5); flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <span class="brand">hermes<span class="dot">.</span>factory</span>
+    <div class="navlinks" id="navlinks">
+      <a href="#what">What it is</a>
+      <a href="#how">How it works</a>
+      <a href="#trust">Trust</a>
+      <a href="#timeline">Timeline</a>
+      <a href="#safety">Safety</a>
+      <a href="#improve">Self-improvement</a>
+      <a href="#glossary">Glossary</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ============================ HERO ============================ -->
+<header class="wrap hero" id="what">
+  <span class="tag">Master plan · v3 · factory-first</span>
+  <h1>Drop in a spec at night. Wake to tested pull requests.</h1>
+  <p class="sub">Hermes is a program on one Mac that is becoming an autonomous software
+  factory: you hand it coding work, and overnight a fleet of AI workers splits it into
+  tasks, writes and tests the code on isolated copies of the repo, and by morning presents
+  you with finished pull requests you approve from your phone with one tap.</p>
+  <a class="plan-link" href="hermes-fable-plan.md#0--what-this-is-and-the-north-star">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §0, What This Is</a>
+
+  <!-- Night-in-the-life -->
+  <div class="night" id="night">
+    <div class="night-head">
+      <h3>A night in the life</h3>
+      <p>Click a moment to walk the timeline</p>
+    </div>
+    <div class="stepper" role="tablist" aria-label="Night timeline">
+      <button class="step-btn" role="tab" aria-selected="true" data-step="0">
+        <span class="when">Evening · ~10pm</span>
+        <span class="what">You drop a spec</span>
+      </button>
+      <button class="step-btn" role="tab" aria-selected="false" data-step="1">
+        <span class="when">3:00 am</span>
+        <span class="what">The fleet builds</span>
+      </button>
+      <button class="step-btn" role="tab" aria-selected="false" data-step="2">
+        <span class="when">Morning · coffee</span>
+        <span class="what">One tap: Approve</span>
+      </button>
+    </div>
+    <div class="step-body" id="stepBody"></div>
+  </div>
+</header>
+
+<!-- ============================ HOW IT WORKS ============================ -->
+<section id="how"><div class="wrap">
+  <div class="eyebrow">How it works</div>
+  <h2 class="sec-title">Six layers, one gate to the outside world</h2>
+  <p class="lede">Plain code supervises everything; AI reasoning lives only in the workers
+  and the review steps. Work flows top to bottom — and nothing reaches the outside
+  (a message, a push, a merge) except through the broker.</p>
+
+  <div class="flow">
+    <div class="flow-row">
+      <div class="flow-label">Intake ×4</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Where work enters</b></div>
+        <div class="flow-desc">Spec docs · Jira queues (via pm_os) · existing <code>~/Code</code> repos · greenfield ideas · voice notes</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row">
+      <div class="flow-label">Planner</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Task-splitter</b><span class="n">AI · one pass</span></div>
+        <div class="flow-desc">Interrogates the spec for gaps. Too vague → parks it and asks you (never guesses). Clear → emits an ordered, acceptance-test-first task graph.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row">
+      <div class="flow-label">Scheduler</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Fleet supervisor</b><span class="n">plain code · on a timer</span></div>
+        <div class="flow-desc">Fans out independent tasks, serializes dependent ones, throttles when a provider is low on quota. All state on disk, so a crash never loses progress.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row">
+      <div class="flow-label">Worker fleet</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Background AI workers</b><span class="n">one worktree each</span></div>
+        <div class="flow-desc">Real OS processes (<code>claude -p</code>, <code>codex exec</code>, or an OpenRouter model) that write and commit code on isolated checkouts — no visible window, no <code>git push</code>.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row">
+      <div class="flow-label">Verification</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>The gauntlet</b><span class="n">every change passes all four</span></div>
+        <div class="flow-desc">Checking the work is the real bottleneck — so every change runs the chain:</div>
+        <div class="gauntlet">
+          <span>acceptance tests</span><span>→ repo test suite</span>
+          <span>→ independent 2nd-AI review</span><span>→ end-to-end demo drive</span>
+        </div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row flow-gate">
+      <div class="flow-label">The gate</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Broker + trust ledger</b><span class="n">separate process · fails closed</span></div>
+        <div class="flow-desc"><b>The only thing that can touch the outside world.</b> It holds every credential (removed from everywhere the AI can read), so the assistant cannot send, push, or merge on its own — it can only ask. One approval surface for every gate.</div>
+      </div>
+    </div>
+    <div class="flow-arrow">↓</div>
+    <div class="flow-row">
+      <div class="flow-label">Your phone</div>
+      <div class="flow-stage">
+        <div class="flow-name"><b>Morning surfaces</b><span class="n">factory mission control</span></div>
+        <div class="flow-desc">A standup briefing + one-tap PR cards (summary · reasoning · reversibility · risk · confidence) you approve over coffee.</div>
+      </div>
+    </div>
+  </div>
+  <a class="plan-link" href="hermes-fable-plan.md#2--architecture">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §2, Architecture</a>
+</div></section>
+
+<!-- ============================ TRUST ============================ -->
+<section id="trust"><div class="wrap">
+  <div class="eyebrow">The trust model</div>
+  <h2 class="sec-title">Autonomy is earned as data — and revoked instantly</h2>
+  <p class="lede">The factory starts by asking for approval on <em>everything</em>. Each
+  repo-plus-task-type combination earns the right to auto-merge only by building a track
+  record. Trust is a ledger, not a vibe: 10 clean merges over 30 days graduates it — a
+  single bad one revokes it.</p>
+
+  <div class="card" style="padding: var(--s5) var(--s5) var(--s6);">
+    <h3 id="ledgerHeading">Track record for one repo × task-type</h3>
+    <p id="ledgerCaption" style="margin-bottom: var(--s3);">0 of 10 clean merges. Still tier-0 — every merge is held for your tap.</p>
+    <div class="trust-track" id="track" aria-hidden="true"></div>
+    <div class="btnrow">
+      <button class="btn primary" id="mergeGood">+ Clean merge</button>
+      <button class="btn" id="mergeBad">Inject a bad merge</button>
+      <button class="btn" id="mergeReset">Reset</button>
+    </div>
+    <div class="verdict" id="verdict"></div>
+  </div>
+
+  <div class="trust-tiers">
+    <div class="tier">
+      <div class="lvl">Tier 0 — start here</div>
+      <h4>Ask for everything</h4>
+      <p>Every merge is held for a human tap. This is the day-one default, and where any repo returns the instant it regresses.</p>
+    </div>
+    <div class="tier">
+      <div class="lvl">Tier 1 — earned</div>
+      <h4>Auto-merge, personal non-prod only</h4>
+      <p>After ≥10 consecutive clean merges, 0 reverts, over ≥30 days. Graduation is a proposal <em>you</em> approve; demotion is automatic.</p>
+    </div>
+    <div class="tier">
+      <div class="lvl">Never</div>
+      <h4>Stays human forever</h4>
+      <p>Production deploys, deletions, spending money, and all work/Diligent repos — regardless of track record.</p>
+    </div>
+  </div>
+  <a class="plan-link" href="hermes-fable-plan.md#phase-1b--trust-ledger--graduation-learns-from-p2s-real-outcomes">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §3, Phase 1b — Trust ledger</a>
+</div></section>
+
+<!-- ============================ TIMELINE ============================ -->
+<section id="timeline"><div class="wrap">
+  <div class="eyebrow">The build journey</div>
+  <h2 class="sec-title">Ten phases, ordered so the first magic lands early</h2>
+  <p class="lede">The order is deliberately factory-first, but split so the first result you
+  can use arrives around day 27–31. Day estimates are directional; each phase has a binding,
+  fresh-context-verified exit gate. Click any phase to expand.</p>
+
+  <p class="parallel-note">The <strong>∥</strong> marks a parallel lane: <strong>P1c</strong>
+  (daily-assistant essentials) runs alongside <strong>P2</strong> on top of the already-built
+  broker. They touch different code, so one team works each lane — and P1c never delays the
+  first-magic gate. If effort is contended, P2 wins.</p>
+
+  <div class="timeline" id="timeline"></div>
+</div></section>
+
+<!-- ============================ SAFETY ============================ -->
+<section id="safety"><div class="wrap">
+  <div class="eyebrow">Safety &amp; security</div>
+  <h2 class="sec-title">What the agents can never do</h2>
+  <p class="lede">These aren't labels — they're enforced by plain code the AI cannot reach.
+  The original failure that started this whole effort was an AI reading a credential off disk
+  and editing its own guard. Every rule below makes that structurally impossible.</p>
+
+  <div class="never">
+    <div class="never-item"><span class="x">✕</span><div>
+      <b>Push directly to the outside</b>
+      <span><code>git push</code> is removed from the worker allowlist entirely. Workers only commit locally; every push and merge goes through the broker.</span></div></div>
+    <div class="never-item"><span class="x">✕</span><div>
+      <b>Spend past the caps</b>
+      <span>Three independent stops: a per-job dollar cap, a wall-clock timeout that kills the process group, and a daily reserved-budget ceiling.</span></div></div>
+    <div class="never-item"><span class="x">✕</span><div>
+      <b>Send confidential code to third-party models</b>
+      <span>A per-repo <code>allow_openrouter</code> flag defaults to <em>false</em> for work/Diligent repos — they wait for subscription capacity rather than spill to third-party hosts.</span></div></div>
+    <div class="never-item"><span class="x">✕</span><div>
+      <b>Touch their own guardrails</b>
+      <span>An immutable-ring denylist rejects, at the merge-submission gate, any diff touching broker source, the trust policy, or cost-stop code — and workers can't even read those paths.</span></div></div>
+  </div>
+  <a class="plan-link" href="hermes-fable-plan.md#5--safety--security">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §5, Safety &amp; Security</a>
+</div></section>
+
+<!-- ============================ SELF-IMPROVEMENT ============================ -->
+<section id="improve"><div class="wrap">
+  <div class="eyebrow">Self-improvement</div>
+  <h2 class="sec-title">The factory gets better every week — within a fence</h2>
+  <p class="lede">A per-model scorecard rewrites the routing table from real outcomes; a weekly
+  pass improves the skill files; a nightly retro proposes concrete edits. But exactly what the
+  factory may change about itself is drawn as three concentric rings — and the core is off-limits.</p>
+
+  <div class="rings">
+    <div class="ring r1">
+      <div class="tagline">Ring 1 · proposal → owner-approved diff</div>
+      <h4>May self-modify</h4>
+      <p>Skill files, prompts, the model-routing table, policy weights, pattern-bank entries.
+      The nightly retro emits a <em>diff</em>; you approve it through the broker; it stays disabled
+      until a skill lint and one behavioral test pass. Never a silent self-edit.</p>
+    </div>
+    <div class="ring r2">
+      <div class="tagline">Ring 2 · data-driven, no diff</div>
+      <h4>May auto-tune within bounds</h4>
+      <p>Routing within the ladder, trust-graduation <em>proposals</em>, backpressure thresholds
+      inside a configured min/max. Every auto-tune writes a line to <code>tuning-log.md</code> —
+      timestamp, what changed, from→to, and the data that triggered it — surfaced in the weekly retro.</p>
+    </div>
+    <div class="ring r3">
+      <div class="tagline">Ring 3 · never self-modifies</div>
+      <h4>Immutable core</h4>
+      <p>The broker boundary, the trust rules themselves, the three cost stops, the "no AI in the
+      supervisor loop" principle, and the "what never graduates" list. A factory job touching these
+      is <em>rejected at submission</em> — human-initiated and restart-gated only.</p>
+    </div>
+  </div>
+  <a class="plan-link" href="hermes-fable-plan.md#6--self-improvement-contract">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §6, Self-Improvement Contract</a>
+</div></section>
+
+<!-- ============================ GLOSSARY ============================ -->
+<section id="glossary"><div class="wrap">
+  <div class="eyebrow">Glossary</div>
+  <h2 class="sec-title">The words that keep coming up</h2>
+  <p class="lede">Every definition lifted from the plan itself. If a term above felt like jargon, it's here.</p>
+
+  <dl class="glossary">
+    <div class="gterm"><dt>Broker</dt><dd>A small separate process that is the <em>only</em> thing holding send/push/API credentials. The assistant asks it to act; it checks the rules and either does it or holds it for approval. Because the AI can't read the credentials, it can't bypass the broker.</dd></div>
+    <div class="gterm"><dt>Worktree</dt><dd>An isolated checkout of a git repo on disk. Each worker gets its own, so parallel workers never overwrite each other's files.</dd></div>
+    <div class="gterm"><dt>Trust ledger</dt><dd>A table recording, per repo and task-type, how past merges went (clean / needed a fix / rejected / reverted). It's the data that earns or revokes auto-merge.</dd></div>
+    <div class="gterm"><dt>Verification gauntlet</dt><dd>The chain of checks every change must pass: acceptance tests → the repo's own test suite → an independent second-AI review → an end-to-end demo drive.</dd></div>
+    <div class="gterm"><dt>Worker</dt><dd>A background AI process (<code>claude -p</code>, <code>codex exec</code>, or an OpenRouter model) that actually writes the code — run without a visible window and controlled by scripts.</dd></div>
+    <div class="gterm"><dt>Task-splitter</dt><dd>A one-time AI pass per project that turns a spec into an ordered list of small tasks, each with its acceptance tests written first — or parks it and asks you if it's too vague.</dd></div>
+    <div class="gterm"><dt>Fresh-context verified</dt><dd>A gate checked by a person or AI agent with no prior knowledge of the task, so the builder can never rubber-stamp its own work.</dd></div>
+    <div class="gterm"><dt>429 / rate limit</dt><dd>HTTP status 429 means "too fast / quota hit." The factory detects it explicitly and steps down to the next cheaper provider — a naive retry can drain a month's quota in minutes.</dd></div>
+    <div class="gterm"><dt>Headless</dt><dd>Running without a visible window. Workers are headless background processes, launched and killed by scripts.</dd></div>
+    <div class="gterm"><dt>pm_os</dt><dd>A separate personal-assistant codebase Yu-Kuan already owns (email, calendar, Jira). The plan reuses its plumbing rather than rebuilding those integrations.</dd></div>
+    <div class="gterm"><dt>Immutable ring</dt><dd>The set of paths — broker source, trust policy, cost-stop code — that plain code refuses to let any diff touch at merge time. The guard being editable is exactly the original failure, made structurally impossible.</dd></div>
+    <div class="gterm"><dt>Pull request (PR)</dt><dd>A proposed set of code changes submitted for review before merging. The factory produces PRs; you approve or reject them.</dd></div>
+  </dl>
+  <a class="plan-link" href="hermes-fable-plan.md#1--locked-decisions">
+    Read the full section <span class="arw">→</span>&nbsp;Master plan §1, Locked Decisions</a>
+</div></section>
+
+<footer><div class="wrap footgrid">
+  <div>
+    <div style="color:var(--ink-dim); margin-bottom:6px;">Hermes — Autonomous Software Factory</div>
+    <div>Source of truth: <a href="hermes-fable-plan.md">hermes-fable-plan.md</a> (§0–§9 + appendices)</div>
+  </div>
+  <div style="text-align:right;">
+    <div>This page is an explainer. No code is written under the plan; it is a plan only.</div>
+    <div style="margin-top:6px;"><a href="hermes-fable-plan.md#7--milestones-binding-gates">Milestones M1–M8 →</a></div>
+  </div>
+</div></footer>
+
+<script>
+  "use strict";
+
+  /* ---- Night-in-the-life stepper -------------------------------------- */
+  var nightCopy = [
+    "In the evening you drop a spec into the queue and go to sleep. That's the whole interaction — a spec document, a Jira ticket, a repo, a fresh idea, or a mumbled voice note. <strong>The factory takes it from here.</strong>",
+    "At 3am the AI workers build the feature, write the tests, run them, and have a <strong>second, independent AI review the diff</strong>. Each works on its own isolated copy of the repo. If one hits a quota wall, the fleet fails it over to a cheaper model and resumes.",
+    "In the morning your phone shows a pull request ready to merge and a 20-second summary — reasoning, reversibility, and a risk score. <strong>You read it over coffee and tap Approve.</strong> Target: about five taps at wake time."
+  ];
+  var stepBtns = Array.prototype.slice.call(document.querySelectorAll(".step-btn"));
+  var stepBody = document.getElementById("stepBody");
+  function showStep(i) {
+    stepBtns.forEach(function (b) { b.setAttribute("aria-selected", String(+b.dataset.step === i)); });
+    stepBody.innerHTML = nightCopy[i];
+  }
+  stepBtns.forEach(function (b) { b.addEventListener("click", function () { showStep(+b.dataset.step); }); });
+  showStep(0);
+
+  /* ---- Trust ladder simulator ----------------------------------------- */
+  var THRESHOLD = 10, PIPS = 12;
+  var track = document.getElementById("track");
+  var caption = document.getElementById("ledgerCaption");
+  var verdict = document.getElementById("verdict");
+  var pips = [];
+  for (var i = 0; i < PIPS; i++) { var p = document.createElement("div"); p.className = "pip"; track.appendChild(p); pips.push(p); }
+  var clean = 0, graduated = false;
+  function renderTrust(event) {
+    pips.forEach(function (p, idx) {
+      p.className = "pip" + (idx < clean ? " on" : "");
+    });
+    caption.textContent = clean + " of " + THRESHOLD + " clean merges" +
+      (graduated ? ". Graduated to tier-1 — clean merges now land on their own." :
+                   ". Still tier-0 — every merge is held for your tap.");
+    if (event === "bad") {
+      verdict.innerHTML = "<b>Revoked.</b> One human-rejected or reverted merge drops it straight back to tier-0. Trust is a track record, and the record just broke.";
+    } else if (graduated && event === "good") {
+      verdict.innerHTML = "<b>Auto-merged + notified.</b> The threshold held, so this one landed without waking you.";
+    } else if (clean === THRESHOLD && event === "good") {
+      verdict.innerHTML = "<b>Graduation proposed.</b> 10 clean over the window — the factory now asks <em>you</em> to approve tier-1. Demotion, from here on, is automatic.";
+    } else if (event === "good") {
+      verdict.textContent = "Clean merge recorded. " + (THRESHOLD - clean) + " more to earn auto-merge.";
+    } else {
+      verdict.textContent = "";
+    }
+  }
+  document.getElementById("mergeGood").addEventListener("click", function () {
+    if (clean < THRESHOLD) clean++;
+    if (clean >= THRESHOLD) graduated = true;
+    renderTrust("good");
+  });
+  document.getElementById("mergeBad").addEventListener("click", function () {
+    clean = 0; graduated = false; renderTrust("bad");
+  });
+  document.getElementById("mergeReset").addEventListener("click", function () {
+    clean = 0; graduated = false; renderTrust();
+  });
+  renderTrust();
+
+  /* ---- Phase timeline ------------------------------------------------- */
+  var A = "hermes-fable-plan.md#";
+  var phases = [
+    { id: "P0", magic:false, title:"Factory-ready host", day:"~5", ms:"M1", anchor:"phase-0--factory-ready-host",
+      goal:"The Mac can host long-lived worker fleets without the OS killing them.",
+      body:"Clean upstream checkout, a capability probe that validates every model name against live catalogs, a measured compute inventory (tokens-per-task → tasks-per-night), and a sleep/wake policy independent of the gateway. Kill the zombie platforms while we're here." },
+    { id:"P R", magic:false, title:"Fix what's broken today", day:"~9", ms:"M1.5", anchor:"phase-r--fix-whats-broken-today",
+      goal:"Close the known reliability holes before anything runs unattended overnight.",
+      body:"Fail-closed config loading (refuse to start half-configured), one owner for token refresh, SSO-expiry surfaced instead of looping, paused/degraded states for broken connectors, and a setup checklist whose every item is verified by observed behavior. You don't run a factory on an un-hardened host." },
+    { id:"P1a", magic:false, title:"Broker + approval lanes + worker launcher", day:"~17", ms:"M2", anchor:"phase-1a--broker--approval-lanes--worker-launcher",
+      goal:"The two keystones the first merge needs: one gate the assistant can't improvise around, plus the worker-launch interface.",
+      body:"A separate broker process owns all egress (including every git push), a generic held-action approval surface replaces the broken /approve-email, a five-condition safe-lane decides auto-send vs. hold, and a real worker launcher (own process group, clean SIGTERM kill) ships with a remote-worker stub so a second machine drops in later." },
+    { id:"P1c", magic:false, par:true, title:"Assistant essentials", day:"~25–30", ms:"M2.5", anchor:"phase-1c--assistant-essentials-parallel-lane-with-p2",
+      goal:"Daily chief-of-staff value early — morning triage, calendar prep, approved sends.",
+      body:"Runs as a parallel lane alongside P2 on top of the P1a broker. Morning inbox triage with a no-reprocess ledger, ACTION/FYI/NOISE bucketing, exactly-one-approval-per-send reconciliation, and calendar-driven meeting prep — a working personal assistant by day 25–30 instead of day 90. Never delays P2's first-magic gate." },
+    { id:"P2", magic:true, title:"One worker, end to end — first magic", day:"~27–31", ms:"M-Magic", anchor:"phase-2--one-worker-end-to-end-first-magic",
+      goal:"One task → worktree → the full test-first gauntlet → PR → approval-gated merge. The whole factory in miniature.",
+      body:"This is time-to-first-magic: you wake to a real, overnight-built PR you approve from your phone. A job store and state machine, a scrubbed push-free worker contract, the gauntlet gates, a broker-executed held merge, the immutable-ring submission gate from the very first merge, and three cost stops that each demonstrably fire. Every merge here is held — auto-merge waits for P1b." },
+    { id:"P1b", magic:false, title:"Trust ledger + graduation", day:"~33", ms:"M3", anchor:"phase-1b--trust-ledger--graduation-learns-from-p2s-real-outcomes",
+      goal:"Now that P2 produces real outcomes, build the policy that earns autonomy from them.",
+      body:"Deliberately after P2 — trust has nothing to graduate on until real merges exist. The ledger records per-repo × task-type outcomes; graduation rules (≥10 clean / ≥30 days / 0 reverts) map track record to a tier; the P2 merge gate is retrofitted to consult it. Graduation is a proposal you approve; demotion is automatic; Diligent repos stay tier-0 forever." },
+    { id:"P3", magic:false, title:"Task-splitter + fleet scheduler + intake", day:"~48", ms:"M4", anchor:"phase-3--task-splitter--fleet-scheduler--intake-pipelines",
+      goal:"Turn single-task into queue-eating.",
+      body:"A spec or Jira epic becomes an ordered task graph with acceptance tests per node; an ambiguity grader parks genuinely-vague specs to questions.md instead of guessing. The supervisor fans out independent tasks and serializes dependent ones. All four intake sources wired — Jira first, since the plumbing exists — each repo onboarded to a committed profile." },
+    { id:"P4", magic:false, title:"Overnight autonomy", day:"~65", ms:"M5", anchor:"phase-4--overnight-autonomy",
+      goal:"Throw a queue at it in the evening; wake to merged/held/needs-attention with cost and confidence.",
+      body:"Checkpoint/resume (a worker that dies at 3am resumes from its last cleared phase), explicit 429 failover down the model ladder via a compact handoff brief, multi-provider routing, the morning surfaces, a cost-per-merged-PR trend board, and a per-job confidence score that ranks the morning digest. The flagship gate: three consecutive nights on a committed queue, zero human before 7am." },
+    { id:"P5", magic:false, title:"Learning loops + self-supervision", day:"~80", ms:"M6", anchor:"phase-5--learning-loops--self-supervision",
+      goal:"Every run makes the next one better and cheaper; the fleet watches itself.",
+      body:"A per-model scorecard turns the routing table data-driven; a weekly pass improves skill files from run histories; a nightly retro proposes skill diffs (immutable-ring-gated, so it can't weaken a trust rule). Drift watchdogs, a post-merge regression sentinel, and a watchdog that watches the watchdog." },
+    { id:"P6", magic:false, title:"Factory mission control", day:"~85", ms:"M7", anchor:"phase-6--factory-mission-control",
+      goal:"Turn the assistant channel into the surfaces through which you drive the running factory.",
+      body:"The daily chief-of-staff features already shipped in P1c; what remains is everything that genuinely needs the factory: voice-note → spec'd task as a full surface, mission-control cards that steer live jobs (approve/reject/re-scope, tail a worker, reprioritize), and a quiet-by-default proactive contract. Every control action rides the same broker approval surface as merges." },
+    { id:"P7", magic:false, title:"Compounding assets", day:"ongoing", ms:"M8", anchor:"phase-7--compounding-assets",
+      goal:"The flywheel's outer ring — and the discipline that keeps it cheap to maintain.",
+      body:"Monthly upstream pulls (cheap because our delta is small), a 20-second demo reel embedded in PR cards, a warm weekly retro with real trending metrics, cross-repo pattern transfer, an auto-refreshed living codebase map, and an end-to-end capstone: a thread → a spec → a Jira ticket → a factory build → a merged change, written back to the ticket." }
+  ];
+
+  var tl = document.getElementById("timeline");
+  phases.forEach(function (ph, idx) {
+    var el = document.createElement("div");
+    el.className = "phase" + (ph.magic ? " magic" : "");
+    el.setAttribute("open-state", ph.magic ? "1" : "0");
+    var parHtml = ph.par ? '<span class="par">∥ parallel with P2</span>' : "";
+    el.innerHTML =
+      '<button class="phase-top" aria-expanded="' + (ph.magic ? "true" : "false") + '">' +
+        '<span class="pid">' + ph.id + '</span>' +
+        '<span class="phase-title">' + ph.title + parHtml + '</span>' +
+        '<span class="phase-meta"><span>day ' + ph.day + '</span>' +
+          '<span class="ms">' + ph.ms + '</span>' +
+          '<span class="chev">▶</span></span>' +
+      '</button>' +
+      '<div class="phase-body">' +
+        '<p class="goal"><strong>Goal.</strong> ' + ph.goal + '</p>' +
+        '<p>' + ph.body + '</p>' +
+        '<a class="plan-link" href="' + A + ph.anchor + '">Read the full section <span class="arw">→</span>&nbsp;Master plan §3, ' + ph.title + '</a>' +
+      '</div>';
+    var btn = el.querySelector(".phase-top");
+    btn.addEventListener("click", function () {
+      var open = el.getAttribute("open-state") === "1";
+      el.setAttribute("open-state", open ? "0" : "1");
+      btn.setAttribute("aria-expanded", String(!open));
+    });
+    tl.appendChild(el);
+  });
+
+  /* ---- Scroll-spy for top nav ----------------------------------------- */
+  var links = Array.prototype.slice.call(document.querySelectorAll(".navlinks a"));
+  var sections = links.map(function (a) { return document.querySelector(a.getAttribute("href")); });
+  if ("IntersectionObserver" in window) {
+    var spy = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) {
+          var id = e.target.id;
+          links.forEach(function (a) { a.classList.toggle("active", a.getAttribute("href") === "#" + id); });
+        }
+      });
+    }, { rootMargin: "-45% 0px -50% 0px", threshold: 0 });
+    sections.forEach(function (s) { if (s) spy.observe(s); });
+  }
+</script>
+</body>
+</html>
