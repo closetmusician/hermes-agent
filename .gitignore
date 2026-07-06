@@ -148,3 +148,4 @@ infographic/
 
 # pytest temp
 pytest-of-*/
+tmp*.env
