@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ABOUTME: launchd service for the Hermes send/action broker — runs it as its own
+  ABOUTME: PID, separate from the assistant/gateway process, so the broker holds
+  ABOUTME: egress credentials the assistant never loads. KeepAlive restarts it on
+  ABOUTME: crash; held actions persist in SQLite and resume on restart. The egress
+  ABOUTME: creds are injected into THIS service's environment only (P1a-h), never
+  ABOUTME: into the assistant's. Adjust the python path / working dir to your install.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hermes.broker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>-m</string>
+    <string>broker.server</string>
+  </array>
+
+  <!-- Run from the Hermes repo so `python -m broker.server` resolves. -->
+  <key>WorkingDirectory</key>
+  <string>REPLACE_WITH_HERMES_REPO_PATH</string>
+
+  <!-- Restart on crash; held actions resume from SQLite on restart. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Broker-only egress credentials are injected here by P1a-h provisioning,
+       NOT into the assistant's environment. Placeholder kept empty in P1a. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_BROKER_HOME</key>
+    <string>REPLACE_WITH_HOME/.hermes/broker</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_HOME/.hermes/logs/broker.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_HOME/.hermes/logs/broker.errors.log</string>
+</dict>
+</plist>
