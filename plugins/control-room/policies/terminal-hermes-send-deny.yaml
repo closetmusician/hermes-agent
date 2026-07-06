@@ -1,0 +1,23 @@
+# ABOUTME: Policy blocking the literal `hermes send` CLI via terminal/execute_code
+# ABOUTME: (design §2 B10, review P0-1). `hermes send` loads ~/.hermes/.env and can
+# ABOUTME: send directly, so it is a direct-send bypass of the broker. This is the
+# ABOUTME: loud BELT; the WALL is credential absence (send tokens removed from the
+# ABOUTME: assistant env by the P1a-h starving mechanism, so the CLI finds nothing).
+name: terminal-hermes-send-deny
+description: "Block the `hermes send` CLI direct-send path (belt; cred-absence is the wall)"
+action: block
+triggers:
+  - tool_name: terminal
+    args:
+      command:
+        operator: regex
+        value: "\\bhermes\\s+send\\b"
+  - tool_name: execute_code
+    args:
+      code:
+        operator: regex
+        value: "\\bhermes\\s+send\\b|send_message_tool\\s*\\("
+preconditions:
+  - state_key: broker.hermes_send_override
+    required: true
+    message: "`hermes send` cannot send directly from the assistant — it is a broker bypass. Use send_message(action='send', ...), which routes through the broker when broker routing is active. Send credentials live only in the broker process."

@@ -64,6 +64,11 @@ PROVIDERS = [
 # During P0 no workers exist yet; these patterns will match them once P2/P3 land.
 WORKER_CMD_MARKERS = ["claude -p", "codex exec"]
 
+# Broker unix-socket path (mirrors broker/server.py main()). The broker holds all
+# egress credentials; P0.8 surfaces whether it is reachable and how many actions
+# are pending approval.
+DEFAULT_BROKER_SOCKET = Path.home() / ".hermes" / "broker" / "broker.sock"
+
 # ---------------------------------------------------------------------------
 # Section 1: Provider reachability
 # ---------------------------------------------------------------------------
@@ -239,6 +244,66 @@ def check_running_workers() -> dict[str, Any]:
     }
 
 
+def check_broker(socket_path: Path = DEFAULT_BROKER_SOCKET) -> dict[str, Any]:
+    """Report broker reachability and pending-action count for P0.8.
+
+    Purpose:
+        The broker holds the only egress credentials; if it has crashed while the
+        gateway is up, egress silently can't happen. This connects to the broker
+        UDS, calls the `health` RPC, and reports socket_reachable + pending_count.
+
+    Usage:
+        result = check_broker()
+        print(result["socket_reachable"], result["pending_count"])
+
+    Gotchas:
+        - Uses the fail-closed BrokerClient: an unreachable socket raises
+          BrokerUnavailable, which we translate to socket_reachable=False (NOT a
+          crash). Whether "down" is a HERMES error is decided in compute_exit_code
+          against gateway liveness — down-with-gateway-down is not broker-specific.
+        - A high pending_count is surfaced but is NOT itself an error (a human
+          simply hasn't approved yet).
+        - The socket file existing is necessary but not sufficient — we actually
+          call health so a stale socket with no listener reads as unreachable.
+    """
+    socket_path = Path(socket_path)
+    result: dict[str, Any] = {
+        "socket_path": str(socket_path),
+        "socket_reachable": False,
+        "pending_count": None,
+        "cause": None,
+        "message": "",
+    }
+    if not socket_path.exists():
+        result["message"] = "broker socket absent (broker not running)"
+        return result
+    try:
+        # Import here so factory_health has no hard import-time dep on the broker
+        # package (the script must run even in a checkout without the broker built).
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from broker_client import BrokerClient, BrokerUnavailable
+
+        client = BrokerClient(socket_path, timeout=3.0)
+        try:
+            health = client.health()
+        except BrokerUnavailable as exc:
+            # Socket file exists but nothing answers health ⇒ the broker crashed
+            # and left a stale socket. That is an actionable internal fault.
+            result["cause"] = "HERMES"
+            result["message"] = f"broker socket present but unreachable: {exc}"
+            return result
+        result["socket_reachable"] = True
+        result["pending_count"] = health.get("pending_count")
+        result["message"] = (
+            f"broker reachable, {result['pending_count']} pending action(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 — a broker check must never crash the report
+        result["message"] = f"broker check error: {exc}"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Section 4: Scheduler tick
 # ---------------------------------------------------------------------------
@@ -390,6 +455,14 @@ def compute_exit_code(sections: dict[str, Any]) -> int:
     if lanes.get("status") == "degraded" and lanes.get("degraded"):
         has_network_error = True  # reuse degraded bucket; lanes are auth/network issues
 
+    # Broker: a HERMES-attributed broker fault (socket present but the listener is
+    # dead — i.e. the broker crashed while its socket lingered) is an actionable
+    # internal bug ⇒ exit 2. A cleanly-absent broker (no socket) is cause=None and
+    # not an error here (it simply isn't provisioned / running).
+    broker = sections.get("broker", {})
+    if broker.get("cause") == "HERMES":
+        has_hermes_error = True
+
     if has_hermes_error:
         return 2
     if has_network_error:
@@ -468,6 +541,18 @@ def render_health_report(sections: dict[str, Any]) -> str:
     lines.append("[3] Running Workers")
     lines.append(f"  {workers.get('message', 'unknown')}")
     lines.append("")
+
+    # Section 3b — Broker (egress credential holder)
+    broker = sections.get("broker")
+    if broker is not None:
+        lines.append("[3b] Broker (egress)")
+        if broker.get("socket_reachable"):
+            pending = broker.get("pending_count")
+            lines.append(f"  reachable, {pending} pending action(s)")
+        else:
+            prefix = "ERROR" if broker.get("cause") == "HERMES" else "not running"
+            lines.append(f"  {prefix}: {broker.get('message', 'unreachable')}")
+        lines.append("")
 
     # Section 4 — Scheduler
     scheduler = sections.get("scheduler", {})
@@ -564,6 +649,18 @@ def run_health_check(
             "count": 0,
             "worker_pids": [],
             "message": f"worker check crashed: {exc}",
+        }
+
+    # Broker (egress credential holder)
+    try:
+        sections["broker"] = check_broker()
+    except Exception as exc:  # noqa: BLE001
+        sections["broker"] = {
+            "socket_path": str(DEFAULT_BROKER_SOCKET),
+            "socket_reachable": False,
+            "pending_count": None,
+            "cause": "HERMES",
+            "message": f"broker check crashed: {exc}",
         }
 
     # Scheduler

@@ -1,0 +1,23 @@
+# ABOUTME: Policy blocking raw `git push` via terminal/execute_code (design §1.3.2,
+# ABOUTME: bypass B3/B13). The sanctioned push path is the broker's
+# ABOUTME: enqueue_action{type:"git_push"}; push credentials live only in the broker.
+# ABOUTME: This is the loud BELT — the WALL is credential absence (GITHUB_TOKEN/
+# ABOUTME: GH_TOKEN removed from the assistant env by the P1a-h starving mechanism).
+name: terminal-git-push-deny
+description: "Block raw `git push` outside the broker (belt; cred-absence is the wall)"
+action: block
+triggers:
+  - tool_name: terminal
+    args:
+      command:
+        operator: regex
+        value: "\\bgit\\b(?:\\s+-\\S+(?:\\s+\\S+)?)*\\s+push\\b"
+  - tool_name: execute_code
+    args:
+      code:
+        operator: regex
+        value: "\\bgit\\b(?:\\s+-\\S+(?:\\s+\\S+)?)*\\s+push\\b|git.*push.*https://.*@"
+preconditions:
+  - state_key: broker.git_push_override
+    required: true
+    message: "Raw `git push` is not permitted from the assistant. Push credentials live only in the broker process. Route the push through the broker: enqueue_action(type='git_push', ...). If this is a sanctioned in-broker executor path, it runs in the broker process, not here."

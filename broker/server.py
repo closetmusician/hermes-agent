@@ -282,15 +282,18 @@ def main() -> None:
     """
     home = Path(os.path.expanduser("~/.hermes/broker"))
 
-    def _refuse(row: Dict[str, Any]) -> Dict[str, Any]:
-        raise RuntimeError("no message executor wired (P1a-h owns the real send path)")
-
     creds = BrokerCredentials(secret_dir=home)
+    # P1a-h wires the REAL message executor here: the broker process holds the
+    # egress tokens (relocated out of the assistant env by the starving mechanism),
+    # so the send engine it invokes actually delivers. This is the only place a
+    # real message send happens after the cutover.
+    from broker.executors.message_executor import build_message_executor
+
     server = BrokerServer(
         socket_path=home / "broker.sock",
         db_path=home / "held_actions.db",
         credentials=creds,
-        message_executor=_refuse,
+        message_executor=build_message_executor(creds.egress_cred),
     )
     server.serve_forever()
 

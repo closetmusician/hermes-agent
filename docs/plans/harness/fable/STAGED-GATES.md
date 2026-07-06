@@ -19,6 +19,22 @@ live. Each row has the exact command/procedure. Owner runs these as the world pr
 |---|---|---|---|
 | SG-R-2 | WhatsApp round-trip probe passes live | Probe requires `registered=true` + a live WhatsApp session; current `creds.json` has `registered=false` and the connector is `enabled: false` | After pairing: enable WhatsApp (`WHATSAPP_ENABLED=true` in `~/.hermes/.env`), run `hermes whatsapp` and scan QR, then restart gateway. `hermes logs` must show `Round-trip probe passed (messageId=...)` within 60s of startup. |
 
+## From Phase P1a (broker egress cutover — P1a-h)
+
+The credential-starving + broker-routing mechanism is BUILT and tested with fixtures, but
+flipping it live relocates real secrets and breaks the running gateway's direct-send path
+until the broker is up and the gateway is restarted to route through it. Do these IN ORDER;
+each step is reversible until step 3.
+
+| ID | Gate | Why staged | Exact action to flip |
+|---|---|---|---|
+| SG-P1a-1 | Egress secrets relocated to broker-only source | Moving real send/push tokens out of `~/.hermes/.env` while the running gateway still reads them would break live egress immediately | 1. Create the broker egress source `~/.hermes/broker/egress.env` (mode 0600): move every EGRESS key from `~/.hermes/.env` — `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `WEIXIN_TOKEN`, `SLACK_BOT_TOKEN`, `SIGNAL_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `MICROSOFT_GRAPH_CLIENT_SECRET`/`MS_GRAPH_CLIENT_SECRET` (full list = `hermes_cli/egress_creds._EGRESS_EXACT`). LEAVE the MODEL keys (`ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY`/`OPENAI_API_KEY`) in `~/.hermes/.env`. 2. Also remove those EGRESS keys from any managed `/etc/hermes/.env` and from the assistant's Bitwarden source map. 3. `chmod 600 ~/.hermes/broker/egress.env`. |
+| SG-P1a-2 | Broker launchd service running (separate PID) | The broker must own the socket + creds before the gateway is pointed at it | In a real Terminal: `cp broker/launchd/com.hermes.broker.plist ~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hermes.broker.plist`; confirm `launchctl list \| grep com.hermes.broker` and `test -S ~/.hermes/broker/broker.sock`. The broker's launchd env (or its `egress.env`) must carry the EGRESS keys from SG-P1a-1; the assistant/gateway env must NOT. |
+| SG-P1a-3 | Gateway restarted with starving + routing ON | Enabling `HERMES_BROKER_EGRESS_STARVE=1` + `HERMES_BROKER_ROUTE=1` mid-conversation would strip live creds from the running gateway; requires a clean restart | Set `HERMES_BROKER_EGRESS_STARVE=1` and `HERMES_BROKER_ROUTE=1` in the gateway's env (e.g. `~/.hermes/.env`), then restart the gateway. After restart, in a fresh assistant process: `hermes ... -c "python: import os; print([k for k in os.environ if 'TOKEN' in k or 'SECRET' in k])"` shows NO egress key, and a MODEL key is still present (the assistant can still converse). |
+| SG-P1a-4 | Real send goes through approval | Only provable with a live broker + Telegram button round-trip | With the broker up, trigger a `send_message` from the assistant to a NON-allowlisted recipient → it must be HELD, not sent; approve via the Telegram button (nonce-gated); confirm the message arrives and the held-action row transitions to `executed` in `~/.hermes/broker/held_actions.db`. Then confirm a raw `hermes send` / `git push` from the assistant produces NO effect (cred-absence wall). |
+
+> Rollback (before SG-P1a-4 is trusted): unset `HERMES_BROKER_ROUTE`/`HERMES_BROKER_EGRESS_STARVE`, move the egress keys back into `~/.hermes/.env`, restart the gateway — the routing gate and starving filter are both no-ops when the flags are unset, so the pre-cutover direct-send path is fully restored.
+
 ## From later phases
 (appended as each phase completes — P4 3-night flagship, P1b 30-day/10-merge graduation,
 P1c real-meeting prep, etc.)

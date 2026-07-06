@@ -295,21 +295,98 @@ def _load_hermes_env() -> None:
         os.environ[key] = str(val)
 
 
+def _broker_enqueue(**kwargs):
+    """
+    Purpose: assistant-side seam for the `hermes send` CLI to route a message
+    through the broker (design §1.7 E2 / review P0-1). Delegates to the shared
+    egress-broker helper; patchable by tests to spy on routing without a broker.
+    Usage: internal — called by cmd_send when broker routing is active.
+    Gotchas: raises BrokerUnavailable if the broker is down (fail-closed); the
+    CLI must then refuse with a nonzero exit, never fall back to a direct send.
+    """
+    from tools.egress_broker import _broker_enqueue as _impl
+
+    return _impl(**kwargs)
+
+
+def _maybe_route_or_refuse(args: argparse.Namespace) -> Optional[int]:
+    """Route the send through the broker (or refuse) when routing is active.
+
+    Purpose: close the `hermes send` direct-send hole (review P0-1). When broker
+    routing is on, this CLI must NOT reach the direct platform adapter — it frames
+    enqueue_action, or refuses fail-closed if the broker is down.
+    Usage: rc = _maybe_route_or_refuse(args); if rc is not None: sys.exit(rc).
+    Gotchas: returns None when routing is OFF (caller proceeds with the legacy
+    direct path — a no-op for the running gateway); returns an exit code when it
+    handled the send (0 routed, 1 refused). --list is handled by the caller first.
+    """
+    from tools.egress_broker import broker_routing_active
+
+    if not broker_routing_active():
+        return None
+
+    target = _resolve_target(getattr(args, "to", None))
+    if not target:
+        return None  # let the normal usage-error path report it
+
+    message = _read_message_body(
+        getattr(args, "message", None), getattr(args, "file", None)
+    )
+    if message is None or not message.strip():
+        return None  # normal usage-error path reports it
+
+    subject = getattr(args, "subject", None)
+    if subject:
+        message = f"{subject}\n\n{message.lstrip()}"
+
+    parts = target.split(":", 1)
+    channel = parts[0].strip().lower()
+    recipient = parts[1].strip() if len(parts) > 1 else None
+
+    from broker_client import BrokerUnavailable, BrokerError
+
+    try:
+        res = _broker_enqueue(
+            type="message",
+            channel=channel,
+            recipient=recipient,
+            summary=message[:120],
+            payload=message,
+            origin="hermes_send_cli",
+        )
+    except (BrokerUnavailable, BrokerError) as exc:
+        print(
+            f"hermes send: broker routing is active but the send could not be "
+            f"queued (fail-closed, no direct send): {exc}",
+            file=sys.stderr,
+        )
+        return _FAILURE_EXIT
+    disposition = res.get("disposition", "queued")
+    if not getattr(args, "quiet", False):
+        print(f"hermes send: routed to broker ({disposition}) id={res.get('action_id')}")
+    return _SUCCESS_EXIT
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     """Entry point wired into the top-level argparse dispatcher."""
+
+    # --list short-circuits everything (including routing) — it only reads the
+    # channel directory, no send. Handle it before the broker-routing gate.
+    if getattr(args, "list_targets", False):
+        platform_filter = getattr(args, "message", None)
+        sys.exit(_list_targets(platform_filter, json_mode=getattr(args, "json", False)))
+
+    # Egress routing gate (review P0-1): when broker routing is active, `hermes
+    # send` routes through the broker or refuses fail-closed — it must never reach
+    # the direct platform adapter. No-op (returns None) when routing is OFF.
+    routed_rc = _maybe_route_or_refuse(args)
+    if routed_rc is not None:
+        sys.exit(routed_rc)
 
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
     _load_hermes_env()
-
-    # --list short-circuits everything else.
-    if getattr(args, "list_targets", False):
-        # When `--list telegram` is used, argparse stores "telegram" in the
-        # `message` positional (since list_targets takes no argument).
-        platform_filter = getattr(args, "message", None)
-        exit_code = _list_targets(platform_filter, json_mode=getattr(args, "json", False))
-        sys.exit(exit_code)
 
     target = _resolve_target(getattr(args, "to", None))
     if not target:

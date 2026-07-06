@@ -245,7 +245,36 @@ def load_hermes_dotenv(
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # Credential starving (design §1.6): once every source has loaded, strip the
+    # EGRESS/send/push secrets from os.environ so the assistant process holds only
+    # its MODEL-inference keys. Runs LAST so it also removes anything the managed
+    # .env or Bitwarden just re-hydrated. Gated OFF by default — a NO-OP for the
+    # running gateway until the owner performs the staged cutover (STAGED-GATES).
+    _starve_egress_if_enabled()
+
     return loaded
+
+
+def _starve_egress_if_enabled() -> None:
+    """Strip EGRESS credentials from os.environ when starving is switched on.
+
+    Purpose: enforce the assistant-side half of the credential split — model
+    keys stay, send/push keys leave — as the final step of every env load.
+    Usage: called at the tail of load_hermes_dotenv(); no-op unless
+    HERMES_BROKER_EGRESS_STARVE is set (default OFF preserves current behavior).
+    Gotchas: import is local so a partial-bootstrap import cycle can't break env
+    loading; any failure is swallowed so starving can never block startup.
+    """
+    try:
+        from hermes_cli.egress_creds import (
+            egress_starving_active,
+            starve_egress_credentials,
+        )
+
+        if egress_starving_active():
+            starve_egress_credentials(os.environ)
+    except Exception:  # noqa: BLE001 — starving must never block startup
+        pass
 
 
 def _apply_managed_env() -> None:

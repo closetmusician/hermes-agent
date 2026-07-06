@@ -295,12 +295,66 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
+def _broker_enqueue(**kwargs):
+    """
+    Purpose: assistant-side seam that hands a message to the broker. Delegates to
+    the shared egress-broker helper so tests can patch this name to spy on routing.
+    Usage: internal — called by _handle_send when broker routing is active.
+    Gotchas: raises BrokerUnavailable if the broker is down (fail-closed); never
+    sends directly. Kept as a thin module-level indirection so the routing seam
+    is patchable without a live broker socket.
+    """
+    from tools.egress_broker import _broker_enqueue as _impl
+
+    return _impl(**kwargs)
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    # Egress routing (design §1.3.1): when broker routing is active, the send body
+    # is re-routed to enqueue_action instead of reaching _send_to_platform / the 9
+    # per-platform senders. The broker holds the only egress credentials; this tool
+    # has none. Fail-closed — a down broker errors, it does NOT send directly.
+    # Gated OFF by default (a no-op for the running gateway) until the staged cutover.
+    # The broker's own executor sets _broker_direct=True so its post-approval send
+    # runs the real platform path instead of re-routing back to the broker (which
+    # would recurse). Only the in-broker executor ever passes this.
+    _broker_direct = bool(args.get("_broker_direct"))
+    try:
+        from tools.egress_broker import broker_routing_active
+        from broker_client import BrokerUnavailable, BrokerError
+    except Exception:  # noqa: BLE001 — routing helpers optional during bootstrap
+        broker_routing_active = None  # type: ignore[assignment]
+    if broker_routing_active and broker_routing_active() and not _broker_direct:
+        parts0 = target.split(":", 1)
+        channel = parts0[0].strip().lower()
+        recipient = parts0[1].strip() if len(parts0) > 1 else None
+        summary = message[:120]
+        try:
+            res = _broker_enqueue(
+                type="message",
+                channel=channel,
+                recipient=recipient,
+                summary=summary,
+                payload=message,
+                origin="send_message",
+            )
+        except BrokerUnavailable as exc:
+            return json.dumps(_error(f"broker unavailable — message not sent (fail-closed): {exc}"))
+        except BrokerError as exc:
+            return json.dumps(_error(f"broker rejected the action: {exc}"))
+        return json.dumps({
+            "success": True,
+            "routed": True,
+            "action_id": res.get("action_id"),
+            "disposition": res.get("disposition"),
+            "note": f"routed to broker ({res.get('disposition', 'queued')})",
+        })
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
