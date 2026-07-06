@@ -1,0 +1,79 @@
+{
+  "probed_at": "2026-07-06T00:41:30Z",
+  "cli": {
+    "claude": {
+      "present": true,
+      "absent": false,
+      "version": "2.1.170 (Claude Code)",
+      "max_budget_usd_flag": true,
+      "json_schema_output": true
+    },
+    "codex": {
+      "present": true,
+      "absent": false,
+      "version": "codex-cli 0.139.0",
+      "budget_flag": false,
+      "budget_flag_name": null,
+      "json_output": true
+    }
+  },
+  "git_worktree": {
+    "supported": true,
+    "output_preview": "/Users/yklin/Code/hermes                                   c92860838 [factory]\n/Users/yklin/Code/hermes/.claude/worktrees/agent-a19edb0e  f789c8018 [worktree-agent-a19edb0e]\n/Users/yklin/Code/hermes/."
+  },
+  "openrouter": {
+    "catalog_fetched": false,
+    "key_present": false,
+    "models": {
+      "zhipuai/glm-5": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "gmi-ai/GLM-5.1-FP8": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "zhipuai/GLM-5.2": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "moonshot/kimi-k2": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "deepseek/deepseek-r1": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "deepseek/deepseek-v3": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      },
+      "deepseek/deepseek-v4-flash:free": {
+        "live_catalog": false,
+        "ping_ok": false,
+        "latency_ms": null,
+        "error": "key_missing"
+      }
+    }
+  },
+  "cost_estimate_usd": {
+    "num_models_probed": 7,
+    "tokens_per_ping": 1,
+    "estimated_cost_usd": 3e-06,
+    "budget_limit_usd": 0.05,
+    "within_budget": true
+  }
+}
