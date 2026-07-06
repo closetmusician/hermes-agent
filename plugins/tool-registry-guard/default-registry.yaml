@@ -1,0 +1,49 @@
+version: 1
+tools:
+  - name: graph-workbook
+    path: ~/Code/pm_os/bin/graph-workbook.js
+    description: "Excel read/write (ALL: read, write, format, formulas, ranges)"
+    operations: [excel-read, excel-write, excel-format]
+    banned_alternatives:
+      packages: [pandas, openpyxl, xlrd, xlsxwriter]
+      imports: [pandas, openpyxl, xlrd, xlsxwriter]
+
+  - name: ooxml-surgery
+    path: ~/Code/pm_os/bin/ooxml-surgery.py
+    description: "Word/PPT package operations (read, extract, write, comments)"
+    operations: [word-read, word-write, pptx-read, word-comments]
+    banned_alternatives:
+      packages: [python-docx, docx, mammoth, docx2txt, textract]
+      imports: [docx, mammoth, docx2txt, textract]
+
+  - name: graph-file-ops
+    path: ~/Code/pm_os/bin/graph-file-ops.js
+    description: "File download/upload from SharePoint/OneDrive"
+    operations: [sharepoint-download, sharepoint-upload]
+    banned_alternatives:
+      packages: []
+      imports: []
+
+  - name: graph-edit-pptx
+    path: ~/Code/pm_os/bin/graph-edit-pptx.js
+    description: "Complex PPT edits (charts, images, tables)"
+    operations: [pptx-chart, pptx-image, pptx-table]
+    banned_alternatives:
+      packages: [python-pptx, pptx]
+      imports: [pptx]
+
+  - name: graph-list-crud
+    path: ~/Code/pm_os/bin/graph-list-crud.js
+    description: "SharePoint list CRUD"
+    operations: [sharepoint-list]
+    banned_alternatives:
+      packages: []
+      imports: []
+
+  - name: sp-checkout
+    path: ~/Code/pm_os/bin/sp-checkout.js
+    description: "Shared doc locking"
+    operations: [sharepoint-lock]
+    banned_alternatives:
+      packages: []
+      imports: []
