@@ -145,3 +145,6 @@ apps/desktop/demo/
 infographic/
 .agents/
 .claude/worktrees/
+
+# pytest temp
+pytest-of-*/
