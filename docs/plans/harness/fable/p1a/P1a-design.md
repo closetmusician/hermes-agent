@@ -7,6 +7,27 @@
 
 ---
 
+## Revision v2 — red-team closures
+
+Adversarial review (`P1a-review.md`, verdict SHIP-WITH-FIXES, 2 P0 · 4 P1 · 3 P2) proved the
+thesis sound but the **egress perimeter too small**. v2 widens it and closes all three P0 holes.
+All review file:lines re-verified against `factory` HEAD before revising.
+
+| Hole (review) | Closure in v2 | Where |
+|---|---|---|
+| **P0-1** `hermes send` CLI is an unrouted direct send (`send_cmd.py:220` loads `.env` + sends) | `send_cmd` refuses in assistant context OR routes via `broker_client.enqueue_action`; deny-policy belt; wall = EGRESS creds gone from `~/.hermes/.env` | §1.7 E2, §2 B10, P1a-h |
+| **P0-2** cred-absence is FALSE today — `cli.py:177`/`run_agent.py:119` load `~/.hermes/.env` into `os.environ` override=True | EGRESS/MODEL credential **split**: EGRESS secrets relocated out of every source the assistant loads (`~/.hermes/.env`, managed `/etc/hermes/.env`, Bitwarden, config scalars) → broker-only; MODEL keys stay so the assistant can converse. Gate test asserts **`os.environ`** is starved, not a file read. | §1.6, P1a-h test #2 |
+| **P0-3** self-approval — `approve(id, approver)` trusts a client string over the enqueue socket | **Separate approval authority**: broker mints a single-use nonce bound to the `action_id`, delivered out-of-band in the Telegram button; `approve` without a valid nonce is rejected; assistant cannot mint it. | §2.1, §2 B15, P1a-d test #6 |
+| **P1-#3** wrong egress locus + missed paths | Locus corrected to `_handle_send:298`; full egress inventory (send-CLI, MS Graph, Discord, git-push-over-token) as B10–B13. | §0 table, §1.7, §2 |
+| **P1-#5/#6/#7, P2 (8/9/10)** regex-is-belt-not-wall, commit-before-ack, fake-socket residual, killpg grandchild-escape, mtime≠progress, subagent `terminal` | Stated explicitly / added as tests. | §1.6, §2 B14, §5.2 |
+
+**The crux — credential split (do NOT get this wrong):** the assistant KEEPS its
+MODEL-inference key (`ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY`/`OPENAI_API_KEY`, `cli.py:3843`)
+so the conversation loop can think; ONLY EGRESS/SEND/PUSH creds leave it. The gate proves both
+halves: EGRESS creds absent (send fails) **and** the assistant still converses.
+
+---
+
 ## 0. What P1a must achieve (the one sentence)
 
 Make it **architecturally impossible for the assistant to send a message, hit a
@@ -29,7 +50,7 @@ are defense-in-depth that fail *loud* if the assistant tries the obvious bypasse
 | Tool-call interception / block | `pre_tool_call` hook, `hermes_cli/plugins.py:2140`; protocol `{"action":"block","message":...}`; per-thread whitelist `:2161` | **Reuse** — the broker-bypass guards are new control-room policies on this hook, not new plumbing |
 | Policy engine + audit store | control-room plugin: `pre_tool_call` at `plugins/control-room/__init__.py:699`, SQLite tables `audit_log`/`policy_log`/`workflow_state` (`:36/:48/:58`), `register()` `:990`, declarative YAML policies in `plugins/control-room/policies/` | **Extend** — add broker-bypass policies; the broker's OWN durable store is separate (see §1.4) |
 | Dangerous-command approval + hooks | `tools/approval.py` — `DANGEROUS_PATTERNS` (`:546`), `pre_approval_request`/`post_approval_response` fired via `_fire_approval_hook` (`:94/:102`), gateway-context detection `:178` | **Do NOT reuse as the held-action surface.** This is a *synchronous, in-process* approve-this-shell-command gate. The broker's held-action surface (§2) is async, durable, cross-restart. They are different problems; conflating them repeats the `/approve-email` mistake. Keep `approval.py` for its existing dangerous-shell role only. |
-| Egress chokepoint (messages) | `send_message` tool `tools/send_message_tool.py:142`; resolves creds via `gateway/config.py` adapters (`:244`) | **Re-route** — `send_message` becomes a thin broker client; the adapter+credential path moves into the broker process |
+| Egress chokepoint (messages) | `send_message` tool: real send is `_handle_send` (`tools/send_message_tool.py:298`) → `_send_to_platform` (`:723`) → 9 platform senders; creds via `gateway/config.py` adapters (`:244`) + `os.getenv` (`WEIXIN_TOKEN :356`, etc.). **NOT `:142`** — that is `SEND_MESSAGE_SCHEMA` (corrected per review P1-#3, verified). | **Re-route at `_handle_send`** — `send_message` becomes a thin broker client; the adapter+credential path moves into the broker process |
 | Worker helper (to be superseded) | `tools/delegate_tool.py` — `ThreadPoolExecutor`, in-process threads (`:28,:60`) | **Do NOT extend for the launcher.** Reuse only its orchestrator-side result-collection shape as reference; the process launcher is new code (§4) |
 | Health signal (P0.8) | `scripts/factory_health.py` — section model (`sections["workers"]` etc., `:561`), exit-code map `:357` | **Extend** — add a `broker` section (§1.5) |
 | Git-push guard (today) | `tools/approval.py:713` guards only `git push --force` | **Insufficient** — P1a adds a full `git push` broker-routing guard (§2 bypass table) |
@@ -89,7 +110,7 @@ half-written line is discarded, not misparsed). No network listener ever.
 |---|---|---|---|
 | `enqueue_action` | `{type, channel?, recipient?, summary, payload, origin}` | `{action_id, disposition}` | `disposition` ∈ `auto_sent` \| `held`. Safe-lane runs here. |
 | `list_pending` | `{}` | `[{action_id, type, summary, created_ts, safe_lane_failed}]` | For the approval surface; never truncates payload (summary only in list). |
-| `approve` | `{action_id, approver}` | `{status, result}` | Executes the real egress; idempotent by `action_id`. |
+| `approve` | `{action_id, nonce}` | `{status, result}` | **`nonce` = broker-minted, single-use, action-bound (§2.1).** Executes the real egress; idempotent by `action_id`; REJECTS any call without a valid nonce (blocks assistant self-approve). No trust-me `approver` string. |
 | `reject` | `{action_id, approver, reason?}` | `{status}` | Marks rejected; durable. |
 | `send` | `{channel, recipient, payload}` | `{status}` | **Internal** — only the broker's own executor calls this after safe-lane/approval; not exposed to assistant client directly (assistant uses `enqueue_action`). |
 | `git_push` | `{repo, remote, ref, force:false}` | `{status}` \| held | Same enqueue→safe-lane→hold/execute path as `send`. |
@@ -103,11 +124,14 @@ the safe lane. The client stub (`broker_client.py`) exposes only `enqueue_action
 
 ### 1.3 How egress is *forced* through the broker (integration points, file:line)
 
-1. **`tools/send_message_tool.py:142`** — the `send_message` tool body is rewritten to
-   frame an `enqueue_action{type:"message", channel, recipient, payload}` to the broker
-   client instead of calling `gateway/config.py` adapters directly. The **adapter +
-   credential resolution moves into the broker process** (new `broker/executors/message_executor.py`).
+1. **`tools/send_message_tool.py` `_handle_send` (`:298`)** — the send body (NOT the
+   `:142` schema) is rewritten to frame an `enqueue_action{type:"message", channel,
+   recipient, payload}` to the broker client instead of reaching `_send_to_platform`
+   (`:723`) / the 9 per-platform senders directly. The **adapter + credential resolution
+   moves into the broker process** (new `broker/executors/message_executor.py`).
    After P1a-8 the assistant-side tool has no token to fall back to.
+   *The complete egress surface (send-CLI, MS Graph, Discord, git push over token) is
+   enumerated in §1.7 and dispositioned in the §2 bypass table (B10–B13).*
 2. **New `git push` routing** — today only `tools/approval.py:713` guards force-push.
    P1a adds a control-room policy (`plugins/control-room/policies/terminal-git-push-deny.yaml`,
    NEW) that **blocks any `terminal`/`execute_code` invocation whose command matches
@@ -171,6 +195,66 @@ New `check_broker()` in `scripts/factory_health.py` (mirrors `check_running_work
 not a broker-specific error. A stuck-pending count is surfaced but not itself an error
 (a human simply hasn't approved yet).
 
+### 1.6 Credential inventory + the starving mechanism (REQ-02 / review P0-2)
+
+The wall is credential absence — but the review proved it is **false today**: `cli.py:177`
+and `run_agent.py:119` both call `hermes_cli.env_loader.load_hermes_dotenv`, which loads
+`~/.hermes/.env` into `os.environ` with `override=True` (`env_loader.py:238`), then
+`_apply_external_secret_sources` pulls Bitwarden (`:245`) and `_apply_managed_env` re-applies
+a managed `.env` last with override (`:246,:251`). `env_loader.py`'s own docstring admits it
+"does NOT prevent the agent from later mutating `os.environ`" (`:261`). So **every assistant
+process re-hydrates every send/push key at startup.** Removing keys from the broker's launchd
+env is necessary but *not sufficient* — the keys must leave the *sources the assistant loads*.
+
+**The split (the crux):** two disjoint credential classes.
+
+- **MODEL-INFERENCE creds** — `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`
+  (assistant conversation loop needs these to think; verified as the resolution keys at
+  `cli.py:3843/3845`). **These STAY in the assistant env.** Removing them breaks the product.
+- **EGRESS/SEND creds** — every recipient-facing send/push key. **These are REMOVED from every
+  source the assistant loads, and held ONLY by the broker.**
+
+**Credential inventory** (source | secret | class | who-holds-it after P1a-8):
+
+| Source | Secret(s) | Class | Who holds it |
+|---|---|---|---|
+| `~/.hermes/.env` | `TELEGRAM_BOT_TOKEN`, `WEIXIN_TOKEN` (`send_message_tool.py:356`), `DISCORD_BOT_TOKEN` (`discord_tool.py:55`), QQ/Signal/BlueBubbles send tokens, MS Graph client secret (`microsoft_graph_auth.py:from_env`), `GITHUB_TOKEN`/`GH_TOKEN` (`skills_hub.py:336`) | **EGRESS** | broker-only env (moved out of `~/.hermes/.env`) |
+| `~/.hermes/.env` | `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | **MODEL** | assistant env (unchanged) |
+| managed `/etc/hermes/.env` (`env_loader.py:251` `_apply_managed_env`, override=True) | any EGRESS key pinned here | **EGRESS** | must be moved to broker-managed scope; managed override is the sneakiest re-hydration path |
+| Bitwarden (`env_loader.py:245` `_apply_external_secret_sources`) | any EGRESS key sourced from BW | **EGRESS** | broker fetches from BW; the assistant's BW-source map (`env_loader.py:24`) must exclude egress keys |
+| `~/.hermes/config.yaml` bridged scalars (`send_cmd.py:225` step 2; `gateway/run.py` bridge) | `TELEGRAM_HOME_CHANNEL` etc. (routing, not secrets) + any secret scalar | **EGRESS if secret** | secret scalars must not bridge into assistant env; routing scalars (channel IDs) may stay (not a send credential) |
+| macOS keychain / broker launchd env | egress creds | **EGRESS** | broker only (UNVERIFIED: keychain-unlock semantics under broker launchd session — validate empirically in P1a-8, §constraint notes) |
+
+**Starving mechanism** (what P1a-8 actually does): a broker-provisioning step relocates every
+EGRESS secret out of `~/.hermes/.env`, out of the managed `/etc/hermes/.env`, and out of the
+assistant's Bitwarden source map — into a broker-only secret store (`broker/credentials.py`,
+keychain + broker launchd env, mode 0600, unreadable by the assistant's login context). The
+assistant's `env_loader` load path then re-hydrates **only** the MODEL class. **Assertion the
+gate test enforces:** in a fresh assistant/gateway process, `os.environ` contains a live MODEL
+key AND contains **no** live EGRESS secret — not merely that a *file read* found nothing (the
+review's theater objection to the old `test_token_file_read_finds_no_live_cred`). See revised
+P1a-h test #2.
+
+### 1.7 Full egress inventory (REQ-01 / review P1-#3)
+
+Every path that sends/posts/pushes, each mapped to its closure. Route-through-broker where a
+tool is the sanctioned interface; otherwise cred-absence (P1a-8) is the wall and a control-room
+guard is the loud belt.
+
+| # | Egress path | file:line (verified) | Reads creds from | Disposition | Owning task |
+|---|---|---|---|---|---|
+| E1 | `send_message` 9 platform senders | `send_message_tool.py:298`→`:723`→`:1017..1754` | env/config adapters | **Re-route** at `_handle_send` → broker | P1a-h |
+| E2 | `hermes send` CLI subcommand | `hermes_cli/send_cmd.py:220` (`_load_hermes_env` → `load_dotenv` override + config bridge) | `~/.hermes/.env` itself | **Refuse-or-route** (§2 B10; refuse in assistant context, else route via `broker_client.enqueue_action`) | P1a-h |
+| E3 | MS Graph `sendMail` | `microsoft_graph_auth.py:180` (`client.post`), creds `from_env` (`:128`) | env | **Cred-absence** (MS token → broker); belt: `execute-code-email-block` regex | P1a-h |
+| E4 | Discord API direct | `discord_tool.py:40` (`discord.com/api/v10`), token `os.getenv("DISCORD_BOT_TOKEN")` (`:55`) | env | **Cred-absence** (Discord token → broker) | P1a-h |
+| E5 | `git push` over HTTPS token | `terminal`/`execute_code` + `GITHUB_TOKEN`/`GH_TOKEN` (`skills_hub.py:336`) | env | **Cred-absence** (token → broker) + `terminal-git-push-deny` policy belt | P1a-h |
+| E6 | `git push` (force) — existing guard | `approval.py:713` (force only) | env | Superseded by E5 broker routing; force still guarded | P1a-h |
+
+**Escalation (REQ-01):** all six close inside P1a via cred-absence + re-route. No path defers to
+a later phase. The residual that defers is *immutability of the broker source/policy* (B6/B7/B8),
+which the write-block policy covers as belt and the P2.8 immutable ring closes fully — unchanged
+from v1.
+
 ### Files to CREATE (REQ-01)
 
 | File | Role |
@@ -190,7 +274,9 @@ not a broker-specific error. A stuck-pending count is surfaced but not itself an
 
 | File:line | Change |
 |---|---|
-| `tools/send_message_tool.py:142` | body re-routes to `broker_client.enqueue_action`; strip adapter/cred resolution |
+| `tools/send_message_tool.py` `_handle_send` (`:298`) | body re-routes to `broker_client.enqueue_action`; strip adapter/cred resolution (NOT `:142` schema) |
+| `hermes_cli/send_cmd.py:220` (`_load_hermes_env`) | refuse in assistant context OR re-route to `broker_client.enqueue_action`; drop the direct `load_dotenv`+send (review P0-1) |
+| `hermes_cli/env_loader.py` | provisioning: relocate EGRESS secrets out of the assistant load path; leave MODEL keys (§1.6) — implemented in P1a-h |
 | `scripts/factory_health.py:561`/`:357` | add `broker` section + exit-code rule |
 
 ---
@@ -211,7 +297,13 @@ the closure. Fresh-context gate (plan §P1a exit gate): direct send-CLI + token-
 | B6 | Write a plugin / edit a skill that sends | Broker source + policy files are in the **immutable ring (P2.8)**; assistant cannot edit them. In P1a (before the ring lands) this is the **one open residual** — see below | P1a-2 (design), P2.8 (closure) | **RESIDUAL — closed in P2.8.** In P1a, a control-room policy blocks writes to `broker/**` and `plugins/control-room/policies/**`; hardening to an OS-level immutable ring is P2.8. |
 | B7 | Edit the broker source or safe-lane policy to weaken it, then use the broker | Same as B6 — write-block on `broker/**` and policy dirs now; immutable ring in P2.8 | P1a-2, P2.8 | **RESIDUAL — P2.8.** Noted per constraint: "the design must not let a worker/assistant edit broker source or its policy files." |
 | B8 | Point `broker_client` at a *fake* socket the assistant controls (self-approve) | Client socket path is a broker-env/config value the assistant can't rewrite once B6/B7 write-blocks hold; broker verifies socket ownership (0600, own UID) | P1a-2 | Medium in P1a, Low after P2.8 |
-| B9 | Kill the broker, then fall back to a direct path | **Fail-closed (P1a-3):** there IS no direct fallback path — with the broker down, `send_message`/git-push simply error; held actions persist in SQLite and resume on restart | P1a-3 | Low — no degraded-send mode exists by construction |
+| B9 | Kill the broker, then fall back to a direct path | **Fail-closed (P1a-3):** there IS no direct fallback path — with the broker down, `send_message`/git-push simply error; held actions persist in SQLite and resume on restart. **Sound ONLY if every path (B10–B13) is cred-starved — else "fail-closed" is "fail-open via the other path" (review B9→P0).** | P1a-3, P1a-h | Low *iff* P1a-8 starves all sources (§1.6) |
+| B10 | `hermes send <platform> "..."` CLI via `terminal` (review P0-1) | `send_cmd.py` **refuses in assistant context OR routes** to `broker_client.enqueue_action`; belt: control-room deny policy for the literal `hermes send` command on `terminal`/`execute_code`; wall: EGRESS creds absent from `~/.hermes/.env` so the CLI's own `load_dotenv` finds nothing live | P1a-h | Low — no live token even if the deny regex is evaded |
+| B11 | MS Graph `sendMail` tool (review P1) | **Cred-absence** (MS Graph secret → broker, §1.6); belt: existing `execute-code-email-block` regex | P1a-h | Low — wall is token-absence, not regex |
+| B12 | Discord API tool direct POST (review P1) | **Cred-absence** (`DISCORD_BOT_TOKEN` → broker, §1.6) | P1a-h | Low — no live Discord token in assistant env |
+| B13 | `git push https://$GITHUB_TOKEN@host` (review P1) | **Cred-absence** (`GITHUB_TOKEN`/`GH_TOKEN` → broker); `terminal-git-push-deny` policy is belt only — closure is token-absence, never the regex | P1a-h | Low — no live push token; sanctioned push is `enqueue_action{git_push}` |
+| B14 | Subagent uses `terminal` to `curl`/`hermes send`/`git push` (review P2) | `DELEGATE_BLOCKED_TOOLS` (`delegate_tool.py:45`) strips `send_message`+`execute_code` but **NOT `terminal`** — verified. Same UID, same starved env ⇒ same cred-absence dependency. Residual P2: add `terminal` to the block set (out of P1a file-disjoint scope; noted for P1c). | P1a-8 (wall), P1c (block-set) | Low via cred-absence; terminal-strip deferred |
+| B15 | Assistant calls `broker_client.approve(id, approver="yk")` over the enqueue socket to self-approve (review P0-3) | **Approval-authority split (§2.1):** `approve` requires a broker-issued single-use nonce bound to the specific `action_id`, minted only when the broker emits the Telegram button and delivered out-of-band in the button payload. A generic enqueue-socket `approve` WITHOUT the nonce is rejected. The assistant cannot mint the nonce. | P1a-d | Low — self-approve provably rejected (test §5.2) |
 
 **Fresh-context gate mapping (plan §P1a exit gate):**
 - *direct send-CLI* → B1/B4, closed by P1a-2 re-route + P1a-8 cred absence.
@@ -228,7 +320,47 @@ defense has repeated the fork's mistake.
 **Residuals escalated (per REQ-02 instruction):** B6, B7, B8 cannot be *fully* closed in
 P1a because the immutable ring is P2.8. P1a lands the write-block *policy* (belt); the OS
 immutable ring (suspenders) closes them. This is called out so P2.8 inherits a named
-obligation, not a surprise.
+obligation, not a surprise. B14 (subagent `terminal`) is closed by cred-absence in P1a with
+the block-set hardening deferred to P1c (out of P1a's file-disjoint scope).
+
+### 2.1 Approval authority — separating "who may approve" from "who may enqueue" (review P0-3)
+
+**The hole:** in v1, `approve(action_id, approver)` took `approver` as a client-supplied
+string over the **same** UDS the assistant uses to `enqueue_action`. If the assistant can reach
+the socket to enqueue, it can also call `approve(id, approver="yk")` on its own held action —
+the "hold" is decorative. Verified: nothing in v1 authenticated that the approve RPC came from
+Yu-Kuan's Telegram tap versus the assistant.
+
+**The closure — broker-issued approval nonce bound to the action_id and the Telegram button:**
+
+```
+1. Broker holds action A (id=ULID).  Broker MINTS approval_nonce_A =
+   HMAC(broker_secret, action_id ∥ created_ts ∥ random) — a single-use, opaque token.
+   broker_secret lives ONLY in the broker (never on the socket, never in any client).
+2. Broker delivers the Telegram button with callback payload = {action_id, approval_nonce_A}.
+   This delivery is broker→Telegram (principal-directed notify, exempt from safe-lane per §3.2).
+   The nonce travels OUT-OF-BAND — down the broker's own Telegram send path, never returned
+   to any enqueue-socket client.
+3. Yu-Kuan taps Approve → gateway Telegram-callback handler receives {action_id, nonce} from
+   the button → calls broker.approve(action_id, nonce).
+4. Broker validates: nonce matches the one minted for THIS action_id, is unused, unexpired →
+   execute egress, burn the nonce (single-use ⇒ replay-safe, idempotent).
+5. Any approve() arriving WITHOUT a valid nonce (e.g. the assistant calling
+   broker_client.approve(id, approver="yk")) is REJECTED. The assistant never sees the nonce
+   (it went to Telegram, not back over the enqueue socket), and cannot mint one (no broker_secret).
+```
+
+**Why this provably blocks self-approval:** the only way to obtain a valid nonce is to receive
+the Telegram button payload, which requires being Yu-Kuan's Telegram client — an out-of-band
+authority the assistant has no access to. The enqueue socket carries no nonce and no way to
+derive one. `broker_client` (assistant-side) exposes `approve(action_id, nonce)` but the
+assistant has no nonce to pass; the Telegram-callback path in the gateway is the only caller
+that ever holds one. This is a **separate approval authority**, not a stronger string check.
+
+**File impact:** `broker/approval.py` mints/validates/burns the nonce; the RPC signature becomes
+`approve{action_id, nonce}` (drops the trust-me `approver` string); `gateway/broker_approval_buttons.py`
+carries `{action_id, nonce}` in the inline-button callback data. `broker/credentials.py` holds
+`broker_secret`. Gate test: `test_assistant_cannot_self_approve` (§5.2 P1a-d).
 
 ---
 
@@ -276,11 +408,13 @@ re-fetches the payload by id.
 ```
 broker holds action  ──►  notify Yu-Kuan on Telegram (principal-directed, NOT third-party
                           send → exempt from safe-lane, direct delivery per remediation §2)
-                          message = summary + [Approve ✓] [Reject ✗] carrying action_id
-Yu-Kuan taps Approve ──►  gateway → broker_client.approve(action_id, approver="yk")
-                     ──►  broker: load row by id → execute real egress → state=executed
-                          → idempotent (second tap = no-op, returns cached result)
-Yu-Kuan taps Reject  ──►  broker_client.reject(action_id) → state=rejected, no send
+                          message = summary + [Approve ✓] [Reject ✗] carrying
+                          {action_id, approval_nonce} (nonce minted per §2.1)
+Yu-Kuan taps Approve ──►  gateway Telegram-callback → broker.approve(action_id, nonce)
+                     ──►  broker: validate+burn nonce → load row by id → execute real egress
+                          → state=executed → idempotent (second tap = no-op, cached result)
+                          (an assistant approve() WITHOUT the nonce is rejected — §2.1)
+Yu-Kuan taps Reject  ──►  gateway callback → broker.reject(action_id, nonce) → state=rejected
 ```
 The approval surface is **generic** — `{type, summary, payload}` — so message-sends,
 pm_os writes, git pushes, and P2 merge approvals all ride the identical path. No
@@ -292,7 +426,7 @@ per-channel hash surgery ever again.
 |---|---|
 | `broker/safe_lane.py` | 5-condition evaluator (predicates C1–C5) |
 | `broker/action_id.py` | ULID generation |
-| `broker/approval.py` | approve/reject state machine over `held_store` (idempotent) |
+| `broker/approval.py` | approve/reject state machine over `held_store` (idempotent) + approval-nonce mint/validate/burn (§2.1) |
 | `broker/policy/safe-lane.md` | prose spec of the 5 conditions (single-owner) |
 | `broker/policy/allow-list.md` | recipient allow-list (C2), P1a-seeded |
 | `broker/policy/strategic-markers.md` | C3 strategic keywords |
@@ -381,12 +515,16 @@ Ownership rule: **no two tasks write the same file.** Shared files (`send_messag
 | **P1a-e** | P1a-5 | `broker/safe_lane.py`, `broker/policy/*.md` | P1a-c |
 | **P1a-f** | P1a-6 | `worker/__init__.py`, `worker/base.py`, `worker/local_subprocess.py` | — (parallel with broker) |
 | **P1a-g** | P1a-7 | `worker/remote_stub.py` | P1a-f |
-| **P1a-h** | P1a-8 | `broker/executors/message_executor.py`, `broker/executors/git_push_executor.py`, `plugins/control-room/policies/terminal-git-push-deny.yaml`, `tools/send_message_tool.py` (re-route), `scripts/factory_health.py` (broker section) | P1a-b |
+| **P1a-h** | P1a-8 | `broker/executors/message_executor.py`, `broker/executors/git_push_executor.py`, `plugins/control-room/policies/terminal-git-push-deny.yaml`, `plugins/control-room/policies/terminal-hermes-send-deny.yaml` (NEW belt for B10), `tools/send_message_tool.py` (`_handle_send` re-route), `hermes_cli/send_cmd.py` (refuse-or-route, B10), `hermes_cli/env_loader.py` (EGRESS-cred starving, §1.6), `scripts/factory_health.py` (broker section) | P1a-b |
 
-**Cross-task shared-file resolution:** `send_message_tool.py` and `factory_health.py` are
-owned solely by **P1a-h**. `broker/server.py` dispatch references methods implemented in
-P1a-c/d/e via import — those tasks add *new files*, P1a-b's server imports them (dispatch
-table wired in P1a-b, method bodies in the dependent tasks). No shared-file write.
+**Cross-task shared-file resolution:** `send_message_tool.py`, `hermes_cli/send_cmd.py`,
+`hermes_cli/env_loader.py`, and `factory_health.py` are owned solely by **P1a-h** (all the
+egress re-route + cred-starving edits land in one task, keeping the set file-disjoint). The
+approval-nonce mint/validate/burn lives entirely in P1a-d's `broker/approval.py` +
+`gateway/broker_approval_buttons.py` — no overlap with P1a-h. `broker/server.py` dispatch
+references methods implemented in P1a-c/d/e via import — those tasks add *new files*, P1a-b's
+server imports them (dispatch table wired in P1a-b, method bodies in the dependent tasks). No
+shared-file write.
 
 ### 5.2 Per-component RED tests (TDD — assert the failure first)
 
@@ -403,13 +541,21 @@ table wired in P1a-b, method bodies in the dependent tasks). No shared-file writ
 3. `test_approve_is_idempotent` — approve same id twice ⇒ single execution.
 4. `test_long_payload_not_truncated` — 100KB payload stored and re-read byte-identical.
 5. `test_state_transition_atomic` — crash mid-transition leaves a consistent state.
+6. `test_crash_between_ack_and_commit_loses_nothing` (review P1-#6) — the enqueue is
+   committed/fsynced to SQLite **before** the RPC returns `action_id`; a crash after ack but
+   before an in-flight write never leaves the assistant believing an action is queued that isn't.
 
-**P1a-d approval surface (4–6):**
+**P1a-d approval surface + authority (6–7):**
 1. `test_action_id_is_ulid_stable` — id is ULID, never derived from body hash.
-2. `test_approve_by_id_executes` — approve(id) runs the real (stubbed) egress.
-3. `test_reject_by_id_no_send` — reject(id) ⇒ no egress, state=rejected.
+2. `test_approve_with_valid_nonce_executes` — approve(id, valid nonce) runs the real (stubbed) egress.
+3. `test_reject_by_id_no_send` — reject(id, nonce) ⇒ no egress, state=rejected.
 4. `test_generic_types_share_path` — message/pm_os/git_push/merge all enqueue+approve identically.
-5. `test_telegram_carries_id_not_payload` — surface message has id+summary, not full body.
+5. `test_telegram_carries_id_not_payload` — surface message has id+summary (+nonce in callback data), not full body.
+6. **`test_assistant_cannot_self_approve`** (review P0-3) — assistant client calling
+   `broker_client.approve(id, approver="yk")` / any `approve` WITHOUT a valid broker-minted
+   nonce on its own enqueued action is REJECTED; no egress occurs.
+7. `test_nonce_single_use` — approve twice with the same nonce ⇒ second is rejected (burned),
+   and a stale/expired nonce is rejected.
 
 **P1a-e safe-lane (5–6, one per condition + integration):**
 1. `test_all_five_hold_auto_sends` — the "got it to a known colleague" case auto-sends.
@@ -421,28 +567,53 @@ table wired in P1a-b, method bodies in the dependent tasks). No shared-file writ
 
 **P1a-f/g worker launcher (5–6) — incl. the process-group proof:**
 1. `test_launch_creates_process_group` — child pgid == pid (`os.getpgid`).
-2. `test_kill_terminates_children` — spawn parent+child, `kill`, assert **both** gone.
-3. `test_stalled_detected_by_mtime` — alive but output frozen ⇒ STALLED, not RUNNING.
+2. `test_kill_terminates_children` — spawn parent+child, `kill`, assert **both** gone; AND
+   spawn a grandchild that itself calls `setsid` (escapes the pgid) ⇒ assert the escape is
+   detected (scan orphaned descendants by process tree, not just pgid) OR the residual is
+   documented (review P2 — mtime/killpg cannot reach a re-`setsid`'d grandchild by group alone).
+3. `test_stalled_detected_by_mtime` — alive but output frozen ⇒ STALLED, not RUNNING. (Named
+   limit, review P2: mtime detects "writing," not "progressing" — a keep-alive spinner reads
+   RUNNING forever; the staleness window is a liveness heuristic, not a progress guarantee.)
 4. `test_collect_result_bounded` — never blocks past timeout.
 5. `test_remote_stub_same_interface` — stub satisfies `Worker` ABC; dispatched by the
    *same* supervisor path as local (the P1a-7 gate).
 
-**P1a-h bypass-impossibility (THE gate tests — 4–6, assert egress FAILS):**
-1. `test_direct_send_cli_fails_no_creds` — call the send path with broker unreachable / creds absent ⇒ no message leaves.
-2. `test_token_file_read_finds_no_live_cred` — read `.env`/token paths ⇒ no live send credential present (P1a-8).
-3. `test_raw_git_push_blocked` — `terminal("git push ...")` ⇒ blocked by policy, no push.
-4. `test_execute_code_import_adapter_fails` — code importing the adapter can't send (cred absent).
-5. `test_subagent_inherits_cred_absence` — a delegated subagent also cannot send.
-6. `test_send_message_routes_to_broker` — the re-routed tool frames `enqueue_action`, never touches an adapter.
+**P1a-h bypass-impossibility (THE gate tests — assert egress FAILS; strengthened per review):**
+1. `test_hermes_send_cli_refuses_or_routes` (review P0-1) — invoke the **real** `hermes send`
+   subcommand (`hermes_cli/send_cmd.py`, not a stub) in an assistant context ⇒ it refuses OR
+   frames `enqueue_action`; **no message leaves** and it does not fall back to a direct adapter.
+2. **`test_assistant_process_env_starved_of_egress_creds`** (review P0-2, replaces the old
+   file-read test) — spin up a fresh assistant/gateway process through the real `env_loader`
+   load path; assert `os.environ` contains a live **MODEL** key (e.g. `ANTHROPIC_API_KEY` or
+   `OPENROUTER_API_KEY`) AND contains **no** live EGRESS secret (`TELEGRAM_BOT_TOKEN`,
+   `DISCORD_BOT_TOKEN`, MS Graph secret, `GITHUB_TOKEN`, `WEIXIN_TOKEN`). Covers `~/.hermes/.env`,
+   managed `/etc/hermes/.env`, Bitwarden, and config.yaml scalar bridging (§1.6). File-read-finds-
+   nothing is NOT sufficient — the assertion is on the process env.
+3. `test_assistant_can_still_converse` — the same starved process can still resolve a MODEL key
+   and run one model turn (proves the split didn't break the product).
+4. `test_raw_git_push_blocked_and_no_token` — `terminal("git push ...")` ⇒ blocked by policy;
+   AND with the deny bypassed (`git -C`/alias), `GITHUB_TOKEN`/`GH_TOKEN` is absent from the
+   process env so `git push https://$TOKEN@host` finds no live token (wall = cred-absence).
+5. `test_ms_graph_sendmail_fails_no_cred` (B11) — MS Graph `sendMail` path finds no live token ⇒ no send.
+6. `test_discord_direct_fails_no_cred` (B12) — Discord tool finds no `DISCORD_BOT_TOKEN` ⇒ no post.
+7. `test_execute_code_import_adapter_fails` — code importing the adapter can't send (cred absent).
+8. `test_subagent_inherits_cred_absence_incl_terminal` (review P2/B14) — a delegated subagent
+   cannot send via `send_message`/`execute_code` (stripped by `DELEGATE_BLOCKED_TOOLS`) AND
+   cannot send via `terminal` (`curl`/`hermes send`/`git push`) because the shared env is starved.
+9. `test_send_message_routes_to_broker` — the re-routed `_handle_send` frames `enqueue_action`, never touches an adapter.
 
 ### 5.3 Fresh-context exit-gate script (maps to plan §P1a binding gate)
 
 A single reviewer-run checklist (no self-report): (a) approve a held action incl. one long
-payload from Telegram → it executes; (b) safe-lane auto-sends one recoverable/operational
-action and holds one strategic one; (c) attempt direct bypass — send-CLI + token-file read
-+ raw `git push` — all three produce **no effect**; (d) `remote_stub` compiles and is
-dispatched by the same supervisor path as local; (e) a local subprocess is killed via
-SIGTERM-to-process-group with all children dead. Each is one of the RED tests above going
+payload from Telegram → it executes, AND an assistant `approve()` WITHOUT the nonce on its own
+action is **rejected** (self-approval blocked, §2.1); (b) safe-lane auto-sends one
+recoverable/operational action and holds one strategic one; (c) attempt direct bypass across
+the FULL egress surface — `hermes send` CLI, MS Graph sendMail, Discord tool, raw `git push`
+(incl. HTTPS-token variant), and a fresh assistant process's `os.environ` — **every EGRESS
+credential is absent while the MODEL key is present and the assistant can still converse** (all
+produce no send effect); (d) `remote_stub` compiles and is dispatched by the same supervisor
+path as local; (e) a local subprocess (incl. a `setsid`-escaping grandchild, or the escape
+documented) is killed via SIGTERM-to-process-group. Each is one of the RED tests above going
 GREEN, re-run by the verifier.
 
 ---
