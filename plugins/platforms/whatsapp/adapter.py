@@ -507,6 +507,26 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             )
             return False
 
+        # REQ-01: creds.json exists but the WhatsApp server handshake (phone
+        # scan) was never completed — registered=false means Baileys created
+        # the key material but the pairing ceremony did not finish.  Skip the
+        # 30-second bridge bootstrap and mark non-retryable so the reconnect
+        # watcher drops it immediately instead of looping every 30–300 s.
+        _owner_jid = self._read_creds_registered(creds_path)
+        if _owner_jid is None:
+            logger.warning(
+                "[%s] WhatsApp creds.json found but session is not registered "
+                "(registered=false or corrupt).  Re-pair: `hermes whatsapp`.",
+                self.name,
+            )
+            self._set_fatal_error(
+                "whatsapp_not_registered",
+                "WhatsApp creds.json present but session not registered — "
+                "re-pair via `hermes whatsapp`.",
+                retryable=False,
+            )
+            return False
+
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
         
         # Acquire scoped lock to prevent duplicate sessions
@@ -591,10 +611,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 disk_hash = _file_content_hash(bridge_path)
                                 if running_hash and disk_hash and running_hash == disk_hash:
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                    self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
                                     self._http_session = aiohttp.ClientSession()
+                                    # REQ-02: verify the session can actually send before
+                                    # marking the connector active.
+                                    if not await self._run_round_trip_probe(_owner_jid):
+                                        logger.warning(
+                                            "[%s] Round-trip probe failed on existing bridge; "
+                                            "not marking connected.",
+                                            self.name,
+                                        )
+                                        await self._http_session.close()
+                                        self._http_session = None
+                                        return False
                                     self._poll_task = asyncio.create_task(self._poll_messages())
+                                    self._mark_connected()
                                     return True
                                 print(
                                     f"[{self.name}] Running bridge is stale "
@@ -721,9 +752,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Create a persistent HTTP session for all bridge communication
             self._http_session = aiohttp.ClientSession()
 
+            # REQ-02: verify the session can actually send before reporting
+            # the connector as ACTIVE.  A bridge that reaches status:connected
+            # but can't deliver messages (e.g. soft-banned, stale auth token)
+            # must not silently masquerade as healthy.
+            if not await self._run_round_trip_probe(_owner_jid):
+                logger.warning(
+                    "[%s] Round-trip probe failed; not marking connected.",
+                    self.name,
+                )
+                await self._http_session.close()
+                self._http_session = None
+                return False
+
             # Start message polling task
             self._poll_task = asyncio.create_task(self._poll_messages())
-            
+
             self._mark_connected()
             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
             return True
@@ -737,6 +781,70 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     self._release_platform_lock()
                 self._close_bridge_log()
     
+    def _read_creds_registered(self, creds_path: Path) -> Optional[str]:
+        """
+        Purpose: Read creds.json and return the owner JID iff the session is
+                 fully registered with WhatsApp servers.
+        Usage:   Called by connect() after confirming creds.json exists; returns
+                 the `me.id` JID string on success, None on any failure.
+        Gotchas: Baileys writes creds.json early (on first QR scan) with
+                 registered=False; file existence alone is not a valid pairing
+                 signal — only registered=True means the phone handshake completed.
+        """
+        try:
+            import json as _j
+            data = _j.loads(creds_path.read_text())
+            if not data.get("registered"):
+                logger.debug("[%s] creds.json has registered=false — not yet paired.", self.name)
+                return None
+            owner_jid = data.get("me", {}).get("id")
+            if not owner_jid:
+                logger.warning("[%s] creds.json has registered=true but me.id missing.", self.name)
+                return None
+            return owner_jid
+        except Exception as exc:
+            logger.warning("[%s] Could not read creds.json: %s", self.name, exc)
+            return None
+
+    async def _run_round_trip_probe(self, owner_jid: str) -> bool:
+        """
+        Purpose: Send a self-addressed probe message through the bridge to
+                 confirm the WhatsApp session can actually deliver messages.
+        Usage:   Called by connect() after the bridge reports status:connected
+                 and _http_session is open; returns True iff the bridge accepts
+                 the send with success:true.
+        Gotchas: Requires _http_session to be set before calling. The probe
+                 message is sent to the owner's own JID so no other party sees it.
+                 Any HTTP error, non-200 response, or success:false is a failure.
+        """
+        if self._http_session is None:
+            logger.warning("[%s] Round-trip probe called before _http_session is set.", self.name)
+            return False
+        try:
+            import aiohttp
+            url = f"http://127.0.0.1:{self._bridge_port}/send"
+            payload = {"chatId": owner_jid, "message": "[hermes probe]"}
+            async with self._http_session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        "[%s] Round-trip probe HTTP %d: %s",
+                        self.name, resp.status, body[:200],
+                    )
+                    return False
+                data = await resp.json()
+                if not data.get("success"):
+                    logger.warning(
+                        "[%s] Round-trip probe rejected by bridge: %s",
+                        self.name, data.get("error", "<no error field>"),
+                    )
+                    return False
+            logger.info("[%s] Round-trip probe passed (messageId=%s).", self.name, data.get("messageId"))
+            return True
+        except Exception as exc:
+            logger.warning("[%s] Round-trip probe failed: %s", self.name, exc)
+            return False
+
     def _close_bridge_log(self) -> None:
         """Close the bridge log file handle if open."""
         if self._bridge_log_fh:

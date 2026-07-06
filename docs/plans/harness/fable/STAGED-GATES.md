@@ -13,6 +13,12 @@ live. Each row has the exact command/procedure. Owner runs these as the world pr
 | SG-P0-3 | Zombie-platform log silence confirmed live | Running gateway loaded pre-P0-9 config; silence only provable after restart | After next gateway restart: `hermes logs --since 30m \| grep -Ei 'discord\|whatsapp'` shows zero reconnect/retry lines. |
 | SG-P0-4 | compute.md tasks/night from a dedicated gauntlet | Figures derived from n=5 real fable-run subagents (proxy), not a dedicated metered gauntlet | Run the procedure in `compute.md §STAGED` (≥20 metered factory jobs) and update the ceiling. |
 
+## From Phase R
+
+| ID | Gate | Why staged | Exact action to flip |
+|---|---|---|---|
+| SG-R-2 | WhatsApp round-trip probe passes live | Probe requires `registered=true` + a live WhatsApp session; current `creds.json` has `registered=false` and the connector is `enabled: false` | After pairing: enable WhatsApp (`WHATSAPP_ENABLED=true` in `~/.hermes/.env`), run `hermes whatsapp` and scan QR, then restart gateway. `hermes logs` must show `Round-trip probe passed (messageId=...)` within 60s of startup. |
+
 ## From later phases
 (appended as each phase completes — P4 3-night flagship, P1b 30-day/10-merge graduation,
 P1c real-meeting prep, etc.)

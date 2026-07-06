@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import contextlib
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -83,12 +84,26 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     return MagicMock(return_value=_AsyncCM(mock_session))
 
 
+def _apply_all(patch_list):
+    """Return an ExitStack that activates every patch in the list.
+
+    Enables tests to apply a variable-length patch list without spelling
+    out each index individually.
+    """
+    stack = contextlib.ExitStack()
+    for p in patch_list:
+        stack.enter_context(p)
+    return stack
+
+
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
-    """Return a dict of common patches needed to reach the health-check loop."""
-    patches = {
-        "plugins.platforms.whatsapp.adapter.check_whatsapp_requirements": True,
-        "plugins.platforms.whatsapp.adapter.asyncio.create_task": MagicMock(),
-    }
+    """Return a list of common patches needed to reach the health-check loop.
+
+    Includes a stub for _read_creds_registered so tests focused on bridge
+    startup / cleanup don't need to supply a real creds.json.  The pairing-gate
+    logic itself is exercised by test_whatsapp_pairing_gate.py.
+    """
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
     base = [
         patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
@@ -98,6 +113,19 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         patch("builtins.open", return_value=mock_fh),
         patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
         patch("plugins.platforms.whatsapp.adapter.asyncio.create_task"),
+        # Stub the pairing-gate helpers so tests focused on bridge startup /
+        # cleanup don't need to supply a real creds.json or a probe endpoint.
+        # The pairing-gate logic is covered by test_whatsapp_pairing_gate.py.
+        patch.object(
+            WhatsAppAdapter,
+            "_read_creds_registered",
+            new=MagicMock(return_value="15550001234:1@s.whatsapp.net"),
+        ),
+        patch.object(
+            WhatsAppAdapter,
+            "_run_round_trip_probe",
+            new=AsyncMock(return_value=True),
+        ),
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))
@@ -173,8 +201,7 @@ class TestDataInitialized:
 
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8], \
+        with _apply_all(patches), \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
             # Must NOT raise NameError
             result = await adapter.connect()
@@ -203,8 +230,7 @@ class TestFileHandleClosedOnError:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7]:
+        with _apply_all(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -217,6 +243,7 @@ class TestConnectCleanup:
 
     @pytest.mark.asyncio
     async def test_releases_lock_when_npm_install_fails(self):
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
         adapter = _make_adapter()
 
         def _path_exists(path_obj):
@@ -228,7 +255,9 @@ class TestConnectCleanup:
              patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
              patch("subprocess.run", return_value=install_result), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
-             patch("gateway.status.release_scoped_lock") as mock_release:
+             patch("gateway.status.release_scoped_lock") as mock_release, \
+             patch.object(WhatsAppAdapter, "_read_creds_registered",
+                          return_value="15550001234:1@s.whatsapp.net"):
             result = await adapter.connect()
 
         assert result is False
@@ -402,8 +431,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with _apply_all(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -433,8 +461,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with _apply_all(patches):
             result = await adapter.connect()
 
         assert result is False
@@ -444,6 +471,7 @@ class TestBridgeRuntimeFailure:
     @pytest.mark.asyncio
     async def test_closed_on_unexpected_exception(self):
         """Popen raises, outer except block must still close the handle."""
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
         adapter = _make_adapter()
 
         mock_fh = MagicMock()
@@ -453,7 +481,9 @@ class TestBridgeRuntimeFailure:
              patch.object(Path, "mkdir", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("subprocess.Popen", side_effect=OSError("spawn failed")), \
-             patch("builtins.open", return_value=mock_fh):
+             patch("builtins.open", return_value=mock_fh), \
+             patch.object(WhatsAppAdapter, "_read_creds_registered",
+                          return_value="15550001234:1@s.whatsapp.net"):
             result = await adapter.connect()
 
         assert result is False
