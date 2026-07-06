@@ -394,13 +394,16 @@ def _post_tool_call(
     # are non-JSON exception strings.
     send_failed = False
     if isinstance(result, str):
-        try:
-            parsed = json.loads(result)
-            if isinstance(parsed, dict) and parsed.get("error"):
+        stripped = result.strip()
+        if stripped:
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    send_failed = True
+            except (json.JSONDecodeError, ValueError):
+                # Non-JSON result (e.g. raw exception message) = failure
                 send_failed = True
-        except (json.JSONDecodeError, ValueError):
-            # Non-JSON result (e.g. raw exception message) = failure
-            send_failed = True
+        # Empty/whitespace result is a benign success — do not set send_failed
 
     body = args.get("message", "")
     bh = _body_hash(body)
