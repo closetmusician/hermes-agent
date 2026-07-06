@@ -269,6 +269,34 @@ def _get_enabled_plugins() -> Optional[set]:
 
 
 # ---------------------------------------------------------------------------
+# Mandatory-plugin constants and exception
+# ---------------------------------------------------------------------------
+
+# Hardcoded defense-in-depth: these plugins are mandatory regardless of
+# whether their plugin.yaml carries ``mandatory: true``.  If someone removes
+# the YAML flag, the system still treats them as mandatory.  This is the
+# last line of defense and must never be weakened without owner sign-off.
+MANDATORY_SECURITY_PLUGINS: frozenset = frozenset({
+    "control-room",
+    "email-send-guard",
+    "tool-registry-guard",
+})
+
+
+class MandatoryPluginLoadError(RuntimeError):
+    """Raised by PluginManager.discover_and_load() when one or more mandatory
+    security plugins fail to load.
+
+    Purpose: carry the names of every failed mandatory plugin so gateway
+    startup can log a named error and abort rather than silently starting
+    in a degraded state (FM-4 / REQ-01).
+    Usage: catch at the gateway startup call site; the message names the plugins.
+    Gotchas: inherits RuntimeError so existing generic exception handlers still
+    catch it; callers that need the list should inspect mgr.mandatory_load_failures.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -310,6 +338,11 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # When True the plugin loads unconditionally (bypasses disabled / not-in-enabled
+    # gates) and a load failure raises MandatoryPluginLoadError at startup instead
+    # of being silently swallowed.  Set via ``mandatory: true`` in plugin.yaml or
+    # by the hardcoded MANDATORY_SECURITY_PLUGINS frozenset (defense-in-depth).
+    mandatory: bool = False
 
 
 @dataclass
@@ -1222,6 +1255,11 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Maps mandatory plugin key → error message for every mandatory plugin
+        # that failed to load in the most recent discover_and_load() call.
+        # Non-empty means the system started in a degraded state.  Populated
+        # before MandatoryPluginLoadError is raised so callers can inspect it.
+        self.mandatory_load_failures: Dict[str, str] = {}
 
     # -----------------------------------------------------------------------
     # Public
@@ -1256,6 +1294,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self.mandatory_load_failures.clear()
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1339,6 +1378,13 @@ class PluginManager:
             winners[manifest.key or manifest.name] = manifest
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
+
+            # Mandatory plugins bypass disabled/not-enabled gates and use the
+            # fail-closed load path.  A mandatory plugin that fails to load
+            # raises MandatoryPluginLoadError at the end of this sweep.
+            if manifest.mandatory:
+                self._load_mandatory_plugin(manifest)
+                continue
 
             # Explicit disable always wins (matches on key or on legacy
             # bare name for back-compat with existing user configs).
@@ -1428,6 +1474,19 @@ class PluginManager:
                 "Plugin discovery complete: %d found, %d enabled",
                 len(self._plugins),
                 sum(1 for p in self._plugins.values() if p.enabled),
+            )
+
+        # Fail-closed gate: if any mandatory plugin failed to load, refuse to
+        # continue.  We log CRITICAL in _load_mandatory_plugin per failure; here
+        # we raise a single named exception so the gateway startup can abort
+        # cleanly instead of running unguarded.  The failures dict is populated
+        # before we raise so callers can inspect it for reporting.
+        if self.mandatory_load_failures:
+            failed_names = ", ".join(sorted(self.mandatory_load_failures))
+            raise MandatoryPluginLoadError(
+                f"Gateway startup aborted: mandatory security plugin(s) failed to load: "
+                f"{failed_names}. "
+                f"Errors: { {k: v for k, v in self.mandatory_load_failures.items()} }"
             )
 
     # -----------------------------------------------------------------------
@@ -1587,6 +1646,12 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            # A plugin is mandatory if its YAML says so OR if the hardcoded
+            # MANDATORY_SECURITY_PLUGINS set names it (defense-in-depth: removing
+            # the YAML flag does not weaken the guarantee).
+            is_mandatory = bool(data.get("mandatory", False)) or (
+                key in MANDATORY_SECURITY_PLUGINS or name in MANDATORY_SECURITY_PLUGINS
+            )
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1599,6 +1664,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                mandatory=is_mandatory,
             )
         except Exception as exc:
             logger.warning(
@@ -1783,6 +1849,31 @@ class PluginManager:
                 manifest.name, exc, exc_info=_PLUGINS_DEBUG,
             )
         self._plugins[manifest.key or manifest.name] = loaded
+
+    def _load_mandatory_plugin(self, manifest: PluginManifest) -> None:
+        """Load a mandatory security plugin with fail-closed error recording.
+
+        Purpose: delegate to _load_plugin, then inspect the result.  If the
+        plugin failed (enabled=False), record the failure in mandatory_load_failures
+        and emit a CRITICAL log.  The actual raise is deferred to the end of
+        _discover_and_load_inner so all mandatory failures are collected at once.
+        Usage: called from _discover_and_load_inner for every manifest with
+        manifest.mandatory == True.
+        Gotchas: a disabled or not-in-enabled manifest still loads here because
+        mandatory plugins bypass those gates entirely.
+        """
+        self._load_plugin(manifest)
+        lookup_key = manifest.key or manifest.name
+        loaded = self._plugins.get(lookup_key)
+        if loaded and not loaded.enabled:
+            error_msg = loaded.error or "unknown error"
+            self.mandatory_load_failures[lookup_key] = error_msg
+            logger.critical(
+                "MANDATORY security plugin '%s' failed to load: %s — "
+                "gateway startup will be aborted (fail-closed)",
+                lookup_key,
+                error_msg,
+            )
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.

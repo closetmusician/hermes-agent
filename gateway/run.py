@@ -6787,8 +6787,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
 
-        # Discover and load event hooks
-        self.hooks.discover_and_load()
+        # Discover and load event hooks.
+        # Fail-closed: if any mandatory security plugin fails to load,
+        # MandatoryPluginLoadError is raised here and gateway startup is
+        # aborted.  The error message names the failing plugin(s) so operators
+        # can diagnose the problem without searching logs.  See FM-4 / REQ-01.
+        try:
+            from hermes_cli.plugins import MandatoryPluginLoadError
+            self.hooks.discover_and_load()
+        except MandatoryPluginLoadError as exc:
+            logger.critical(
+                "Gateway startup ABORTED — mandatory security plugin failure: %s", exc
+            )
+            return False
 
         
         # Recover background processes from checkpoint (crash recovery)

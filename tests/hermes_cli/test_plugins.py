@@ -720,6 +720,9 @@ class TestPluginHooks:
             ),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # Isolate from real bundled plugins so mandatory plugins (tool-registry-guard
+        # etc.) don't load and add unexpected hook results.
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "hermes_test" / "plugins"))
 
         mgr = PluginManager()
         mgr.discover_and_load()
@@ -1526,6 +1529,9 @@ class TestPreLlmCallTargetRouting:
             '{"context": "basic context"}',
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # Isolate from real bundled plugins so mandatory plugins (tool-registry-guard
+        # etc.) don't load and add unexpected hook results.
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "hermes_test" / "plugins"))
 
         mgr = PluginManager()
         mgr.discover_and_load()
@@ -1546,6 +1552,9 @@ class TestPreLlmCallTargetRouting:
             '"plain string context"',
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # Isolate from real bundled plugins so mandatory plugins (tool-registry-guard
+        # etc.) don't load and add unexpected hook results.
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "hermes_test" / "plugins"))
 
         mgr = PluginManager()
         mgr.discover_and_load()
@@ -1569,6 +1578,9 @@ class TestPreLlmCallTargetRouting:
             '{"context": "guardrail text"}',
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # Isolate from real bundled plugins so mandatory plugins (tool-registry-guard
+        # etc.) don't load and add unexpected hook results.
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "hermes_test" / "plugins"))
 
         mgr = PluginManager()
         mgr.discover_and_load()
@@ -1602,6 +1614,9 @@ class TestPreLlmCallTargetRouting:
             '"plain text C"',
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        # Isolate from real bundled plugins so mandatory plugins (tool-registry-guard
+        # etc.) don't load and add unexpected hook results.
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(tmp_path / "hermes_test" / "plugins"))
 
         mgr = PluginManager()
         mgr.discover_and_load()
