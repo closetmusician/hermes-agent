@@ -361,3 +361,190 @@ class TestExitCodes:
             "scheduler": {"last_tick": "never"},
         }
         assert fh.compute_exit_code(sections) == 2
+
+
+# ---------------------------------------------------------------------------
+# REQ-04 (R-5): Lane state — degraded detection, clear-on-absent, exit-code
+# ---------------------------------------------------------------------------
+
+class TestLaneState:
+    """Section 5: lane state from R-4's reauth-needed.json marker.
+
+    REQ-01 — lane state shows degraded+reason when marker present, ok when absent.
+    REQ-02 — degraded lane is counted as non-healthy in exit-code logic.
+    REQ-04 — tests are RED-first; mock only file/marker IO.
+    """
+
+    def test_lane_healthy_when_marker_absent(self, tmp_path):
+        """No marker file → lane state is ok with no degraded lanes."""
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        # Do NOT create the file — absent means healthy
+
+        result = fh.check_lane_state(marker_path=marker_path)
+
+        assert result["degraded"] == []
+        assert result["status"] == "ok"
+
+    def test_lane_healthy_when_marker_cleared(self, tmp_path):
+        """Marker file contains {} (cleared) → lane is ok."""
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker_path.write_text("{}")
+
+        result = fh.check_lane_state(marker_path=marker_path)
+
+        assert result["degraded"] == []
+        assert result["status"] == "ok"
+
+    def test_lane_degraded_when_sso_marker_present(self, tmp_path):
+        """Marker with lane+expiry_type → lane is degraded with reason."""
+        import json
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker = {
+            "ts": "2026-07-06T03:00:00Z",
+            "lane": "teams-chat",
+            "expiry_type": "sso-session",
+            "reason": "SSO session expired, interactive re-login required",
+            "skill": "ensure-tokens",
+            "action_needed": "re-auth needed: teams-chat — run /pm-login",
+        }
+        marker_path.write_text(json.dumps(marker))
+
+        result = fh.check_lane_state(marker_path=marker_path)
+
+        assert result["status"] == "degraded"
+        assert len(result["degraded"]) == 1
+        entry = result["degraded"][0]
+        assert entry["lane"] == "teams-chat"
+        assert entry["expiry_type"] == "sso-session"
+        assert "reason" in entry
+
+    def test_lane_degraded_when_foci_marker_present(self, tmp_path):
+        """FOCI token-revoked marker → foci lane is degraded."""
+        import json
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker = {
+            "ts": "2026-07-06T04:00:00Z",
+            "lane": "foci",
+            "expiry_type": "token-revoked",
+            "reason": "FOCI token permanently revoked",
+            "skill": "ensure-tokens",
+            "action_needed": "re-auth needed: foci — run /pm-login",
+        }
+        marker_path.write_text(json.dumps(marker))
+
+        result = fh.check_lane_state(marker_path=marker_path)
+
+        assert result["status"] == "degraded"
+        assert result["degraded"][0]["lane"] == "foci"
+        assert result["degraded"][0]["expiry_type"] == "token-revoked"
+
+    def test_exit_code_1_when_lane_degraded(self, tmp_path):
+        """Degraded lane in sections → compute_exit_code returns 1, not 0."""
+        import json
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker = {
+            "ts": "2026-07-06T03:00:00Z",
+            "lane": "teams-chat",
+            "expiry_type": "sso-session",
+            "reason": "SSO session expired",
+            "skill": "ensure-tokens",
+            "action_needed": "re-auth needed: teams-chat — run /pm-login",
+        }
+        marker_path.write_text(json.dumps(marker))
+
+        lane_state = fh.check_lane_state(marker_path=marker_path)
+        sections = {
+            "providers": [
+                {"name": "anthropic", "status": "reachable", "cause": None},
+                {"name": "openrouter", "status": "reachable", "cause": None},
+            ],
+            "compute": {"caffeinate": True, "disk_free_gb": 50.0, "load_avg": (0.5, 0.4, 0.3)},
+            "workers": {"count": 0, "message": "no workers, factory not provisioned"},
+            "scheduler": {"last_tick": "never"},
+            "lanes": lane_state,
+        }
+        assert fh.compute_exit_code(sections) == 1
+
+    def test_exit_code_0_when_lane_cleared(self, tmp_path):
+        """After clear ({}), lane is ok and providers healthy → exit 0."""
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker_path.write_text("{}")
+
+        lane_state = fh.check_lane_state(marker_path=marker_path)
+        sections = {
+            "providers": [
+                {"name": "anthropic", "status": "reachable", "cause": None},
+                {"name": "openrouter", "status": "reachable", "cause": None},
+            ],
+            "compute": {"caffeinate": True, "disk_free_gb": 50.0, "load_avg": (0.5, 0.4, 0.3)},
+            "workers": {"count": 0, "message": "no workers, factory not provisioned"},
+            "scheduler": {"last_tick": "never"},
+            "lanes": lane_state,
+        }
+        assert fh.compute_exit_code(sections) == 0
+
+    def test_render_shows_degraded_lane_with_reason(self, tmp_path):
+        """render_health_report includes '[5] Lane State' and degraded reason."""
+        import json
+        fh = _import_factory_health()
+
+        marker_path = tmp_path / "reauth-needed.json"
+        marker = {
+            "ts": "2026-07-06T03:00:00Z",
+            "lane": "teams-chat",
+            "expiry_type": "sso-session",
+            "reason": "SSO session expired",
+            "skill": "ensure-tokens",
+            "action_needed": "re-auth needed: teams-chat — run /pm-login",
+        }
+        marker_path.write_text(json.dumps(marker))
+
+        lane_state = fh.check_lane_state(marker_path=marker_path)
+        sections = {
+            "providers": [
+                {"name": "anthropic", "status": "reachable", "cause": None, "latency_ms": 42.0},
+            ],
+            "compute": {"caffeinate": True, "disk_free_gb": 50.0, "load_avg": (0.5, 0.4, 0.3)},
+            "workers": {"count": 0, "message": "no workers, factory not provisioned"},
+            "scheduler": {"last_tick": "never"},
+            "lanes": lane_state,
+        }
+        report = fh.render_health_report(sections)
+
+        assert "[5]" in report
+        assert "teams-chat" in report
+        assert "degraded" in report.lower()
+
+    def test_render_shows_ok_when_no_marker(self, tmp_path):
+        """render_health_report shows lane ok when marker absent."""
+        fh = _import_factory_health()
+
+        # No marker file
+        marker_path = tmp_path / "reauth-needed.json"
+        lane_state = fh.check_lane_state(marker_path=marker_path)
+
+        sections = {
+            "providers": [
+                {"name": "anthropic", "status": "reachable", "cause": None, "latency_ms": 42.0},
+            ],
+            "compute": {"caffeinate": True, "disk_free_gb": 50.0, "load_avg": (0.5, 0.4, 0.3)},
+            "workers": {"count": 0, "message": "no workers, factory not provisioned"},
+            "scheduler": {"last_tick": "never"},
+            "lanes": lane_state,
+        }
+        report = fh.render_health_report(sections)
+
+        assert "[5]" in report
+        assert "ok" in report.lower()

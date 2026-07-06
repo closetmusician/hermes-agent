@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ABOUTME: Jobs-first health command for the hermes autonomous factory host.
-# ABOUTME: Prints 4 sections: provider reachability, compute state, running workers, last scheduler tick.
+# ABOUTME: Prints 5 sections: provider reachability, compute state, running workers, last scheduler tick, lane state.
 # ABOUTME: Distinguishes NETWORK failures (socket/timeout) from HERMES bugs (internal exceptions).
 # ABOUTME: Exit codes: 0=all-healthy, 1=degraded (something down, cause attributable), 2=internal error.
 # ABOUTME: Standalone — no edits to upstream hermes files needed; run directly with `python scripts/factory_health.py`.
@@ -9,13 +9,14 @@
 factory_health.py — single-glance factory host health signal.
 
 Usage:
-    python scripts/factory_health.py [--tick-path PATH]
+    python scripts/factory_health.py [--tick-path PATH] [--lane-marker-path PATH]
 
 Exit codes:
-    0  All sections healthy (providers reachable, compute OK, scheduler ticking).
+    0  All sections healthy (providers reachable, compute OK, scheduler ticking,
+       all lanes ok).
     1  Degraded — at least one section is unhealthy but cause is attributable
-       (e.g. NETWORK outage, disk full) — the factory cannot work but it's not
-       a hermes bug.
+       (e.g. NETWORK outage, disk full, lane auth expired) — the factory cannot
+       work but it's not a hermes bug.
     2  Internal error — a HERMES-attributed failure (bug inside factory_health
        or the hermes stack).  Inspect the HERMES detail for the exception.
 
@@ -25,9 +26,12 @@ Sections printed:
     [2] Compute   — caffeinate assertion present? disk free? load average?
     [3] Workers   — factory worker processes (none = "not provisioned" until P2/P3).
     [4] Scheduler — last tick from ~/.hermes/factory/scheduler-tick ('never' handled).
+    [5] Lanes     — R-4 re-auth marker: any lane whose auth failed shows 'degraded'
+                    with the expiry reason; auto-clears to 'ok' on re-auth.
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -44,6 +48,11 @@ import psutil
 # ---------------------------------------------------------------------------
 
 DEFAULT_TICK_PATH = Path.home() / ".hermes" / "factory" / "scheduler-tick"
+
+# R-4 re-auth marker written by pm_os/bin/ensure-tokens.js.
+# Path contract (from R-4 report §REQ-04): ~/Code/pm_os/state/reauth-needed.json.
+# Absent = healthy; {} = cleared (healthy); object with "lane" field = lane degraded.
+DEFAULT_LANE_MARKER_PATH = Path.home() / "Code" / "pm_os" / "state" / "reauth-needed.json"
 
 # Providers to check — name → HEAD URL (no token spend, public endpoint)
 PROVIDERS = [
@@ -276,6 +285,71 @@ def check_scheduler_tick(tick_path: Path = DEFAULT_TICK_PATH) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Section 5: Lane state (R-4 re-auth marker)
+# ---------------------------------------------------------------------------
+
+
+def check_lane_state(
+    marker_path: Path = DEFAULT_LANE_MARKER_PATH,
+) -> dict[str, Any]:
+    """Read the R-4 re-auth marker and return the lane health state.
+
+    Purpose:
+        Reads ~/Code/pm_os/state/reauth-needed.json (written by pm_os
+        ensure-tokens.js when an SSO/FOCI token expires).  Three cases:
+        - File absent → all lanes ok (no auth failure ever recorded).
+        - File = {} → all lanes ok (re-auth resolved, marker cleared).
+        - File contains {"lane": ..., "expiry_type": ..., ...} → that lane
+          is degraded; it will NOT auto-retry (R-4 exits with SCHEDULED_EXIT_CODE
+          on expiry and never re-enters the retry loop).
+
+    Usage:
+        result = check_lane_state()
+        if result["status"] == "degraded":
+            print(result["degraded"][0]["action_needed"])
+
+    Gotchas:
+        - Reads the raw file; does NOT call pm_os lib/status.js to stay
+          standalone (hermes-side only per constraint).
+        - A malformed JSON file is treated as absent (safe default = ok).
+        - The marker path is configurable for tests; production uses
+          DEFAULT_LANE_MARKER_PATH resolved at import time.
+    """
+    try:
+        raw = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else None
+    except OSError:
+        raw = None
+
+    # Absent or unreadable → healthy
+    if raw is None:
+        return {"status": "ok", "degraded": [], "marker_path": str(marker_path)}
+
+    # Parse JSON; treat malformed as absent
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "ok", "degraded": [], "marker_path": str(marker_path)}
+
+    # Cleared state ({} or object without "lane") → healthy
+    if not isinstance(data, dict) or "lane" not in data:
+        return {"status": "ok", "degraded": [], "marker_path": str(marker_path)}
+
+    # Lane is degraded
+    entry = {
+        "lane": data.get("lane"),
+        "expiry_type": data.get("expiry_type"),
+        "reason": data.get("reason", ""),
+        "ts": data.get("ts"),
+        "action_needed": data.get("action_needed", "run /pm-login"),
+    }
+    return {
+        "status": "degraded",
+        "degraded": [entry],
+        "marker_path": str(marker_path),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Exit code computation
 # ---------------------------------------------------------------------------
 
@@ -308,6 +382,13 @@ def compute_exit_code(sections: dict[str, Any]) -> int:
             has_hermes_error = True
         elif provider.get("cause") == "NETWORK":
             has_network_error = True
+
+    # A degraded lane (auth failure) counts as degraded, not healthy.
+    # R-4 guarantees the lane stopped retrying when degraded, so this is
+    # attributable (not a hermes bug) → exit 1, not exit 2.
+    lanes = sections.get("lanes", {})
+    if lanes.get("status") == "degraded" and lanes.get("degraded"):
+        has_network_error = True  # reuse degraded bucket; lanes are auth/network issues
 
     if has_hermes_error:
         return 2
@@ -400,6 +481,22 @@ def render_health_report(sections: dict[str, Any]) -> str:
         lines.append(f"  last tick: {last}{ago_str}")
     lines.append("")
 
+    # Section 5 — Lane state (R-4 re-auth marker)
+    lanes = sections.get("lanes", {})
+    lines.append("[5] Lane State")
+    if not lanes or lanes.get("status") == "ok":
+        lines.append("  all lanes: ok")
+    else:
+        for entry in lanes.get("degraded", []):
+            lane = entry.get("lane", "unknown")
+            expiry = entry.get("expiry_type", "unknown")
+            action = entry.get("action_needed", "run /pm-login")
+            reason = entry.get("reason", "")
+            lines.append(f"  {lane}: DEGRADED [{expiry}] — {action}")
+            if reason:
+                lines.append(f"    reason: {reason}")
+    lines.append("")
+
     # Summary exit code hint
     exit_code = compute_exit_code(sections)
     code_labels = {0: "ALL HEALTHY", 1: "DEGRADED", 2: "INTERNAL ERROR"}
@@ -413,11 +510,14 @@ def render_health_report(sections: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_health_check(tick_path: Path = DEFAULT_TICK_PATH) -> tuple[dict[str, Any], int]:
+def run_health_check(
+    tick_path: Path = DEFAULT_TICK_PATH,
+    lane_marker_path: Path = DEFAULT_LANE_MARKER_PATH,
+) -> tuple[dict[str, Any], int]:
     """Collect all health sections and compute the exit code.
 
     Purpose:
-        Orchestrates all four checks and returns (sections, exit_code).
+        Orchestrates all five checks and returns (sections, exit_code).
 
     Usage:
         sections, code = run_health_check()
@@ -427,6 +527,8 @@ def run_health_check(tick_path: Path = DEFAULT_TICK_PATH) -> tuple[dict[str, Any
     Gotchas:
         - Each section check is independent; a crash in one does not abort others.
         - The compute section crash is caught and reported as an empty dict.
+        - lane_marker_path defaults to ~/Code/pm_os/state/reauth-needed.json per
+          the R-4 contract; absent/cleared marker = healthy.
     """
     sections: dict[str, Any] = {}
 
@@ -475,6 +577,16 @@ def run_health_check(tick_path: Path = DEFAULT_TICK_PATH) -> tuple[dict[str, Any
             "provisioned": False,
         }
 
+    # Lanes (R-4 re-auth marker)
+    try:
+        sections["lanes"] = check_lane_state(marker_path=lane_marker_path)
+    except Exception as exc:  # noqa: BLE001
+        sections["lanes"] = {
+            "status": "ok",
+            "degraded": [],
+            "_error": f"check_lane_state crashed: {exc}",
+        }
+
     exit_code = compute_exit_code(sections)
     return sections, exit_code
 
@@ -482,8 +594,8 @@ def run_health_check(tick_path: Path = DEFAULT_TICK_PATH) -> tuple[dict[str, Any
 def main() -> None:
     """CLI entrypoint: parse args, run health check, print report, exit.
 
-    Purpose: Parses --tick-path, runs all checks, prints the report, exits.
-    Usage: `python scripts/factory_health.py [--tick-path PATH]`
+    Purpose: Parses --tick-path and --lane-marker-path, runs all checks, prints report, exits.
+    Usage: `python scripts/factory_health.py [--tick-path PATH] [--lane-marker-path PATH]`
     Gotchas: Exits with the computed exit code (0/1/2 per ABOUTME header).
     """
     parser = argparse.ArgumentParser(
@@ -495,9 +607,18 @@ def main() -> None:
         default=DEFAULT_TICK_PATH,
         help=f"Path to the scheduler tick file (default: {DEFAULT_TICK_PATH})",
     )
+    parser.add_argument(
+        "--lane-marker-path",
+        type=Path,
+        default=DEFAULT_LANE_MARKER_PATH,
+        help=f"Path to the R-4 reauth-needed.json marker (default: {DEFAULT_LANE_MARKER_PATH})",
+    )
     args = parser.parse_args()
 
-    sections, exit_code = run_health_check(tick_path=args.tick_path)
+    sections, exit_code = run_health_check(
+        tick_path=args.tick_path,
+        lane_marker_path=args.lane_marker_path,
+    )
     print(render_health_report(sections))
     sys.exit(exit_code)
 
