@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking terminal commands that reference FOCI auth token files.
+# ABOUTME: Catches pm-os-foci-token.json and pm-os-foci-office-token.json paths.
+# ABOUTME: Prevents the agent from reading bearer tokens to bypass tool guards.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 token exfiltration closure (2026-05-22).
+name: terminal-token-read-deny
+description: "Block terminal commands that reference FOCI auth token files"
+action: block
+triggers:
+  - tool_name: terminal
+    args:
+      command:
+        operator: regex
+        value: "pm-os-foci-token|pm-os-foci-office-token"
+preconditions:
+  - state_key: token.read_override
+    required: true
+    message: "Direct access to FOCI auth token files is not allowed. Use the designated pm_os tools which handle authentication internally."

@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking write_file when content references FOCI auth token files.
+# ABOUTME: Catches pm-os-foci-token.json and pm-os-foci-office-token.json paths.
+# ABOUTME: Prevents writing scripts that read bearer tokens to bypass tool guards.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 token exfiltration closure (2026-05-22).
+name: writefile-token-read-deny
+description: "Block writing files that reference FOCI auth token file paths"
+action: block
+triggers:
+  - tool_name: write_file
+    args:
+      content:
+        operator: regex
+        value: "pm-os-foci-token|pm-os-foci-office-token"
+preconditions:
+  - state_key: token.read_override
+    required: true
+    message: "Cannot write files referencing FOCI auth token paths. Use the designated pm_os tools which handle authentication internally."

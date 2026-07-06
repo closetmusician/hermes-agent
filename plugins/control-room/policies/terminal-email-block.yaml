@@ -1,0 +1,18 @@
+# ABOUTME: Policy blocking terminal commands that send email directly.
+# ABOUTME: Catches SMTP, Graph API mail endpoints, nodemailer, sendgrid, etc.
+# ABOUTME: Forces all email sends through the guarded send_message tool.
+# ABOUTME: Uses never-set state key for unconditional blocking.
+# ABOUTME: Part of Phase 4 email loophole closure (2026-05-22).
+name: terminal-email-block
+description: "Block terminal commands that send email directly (bypassing send_message guard)"
+action: block
+triggers:
+  - tool_name: terminal
+    args:
+      command:
+        operator: regex
+        value: "smtplib|SMTP\\(|nodemailer|sendgrid|mailgun|\\.sendmail\\(|sendMail|graph\\.microsoft\\.com.*(sendMail|messages.*send|reply)|/me/(sendMail|messages)|curl.*smtp|postfix|mutt\\s|mail\\s+-s|outlook-send-mail|outlook-reply-mail"
+preconditions:
+  - state_key: email.terminal_send_override
+    required: true
+    message: "Email cannot be sent via terminal commands (curl, sendmail, python smtp, etc.). To send email:\n1. Call send_message(target='email:recipient@example.com', message='your message')\n2. The system will prompt you to call email_load_draft to create a draft\n3. Call email_show_preview to review the draft\n4. The user will run /approve-email to approve\n5. Then call send_message again to send the approved draft"
