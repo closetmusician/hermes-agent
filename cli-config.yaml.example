@@ -1380,3 +1380,42 @@ updates:
 #       # This is a CREDENTIAL: prefer setting HERMES_DASHBOARD_OIDC_CLIENT_SECRET
 #       # in ~/.hermes/.env over putting it here in config.yaml.
 #       #   client_secret: ""
+
+# ── Governance Plugins (P0-2 factory baseline) ────────────────────────────────
+#
+# Standalone plugins that enforce governance policies are loaded ONLY if their
+# key appears in plugins.enabled. Two plugins are enabled by default in the
+# factory host; one is ported dormant (Option A) as the P1a design reference.
+#
+# Enabled plugins fire at EVERY tool call via the native pre_tool_call hook
+# (hermes_cli/plugins.py — first-block-wins). A plugin that fails to load
+# currently fails OPEN (bypass B7, interim until R.1 fail-closed loader lands).
+# HERMES_SAFE_MODE=1 disables ALL plugin discovery — operator-only
+# troubleshooting switch; never set it in the launchd service env.
+#
+# plugins:
+#   enabled:
+#   - control-room          # ENABLED: audit + declarative policy enforcement spine.
+#                           #   Hooks: pre_tool_call, post_tool_call.
+#                           #   Blocks: smtplib/Graph in execute_code, FOCI token reads,
+#                           #   writes to guard source (plugins/control-room,
+#                           #   plugins/tool-registry-guard, ~/.hermes/config.yaml),
+#                           #   hermes-internal imports from execute_code.
+#                           #   8 YAML policies extend coverage. Audits to
+#                           #   ~/.hermes/control-room/audit.db.
+#   - tool-registry-guard   # ENABLED: bans DIY Office/SharePoint libs; injects
+#                           #   pm_os tool-registry table into every LLM turn.
+#                           #   Hooks: pre_tool_call, pre_llm_call, post_tool_call.
+#                           #   Blocks: pip install <banned>, import <banned> in
+#                           #   write_file/patch/terminal. Audits to
+#                           #   ~/.hermes/tool-registry-guard/audit.jsonl.
+#                           #   Registry: ~/.hermes/tool-registry.yaml (user override)
+#                           #   → plugins/tool-registry-guard/default-registry.yaml.
+#   # email-send-guard is NOT in plugins.enabled (Option A — dormant).
+#   # The email platform is gone upstream (F8); control-room email-pattern
+#   # policies provide interim "no raw email egress" enforcement.
+#   # The plugin is ported to plugins/email-send-guard/ as the P1a design
+#   # reference for the broker held-action approval state machine.
+#   entries:
+#     email-send-guard:
+#       drafts_dir: ~/pm_os/reports/drafts   # kept even when dormant
