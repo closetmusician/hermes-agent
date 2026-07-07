@@ -235,6 +235,8 @@ class DailyBudgetLedger:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
+        # P3 §4.7: absorb brief writer contention under fleet concurrency.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(_BUDGET_SCHEMA)
 
     def _today_utc(self) -> str:
@@ -333,6 +335,27 @@ class DailyBudgetLedger:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def release_reservation(
+        self,
+        job_cap_usd: float,
+        job_id: Optional[str] = None,
+        day: Optional[str] = None,
+    ) -> None:
+        """
+        Purpose: return a job's reserved dollars to the ceiling WITHOUT recording
+        any spend — the settlement path for a crashed/parked job (P3 §13.5).  A
+        worker that dies after try_reserve but before commit_spend would otherwise
+        leak its reservation forever, permanently shrinking the night's ceiling.
+        This is a thin wrapper over commit_spend(cap, actual=0.0): it decrements
+        reserved_usd by the cap and adds zero to spent_today_usd.
+        Usage: ledger.release_reservation(job_cap_usd=0.30, job_id=jid)  # crash path
+        Gotchas: idempotency is enforced by the CALLER (the job row's budget_settled
+        flag), not here — calling this twice for one job would over-release, which
+        is why check_integrity gates it behind the flag.  job_id is accepted for
+        forensic logging symmetry with the job store; it does not affect the CAS.
+        """
+        self.commit_spend(job_cap_usd=job_cap_usd, actual_spend_usd=0.0, day=day)
 
     def _seed_for_test(
         self, day: str, spent: float, reserved: float

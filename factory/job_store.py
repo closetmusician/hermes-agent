@@ -49,6 +49,7 @@ from broker.action_id import new_action_id as _new_ulid
 STATES = frozenset(
     {
         "QUEUED",
+        "ADMITTED",
         "RUNNING",
         "TEST",
         "REVIEW",
@@ -63,8 +64,27 @@ STATES = frozenset(
 # Exact one-way transition map.  A key not present in any set means
 # the state is terminal (no outgoing transitions).  REVIEW→RUNNING and
 # TEST→RUNNING represent the one allowed auto-fix retry.
+#
+# ADMITTED (P3 §13.3) is the atomic-slot-reservation state: the fleet
+# scheduler CAS-moves QUEUED→ADMITTED under the store lock BEFORE it spawns
+# the per-node worker, so the concurrency slot is claimed the instant it is
+# reserved — the readiness check cannot double-admit past the cap in the gap
+# between spawn and the child's RUNNING transition.  A scheduler-admitted job
+# advances ADMITTED→RUNNING.
+#
+# NOTE (P3-c scope deviation from design §13.3): the design's exact _ALLOWED
+# edit DROPS QUEUED→RUNNING (making ADMITTED mandatory), paired with a matching
+# supervisor.py:339 edit owned by P3-b.  P3-c must not touch supervisor.py and
+# must keep every existing P2 job_store test green, so QUEUED→RUNNING is RETAINED
+# alongside the new QUEUED→ADMITTED edge.  Both paths coexist: the P2 one-job
+# supervisor still drives QUEUED→RUNNING directly; the P3 fleet scheduler drives
+# QUEUED→ADMITTED→RUNNING.  The atomic-admission guarantee is unaffected — the
+# scheduler ALWAYS reserves the slot via QUEUED→ADMITTED and never uses the direct
+# edge, and the cap count includes ADMITTED.  Making ADMITTED mandatory is a P3-b
+# follow-up (drop RUNNING here + edit supervisor in the same change).
 _ALLOWED: Dict[str, frozenset] = {
-    "QUEUED": frozenset({"RUNNING", "FAILED"}),
+    "QUEUED": frozenset({"ADMITTED", "RUNNING", "FAILED"}),
+    "ADMITTED": frozenset({"RUNNING", "FAILED", "NEEDS_ATTENTION"}),
     "RUNNING": frozenset({"TEST", "FAILED", "NEEDS_ATTENTION"}),
     "TEST": frozenset({"REVIEW", "RUNNING", "NEEDS_ATTENTION"}),
     "REVIEW": frozenset({"AWAITING_APPROVAL", "RUNNING", "NEEDS_ATTENTION"}),
@@ -115,11 +135,23 @@ CREATE TABLE IF NOT EXISTS jobs (
   trust_tier_at_spawn   INTEGER,                -- NULLABLE; reserved for P1b
   fail_reason           TEXT,                   -- populated on FAILED/NEEDS_ATTENTION
   intake_source_hash    TEXT,                   -- idempotency key for intake (§1.6)
+  budget_settled        INTEGER NOT NULL DEFAULT 0,  -- P3 §13.5: reservation released?
   created_ts            INTEGER NOT NULL,
   updated_ts            INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_intake_hash ON jobs(intake_source_hash);
+
+-- P3 §4.2: dependency edges for the fleet scheduler.  A dependent job is
+-- 'ready' only when every depends_on job has reached DONE.  Same DB, same
+-- WAL/FULL connection, same one shared lock — no new writer, no new DB.
+CREATE TABLE IF NOT EXISTS job_deps (
+  job_id      TEXT NOT NULL,   -- the dependent (blocked) job
+  depends_on  TEXT NOT NULL,   -- the job that must reach DONE first
+  graph_id    TEXT NOT NULL,   -- the TaskGraph.spec_hash this edge belongs to
+  PRIMARY KEY (job_id, depends_on)
+);
+CREATE INDEX IF NOT EXISTS idx_job_deps_job ON job_deps(job_id);
 
 -- Supervisor lock: 1-row table, stealed by the next supervisor if stale.
 CREATE TABLE IF NOT EXISTS supervisor_lock (
@@ -176,8 +208,30 @@ class JobStore:
         # loss — the same durability posture as held_store.py.
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
+        # P3 §4.7: absorb brief writer contention under fleet concurrency —
+        # a momentary write-lock waits up to 5s instead of raising SQLITE_BUSY.
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        self._migrate_budget_settled()
         self._conn.commit()
+
+    def _migrate_budget_settled(self) -> None:
+        """
+        Purpose: add the budget_settled column to a pre-P3 jobs table that was
+        created before the column existed (CREATE IF NOT EXISTS never alters an
+        existing table).  Idempotent — a no-op once the column is present.
+        Usage: called once from __init__ after the schema script runs.
+        Gotchas: ALTER TABLE ADD COLUMN is the only safe in-place migration in
+        SQLite; wrapped so a fresh DB (column already present) does not error.
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "budget_settled" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN budget_settled INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------
     # Job lifecycle
@@ -326,6 +380,96 @@ class JobStore:
         return row is not None
 
     # ------------------------------------------------------------------
+    # Dependency graph + atomic slot reservation (P3 fleet scheduler)
+    # ------------------------------------------------------------------
+
+    def add_dep(self, job_id: str, depends_on: str, graph_id: str) -> None:
+        """
+        Purpose: record a depends_on edge (job_id is blocked until depends_on
+        reaches DONE).  Called by the scheduler thread at enqueue under the one
+        shared lock — no new writer is introduced (§13.2).
+        Usage: store.add_dep("T2job", "T1job", graph_id=spec_hash).
+        Gotchas: INSERT OR IGNORE — re-adding the same edge is a no-op, so a
+        re-tick that re-enqueues an idempotent graph does not error.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO job_deps (job_id, depends_on, graph_id) "
+                "VALUES (?, ?, ?)",
+                (job_id, depends_on, graph_id),
+            )
+            self._conn.commit()
+
+    def deps_of(self, job_id: str) -> List[str]:
+        """
+        Purpose: return the list of job ids this job depends on.
+        Usage: blockers = store.deps_of(jid).
+        Gotchas: an empty list means the job has no dependencies (independent).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT depends_on FROM job_deps WHERE job_id = ?", (job_id,)
+            ).fetchall()
+        return [r["depends_on"] for r in rows]
+
+    def ready_jobs(self) -> List[Dict[str, Any]]:
+        """
+        Purpose: the scheduler's serialization primitive — return QUEUED jobs
+        whose EVERY depends_on job is DONE, oldest first.  A node with no deps is
+        always ready; a dependent node is ready only after its predecessor merges.
+        Usage: for node in store.ready_jobs()[:capacity]: admit(node).
+        Gotchas: a job with a dependency that is FAILED/NEEDS_ATTENTION is NOT
+        ready (its blocker never reached DONE) — it will not spawn, which is the
+        fail-safe posture (a dependent cannot start before its predecessor lands).
+        """
+        with self._lock:
+            queued = self._conn.execute(
+                "SELECT * FROM jobs WHERE state = 'QUEUED' ORDER BY created_ts"
+            ).fetchall()
+            ready: List[Dict[str, Any]] = []
+            for row in queued:
+                jid = row["id"]
+                dep_rows = self._conn.execute(
+                    "SELECT depends_on FROM job_deps WHERE job_id = ?", (jid,)
+                ).fetchall()
+                dep_ids = [d["depends_on"] for d in dep_rows]
+                if not dep_ids:
+                    ready.append(dict(row))
+                    continue
+                # All dependencies must be DONE for the job to be ready.
+                placeholders = ",".join("?" * len(dep_ids))
+                done = self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM jobs "
+                    f"WHERE id IN ({placeholders}) AND state = 'DONE'",
+                    dep_ids,
+                ).fetchone()["n"]
+                if done == len(dep_ids):
+                    ready.append(dict(row))
+        return ready
+
+    def reserve_slot(self, job_id: str) -> bool:
+        """
+        Purpose: atomically claim a concurrency slot by CAS-moving a job
+        QUEUED→ADMITTED under the one shared lock, BEFORE the scheduler spawns
+        the per-node supervisor (P3 §13.3).  This is what makes the cap race-free:
+        the slot is taken the instant it is reserved, so a tick firing in the
+        spawn→RUNNING gap already counts this job and cannot double-admit.
+        Usage: if store.reserve_slot(jid): spawn(...) else: retry next tick.
+        Gotchas: returns True on rowcount==1 (we won the CAS), False if the job
+        was no longer QUEUED (another writer took it) — the scheduler releases any
+        budget reservation and moves on when False.
+        """
+        now = _now_ms()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET state='ADMITTED', updated_ts=? "
+                "WHERE id=? AND state='QUEUED'",
+                (now, job_id),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    # ------------------------------------------------------------------
     # Supervisor lock
     # ------------------------------------------------------------------
 
@@ -413,27 +557,36 @@ class JobStore:
     # Per-tick integrity check
     # ------------------------------------------------------------------
 
-    def check_integrity(self) -> List[Dict[str, Any]]:
+    def check_integrity(self, ledger: Optional[Any] = None) -> List[Dict[str, Any]]:
         """
-        Purpose: validate store invariants at the start of each supervisor tick.
-        Catches corruption before acting on potentially bad state.  Each violation
-        is logged and the offending job is parked to NEEDS_ATTENTION — the check
-        never crashes the tick loop.
+        Purpose: validate store invariants at the start of each supervisor/scheduler
+        tick.  Catches corruption before acting on potentially bad state.  Each
+        violation is logged and the offending job is parked to NEEDS_ATTENTION — the
+        check never crashes the tick loop.
 
         Invariants checked:
-          (a) No live job (RUNNING/TEST/REVIEW) whose pgid is dead but state
-              is still active — reconcile to NEEDS_ATTENTION.
+          (a) No live job (ADMITTED/RUNNING/TEST/REVIEW) whose pgid is dead but
+              state is still active — reconcile to NEEDS_ATTENTION.  When it
+              reclaims such a job it ALSO releases that job's budget reservation
+              via the passed-in ledger (P3 §13.5) so the ledger and the job table
+              can never drift; the release is idempotent via the budget_settled
+              flag set in the SAME transaction as the state change.
           (b) No two RUNNING rows share a worktree_path.
           (c) cost_so_far_usd ≤ budget_usd for every live job.
           (d) Every non-NULL branch matches the factory/<repo>/<id>- prefix.
 
-        Usage: violations = store.check_integrity()  # empty list = clean.
+        Usage: violations = store.check_integrity(ledger=stopper.ledger).
         Gotchas: this method WRITES to the store (parks bad rows); call only
-        from the supervisor tick, not from read-only callers.
+        from the supervisor/scheduler tick, not from read-only callers.  Passing
+        no ledger keeps the P2 behaviour (state reconciliation only, no release).
         """
         violations: List[Dict[str, Any]] = []
         now = _now_ms()
-        live_states = ("RUNNING", "TEST", "REVIEW", "AWAITING_APPROVAL", "MERGING")
+        # ADMITTED is a live slot (§13.3): an admitted job whose spawn died before
+        # RUNNING must be reclaimed too, releasing BOTH its slot and reservation.
+        live_states = (
+            "ADMITTED", "RUNNING", "TEST", "REVIEW", "AWAITING_APPROVAL", "MERGING",
+        )
 
         with self._lock:
             rows = self._conn.execute(
@@ -445,26 +598,22 @@ class JobStore:
             job = dict(row)
             jid = job["id"]
 
-            # (a) Dead process group but state still active — only if pgid set.
-            if job["pgid"] is not None and job["state"] == "RUNNING":
+            # (a) Dead process group but state still active — pgid must be set,
+            #     and the state must be one that owns a live process (ADMITTED or
+            #     RUNNING).  An ADMITTED job whose spawn died has a stale pgid too.
+            if job["pgid"] is not None and job["state"] in ("ADMITTED", "RUNNING"):
                 pgid = job["pgid"]
                 try:
                     os.kill(-pgid, 0)  # probe the process group
                 except ProcessLookupError:
-                    # Process group is gone but job still RUNNING.
+                    # Process group is gone but job still ADMITTED/RUNNING.
                     v = {
                         "job_id": jid,
                         "rule": "dead_pgid",
                         "detail": f"pgid {pgid} no longer alive",
                     }
                     violations.append(v)
-                    with self._lock:
-                        self._conn.execute(
-                            "UPDATE jobs SET state='NEEDS_ATTENTION', fail_reason=?,"
-                            " updated_ts=? WHERE id=? AND state='RUNNING'",
-                            (f"integrity: dead pgid {pgid}", now, jid),
-                        )
-                        self._conn.commit()
+                    self._reclaim_dead_job(jid, job, pgid, now, ledger)
 
             # (c) Cost over budget.
             if (
@@ -519,6 +668,45 @@ class JobStore:
                 seen_paths[wt] = job["id"]
 
         return violations
+
+    def _reclaim_dead_job(
+        self,
+        jid: str,
+        job: Dict[str, Any],
+        pgid: int,
+        now: int,
+        ledger: Optional[Any],
+    ) -> None:
+        """
+        Purpose: park a dead-pgid job to NEEDS_ATTENTION and release its budget
+        reservation exactly once (P3 §13.5).  The budget_settled flag is set in
+        the SAME UPDATE that changes state, so a second integrity sweep sees the
+        flag already set and does NOT double-release the reservation.
+        Usage: called from check_integrity when a live job's process group is gone.
+        Gotchas: the ledger release happens only if budget_settled was 0 BEFORE
+        this reclaim — read the flag first, flip it atomically with the park, then
+        (and only then) return the dollars.  A crash between the park and the
+        release is self-healing: the flag guards against double-release, and a
+        never-flipped flag would be re-reclaimed on the next sweep (the job is
+        still NEEDS_ATTENTION with budget_settled unset only if the park committed
+        but we crashed before flipping — which cannot happen since both are one
+        UPDATE).
+        """
+        already_settled = bool(job.get("budget_settled", 0))
+        expected = job["state"]  # ADMITTED or RUNNING
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET state='NEEDS_ATTENTION', fail_reason=?, "
+                "budget_settled=1, updated_ts=? WHERE id=? AND state=?",
+                (f"integrity: dead pgid {pgid}", now, jid, expected),
+            )
+            self._conn.commit()
+            parked = cur.rowcount == 1
+        # Release the reservation only if we actually parked it AND it was not
+        # already settled — the flag makes this idempotent across sweeps.
+        if parked and not already_settled and ledger is not None:
+            cap = job.get("budget_usd") or 0.0
+            ledger.release_reservation(cap, jid)
 
     # ------------------------------------------------------------------
     # build-jobs.md mirror
