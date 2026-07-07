@@ -53,16 +53,34 @@ logger = logging.getLogger(__name__)
 # Nightly spending ceiling (USD). This matches the owner parameter in the design.
 _DEFAULT_CEILING_USD = 5.0
 
+# OpenRouter third-party sub-ceiling (USD/day). Owner parameter: OpenRouter ≤$2/day.
+# Enforced as a per-provider row under the same nightly ceiling (design §R2, F6).
+_DEFAULT_OPENROUTER_CEILING_USD = 2.0
+
+# The provider-row keys (composite-PK migration, design §R2). '__nightly__' is the
+# $5 ceiling row (back-compat: pre-migration single-PK rows carry this default);
+# 'openrouter' is the ≤$2 sub-ceiling row.
+_NIGHTLY_PROVIDER = "__nightly__"
+_OPENROUTER_PROVIDER = "openrouter"
+
 # Grace window between SIGTERM and SIGKILL escalation (seconds).
 _KILL_GRACE_S = 5.0
 
 # Schema for the daily_budget table (also declared in job_store.py so the
 # supervisor DB already carries it; CREATE IF NOT EXISTS is idempotent).
+#
+# Composite-PK migration (design §R2, review F6): the $2 OpenRouter sub-ceiling
+# needs its own row per day, so the PK is (day, provider) — NOT day alone. The
+# nightly $5 ceiling lives in provider='__nightly__'; OpenRouter in 'openrouter'.
+# One table, one connection, one write lock → both CASes commit under a single
+# BEGIN IMMEDIATE (no cross-ledger TOCTOU).
 _BUDGET_SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_budget (
-  day              TEXT PRIMARY KEY,   -- YYYY-MM-DD UTC
+  day              TEXT NOT NULL,                        -- YYYY-MM-DD UTC
+  provider         TEXT NOT NULL DEFAULT '__nightly__',  -- '__nightly__' | 'openrouter'
   spent_today_usd  REAL NOT NULL DEFAULT 0,
-  reserved_usd     REAL NOT NULL DEFAULT 0
+  reserved_usd     REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, provider)
 );
 """
 
@@ -223,10 +241,22 @@ class DailyBudgetLedger:
         The ledger row is created lazily on the first try_reserve for the day.
     """
 
-    def __init__(self, db_path: Path, ceiling_usd: float = _DEFAULT_CEILING_USD):
+    def __init__(
+        self,
+        db_path: Path,
+        ceiling_usd: float = _DEFAULT_CEILING_USD,
+        openrouter_ceiling_usd: float = _DEFAULT_OPENROUTER_CEILING_USD,
+    ):
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ceiling_usd = ceiling_usd
+        # Per-provider ceilings: the nightly $5 ceiling and the OpenRouter ≤$2
+        # sub-ceiling. A provider absent from this map has no sub-ceiling of its own
+        # (it is bounded only by the nightly ceiling via the two-CAS).
+        self._provider_ceiling = {
+            _NIGHTLY_PROVIDER: ceiling_usd,
+            _OPENROUTER_PROVIDER: openrouter_ceiling_usd,
+        }
         self._lock = threading.Lock()
         # isolation_level=None → autocommit mode; we manage transactions explicitly
         self._conn = sqlite3.connect(
@@ -238,6 +268,41 @@ class DailyBudgetLedger:
         # P3 §4.7: absorb brief writer contention under fleet concurrency.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(_BUDGET_SCHEMA)
+        self._migrate_provider_column()
+
+    def _migrate_provider_column(self) -> None:
+        """
+        Purpose: bring a pre-migration daily_budget (PK=day, no provider column)
+        forward to the composite-PK (day, provider) schema (design §R2). Existing
+        rows are stamped provider='__nightly__' so the $5 ceiling data survives.
+        Usage: called once from __init__ after the CREATE IF NOT EXISTS.
+        Gotchas: idempotent — if the provider column already exists (fresh DB on the
+        new schema) this is a no-op. SQLite cannot change a PK in place, so a legacy
+        table is rebuilt: add the column, then rebuild with the composite PK.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(daily_budget)").fetchall()
+        }
+        if "provider" in cols:
+            return  # already migrated (fresh schema or a prior run)
+        # Legacy single-PK table: rebuild with the composite PK, stamping the
+        # existing rows as the nightly ceiling.
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("ALTER TABLE daily_budget RENAME TO daily_budget_legacy")
+                self._conn.execute(_BUDGET_SCHEMA)
+                self._conn.execute(
+                    "INSERT INTO daily_budget (day, provider, spent_today_usd, reserved_usd) "
+                    "SELECT day, '__nightly__', spent_today_usd, reserved_usd "
+                    "FROM daily_budget_legacy"
+                )
+                self._conn.execute("DROP TABLE daily_budget_legacy")
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _today_utc(self) -> str:
         """Return current UTC date as YYYY-MM-DD."""
@@ -245,17 +310,46 @@ class DailyBudgetLedger:
 
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
-    def _ensure_row(self, conn: sqlite3.Connection, day: str) -> None:
+    def _ensure_row(
+        self, conn: sqlite3.Connection, day: str, provider: str = _NIGHTLY_PROVIDER
+    ) -> None:
         """
-        Purpose: lazily insert the daily_budget row for `day` if absent.
+        Purpose: lazily insert the daily_budget row for (day, provider) if absent.
         Usage: called inside an already-open BEGIN IMMEDIATE transaction.
         Gotchas: INSERT OR IGNORE is safe; the row already existing is not an error.
+        provider defaults to '__nightly__' so existing single-CAS callers are
+        unchanged; 'openrouter' addresses the sub-ceiling row.
         """
         conn.execute(
-            "INSERT OR IGNORE INTO daily_budget (day, spent_today_usd, reserved_usd) "
-            "VALUES (?, 0, 0)",
-            (day,),
+            "INSERT OR IGNORE INTO daily_budget "
+            "(day, provider, spent_today_usd, reserved_usd) VALUES (?, ?, 0, 0)",
+            (day, provider),
         )
+
+    def _cas_reserve(
+        self, conn: sqlite3.Connection, day: str, provider: str, cap: float
+    ) -> bool:
+        """
+        Purpose: the atomic reserve CAS for ONE (day, provider) row. Increments
+        reserved_usd by cap iff spent+reserved+cap <= that provider's ceiling.
+        Usage: called inside an already-open BEGIN IMMEDIATE transaction (so multiple
+        CASes on different providers commit or roll back together — the two-CAS).
+        Gotchas: returns True iff rowcount==1 (admitted); does NOT commit — the caller
+        owns the surrounding transaction so a false result can roll back sibling CASes.
+        """
+        ceiling = self._provider_ceiling.get(provider, self._ceiling_usd)
+        self._ensure_row(conn, day, provider)
+        cur = conn.execute(
+            """
+            UPDATE daily_budget
+               SET reserved_usd = reserved_usd + :cap
+             WHERE day = :day
+               AND provider = :provider
+               AND spent_today_usd + reserved_usd + :cap <= :ceiling
+            """,
+            {"cap": cap, "day": day, "provider": provider, "ceiling": ceiling},
+        )
+        return cur.rowcount == 1
 
     def try_reserve(
         self,
@@ -284,19 +378,58 @@ class DailyBudgetLedger:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._ensure_row(self._conn, day)
-                cur = self._conn.execute(
-                    """
-                    UPDATE daily_budget
-                       SET reserved_usd = reserved_usd + :cap
-                     WHERE day = :day
-                       AND spent_today_usd + reserved_usd + :cap <= :ceiling
-                    """,
-                    {"cap": job_cap_usd, "day": day, "ceiling": self._ceiling_usd},
+                admitted = self._cas_reserve(
+                    self._conn, day, _NIGHTLY_PROVIDER, job_cap_usd
                 )
-                admitted = cur.rowcount == 1
                 self._conn.execute("COMMIT")
                 return admitted
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def reserve_openrouter(
+        self,
+        job_cap_usd: float,
+        day: Optional[str] = None,
+    ) -> bool:
+        """
+        Two-CAS reserve for an OpenRouter dispatch: both the $5 nightly ceiling AND
+        the $2 sub-ceiling, in ONE transaction on ONE connection (design §R2, F6).
+
+        Purpose: an OpenRouter job must pass BOTH ceilings. Reserving both rows inside
+        a single BEGIN IMMEDIATE means they commit or roll back together — there is no
+        window where the nightly reservation exists without the sub-ceiling one (the
+        cross-ledger TOCTOU the review flagged). Returns True only if BOTH CASes pass.
+
+        Usage: if ledger.reserve_openrouter(cap): dispatch else: WAIT_FOR_CAPACITY
+        Gotchas:
+          * Order: reserve nightly first, then the openrouter sub-ceiling. If EITHER
+            fails, ROLLBACK undoes both — the rollback IS the compensating release,
+            so a rejected reserve never leaves an orphaned nightly reservation.
+          * First-party (claude/codex) dispatches use try_reserve (single nightly CAS)
+            and never touch the openrouter row — the sub-ceiling is orthogonal to them.
+          * Residency: only allow_openrouter:true repos ever call this; a false repo
+            has no OpenRouter spend by construction (the router never emits an OR rung).
+        """
+        if day is None:
+            day = self._today_utc()
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                ok_nightly = self._cas_reserve(
+                    self._conn, day, _NIGHTLY_PROVIDER, job_cap_usd
+                )
+                ok_sub = self._cas_reserve(
+                    self._conn, day, _OPENROUTER_PROVIDER, job_cap_usd
+                )
+                if ok_nightly and ok_sub:
+                    self._conn.execute("COMMIT")
+                    return True
+                # Either ceiling would be breached → undo BOTH rows (the ROLLBACK is
+                # the compensating release; no orphaned nightly reservation remains).
+                self._conn.execute("ROLLBACK")
+                return False
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -306,31 +439,50 @@ class DailyBudgetLedger:
         job_cap_usd: float,
         actual_spend_usd: float,
         day: Optional[str] = None,
+        provider: str = _NIGHTLY_PROVIDER,
     ) -> None:
         """
         Purpose: on job completion, fold actual_spend_usd into spent_today_usd
         and release the cap reservation in one atomic transaction.
         Usage: ledger.commit_spend(job_cap_usd=0.30, actual_spend_usd=0.22)
-        Gotchas: if actual_spend > cap (metering can overshoot at tick granularity),
-        the delta is still recorded; the ceiling becomes slightly softer post-hoc
-        but the pre-launch CAS is the real guard.
+        Gotchas:
+          * if actual_spend > cap (metering can overshoot at tick granularity), the
+            delta is still recorded; the ceiling becomes slightly softer post-hoc but
+            the pre-launch CAS is the real guard.
+          * provider defaults '__nightly__' (existing callers unchanged). For
+            'openrouter' the spend folds into BOTH the openrouter sub-ceiling row AND
+            the nightly row (an OR dispatch reserved both via reserve_openrouter), so
+            the $5 ceiling always reflects total spend including OpenRouter.
         """
         if day is None:
             day = self._today_utc()
 
+        # An OpenRouter spend was reserved on both rows → release/record both.
+        providers = (
+            (_NIGHTLY_PROVIDER, _OPENROUTER_PROVIDER)
+            if provider == _OPENROUTER_PROVIDER
+            else (provider,)
+        )
+
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                self._ensure_row(self._conn, day)
-                self._conn.execute(
-                    """
-                    UPDATE daily_budget
-                       SET spent_today_usd = spent_today_usd + :actual,
-                           reserved_usd    = MAX(0, reserved_usd - :cap)
-                     WHERE day = :day
-                    """,
-                    {"actual": actual_spend_usd, "cap": job_cap_usd, "day": day},
-                )
+                for prov in providers:
+                    self._ensure_row(self._conn, day, prov)
+                    self._conn.execute(
+                        """
+                        UPDATE daily_budget
+                           SET spent_today_usd = spent_today_usd + :actual,
+                               reserved_usd    = MAX(0, reserved_usd - :cap)
+                         WHERE day = :day AND provider = :provider
+                        """,
+                        {
+                            "actual": actual_spend_usd,
+                            "cap": job_cap_usd,
+                            "day": day,
+                            "provider": prov,
+                        },
+                    )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -358,34 +510,49 @@ class DailyBudgetLedger:
         self.commit_spend(job_cap_usd=job_cap_usd, actual_spend_usd=0.0, day=day)
 
     def _seed_for_test(
-        self, day: str, spent: float, reserved: float
+        self, day: str, spent: float, reserved: float,
+        provider: str = _NIGHTLY_PROVIDER,
     ) -> None:
         """
         Purpose: test-only helper — upsert a daily_budget row with known values
         so tests can control the ledger state without going through try_reserve.
         Usage: ledger._seed_for_test(day="2099-01-01", spent=4.80, reserved=0.0)
         Gotchas: do NOT call from production code; this bypasses the CAS guard.
+        provider defaults '__nightly__' so existing tests are unchanged.
         """
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO daily_budget (day, spent_today_usd, reserved_usd) "
-                "VALUES (?, ?, ?)",
-                (day, spent, reserved),
+                "INSERT OR REPLACE INTO daily_budget "
+                "(day, provider, spent_today_usd, reserved_usd) VALUES (?, ?, ?, ?)",
+                (day, provider, spent, reserved),
             )
 
     def _read_day(self, day: str) -> Optional[dict]:
         """
-        Purpose: read the current ledger row for `day`; returns a dict with
-        keys 'spent' and 'reserved', or None if the row doesn't exist.
+        Purpose: read the nightly ledger row for `day`; returns a dict with keys
+        'spent' and 'reserved', or None if the row doesn't exist.
         Usage: row = ledger._read_day("2099-03-01")
-        Gotchas: used by tests and forensic logging; not performance-critical.
+        Gotchas: reads the '__nightly__' provider row (the $5 ceiling) — the total
+        night spend including OpenRouter, since OR spend folds into it too. Use
+        _read_provider(day, 'openrouter') for the sub-ceiling row alone.
+        """
+        return self._read_provider(day, _NIGHTLY_PROVIDER)
+
+    def _read_provider(self, day: str, provider: str) -> dict:
+        """
+        Purpose: read one (day, provider) ledger row; returns {'spent','reserved'},
+        zero-filled when the row does not yet exist (so callers can sum safely).
+        Usage: sub = ledger._read_provider("2099-04-04", "openrouter")
+        Gotchas: unlike _read_day this never returns None — an absent provider row
+        means zero spend/reserved, which is the correct additive identity.
         """
         row = self._conn.execute(
-            "SELECT spent_today_usd, reserved_usd FROM daily_budget WHERE day = ?",
-            (day,),
+            "SELECT spent_today_usd, reserved_usd FROM daily_budget "
+            "WHERE day = ? AND provider = ?",
+            (day, provider),
         ).fetchone()
         if row is None:
-            return None
+            return {"spent": 0.0, "reserved": 0.0}
         return {"spent": row[0], "reserved": row[1]}
 
 

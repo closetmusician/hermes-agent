@@ -33,7 +33,7 @@ from typing import Dict, List, Mapping, Optional
 
 from factory.job_schema import WorkerResultInvalid, parse_worker_output
 from factory.merge_policy import MergePolicy
-from factory.residency_guard import assert_openrouter_allowed
+from factory.residency_guard import THIRD_PARTY_WORKERS, assert_openrouter_allowed
 from factory.worker_env import assert_no_egress, scrub_env
 from worker.base import WorkerHandle, WorkerResult, WorkerSpec
 from worker.local_subprocess import LocalSubprocessWorker
@@ -49,9 +49,15 @@ _FORBIDDEN_ARGV_SUBSTRINGS = (
 )
 
 # Provider → the model *_API_KEY name the worker carries (inference-only).
+# P4-b enables the OpenRouter overflow tier, so 'openrouter' is mapped here. This
+# REMOVES the third *accidental* wall the P3-review P0-1 relied on (a missing key
+# made .get("openrouter")→None). To compensate, build_worker_env keeps an EXPLICIT
+# wall-3 check (design §13 F7): no OpenRouter key is placed unless the policy permits
+# it — belt-and-suspenders behind the unconditional residency guard at :362.
 _PROVIDER_MODEL_KEY = {
     "claude": "ANTHROPIC_API_KEY",
     "codex": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
 }
 
 # Default least-privilege tool allowlist for the claude worker. No shell-general
@@ -362,6 +368,18 @@ class WorkerRunner:
         assert_openrouter_allowed(run_spec.repo, run_spec.worker, run_spec.policy)
 
         model_key_name = _PROVIDER_MODEL_KEY.get(run_spec.worker)
+
+        # WALL-3 (design §13 F7) — explicit key-injection guard that replaces the
+        # accidental "no openrouter entry" wall now that _PROVIDER_MODEL_KEY maps it.
+        # A third-party (OpenRouter) key is placed ONLY when the policy permits it.
+        # This is redundant with the guard above (which already raised for a false
+        # repo) — deliberately so: it makes the "no OR key unless policy true"
+        # invariant explicit at the injection site rather than relying on the accident.
+        if run_spec.worker in THIRD_PARTY_WORKERS and not (
+            run_spec.policy is not None and run_spec.policy.allow_openrouter
+        ):
+            model_key_name = None
+
         model_env: Optional[Mapping[str, str]] = None
         if run_spec.model_key and model_key_name:
             model_env = {model_key_name: run_spec.model_key}
