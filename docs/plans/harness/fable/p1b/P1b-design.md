@@ -219,13 +219,15 @@ safe_lane_json=_tier_safe_lane_json(disposition, origin=f"factory:{job_id}")
 # ... and record tier into jobs.trust_tier_at_spawn on the same enqueue.
 ```
 
-`_tier_safe_lane_json` emits, for `held`, exactly today's `{"disposition":"held","allowed_origins":[]}`; for `auto`, `{"disposition":"auto_sent","allowed_origins":["factory:<job_id>"]}` — i.e. it hands `SafeLane` the one origin it needs to pass C4 (safe_lane.py:96-100). **The auto/hold logic is not re-implemented in the supervisor**; the supervisor only chooses the disposition and the broker's existing SafeLane/HeldStore machinery does the rest. This is "one code path, parameterized by tier" (plan P1b-4) — the merge card is *always* enqueued; tier only sets its disposition.
+> **REVISED by v2 §V2.3.** The original plan here — the *supervisor* computes tier, emits `auto_sent` in the `safe_lane_json`, and the broker trusts it — is the P0-2 hole: it lets the supervisor's own classification release the merge. In v2 the supervisor **never emits `auto_sent`**. It always enqueues the merge **held**, but stamps the card with a *requested tier* + trusted `capability`/`task_type` (advisory only); a separate `auto_merge` request over the socket asks the **broker** to decide. The broker recomputes tier and re-checks the ring server-side before it releases anything. See §V2.
+
+Legacy (pre-v2) framing, retained for context: `_tier_safe_lane_json` emitted, for `held`, `{"disposition":"held","allowed_origins":[]}`; for `auto`, `{"disposition":"auto_sent","allowed_origins":["factory:<job_id>"]}`. This is **no longer the auto path** — SafeLane's `allowed_origins`/C4 widening is a message-oriented lever and is not the trust gate for a `merge` (P1 finding A4). The merge card is *always* enqueued **held**; only the broker's `auto_merge` path (§V2.2) can release it.
 
 ### 4.4 Auto-merge is **not** a bypass of the nonce wall
 
-Critical safety point (and a "what never graduates" invariant, never-graduates.md line "Self-approving a merge"): even a tier-1 auto-merge must **not** let the supervisor mint its own approval — that would recreate the self-approval hole. Design: an `auto_sent` disposition means the **broker** (which holds the secret, approval.py:40-42) mints the nonce and runs the executor on the supervisor's behalf, on the broker side, with a `decided_by="trust:auto"` audit stamp. The supervisor still holds no nonce and still cannot call `approve` with a valid one. Concretely, `auto_sent` merges route to a broker-side auto-approver that: (a) re-checks the disposition it was handed is genuinely `auto_sent` and the tier ≥ 1, (b) re-checks the ring/never-graduates gates server-side (defense-in-depth — never trust the caller's classification), (c) mints + burns a nonce internally, (d) runs the *same* `merge_executor`. Result: auto-merge is "the broker approves it for you," not "the assistant approves itself." The executor, the ring gate, and the nonce mechanism are all unchanged and still on the critical path.
+> **SUPERSEDED by Revision v2 §V2.** The red-team confirmed the two claims below (broker-side re-check; supervisor cannot self-mint) describe behavior that **does not exist in the P2 code** — the auto-approver, the server-side ring re-check, and the "supervisor holds no in-process authority" property were all aspirational. The **binding design** for the auto-merge authority is now §V2 (REQ-01/REQ-02). The intent stated here is correct; §V2 makes it real and grounds every step in a cited seam. Read §V2 for the authoritative auto-merge path.
 
-> This is the single most security-sensitive decision in P1b and is called out for adversarial review: the auto-approver is a **broker** capability, gated by the same secret as human approval, not an assistant capability.
+Critical safety intent (a "what never graduates" invariant, never-graduates.md:24 "Self-approving a merge"): even a tier-1 auto-merge must **not** let the supervisor mint its own approval — that would recreate the self-approval hole. The *shape* is: the **broker** (which holds the secret, approval.py:40-42) is the party that decides + executes an auto-merge; the supervisor only requests it. §V2 specifies exactly how — over the socket, with a broker-side gate that re-runs the ring/never-graduates/tier checks and fails closed.
 
 ---
 
@@ -240,9 +242,12 @@ Critical safety point (and a "what never graduates" invariant, never-graduates.m
 | **P1b-a** (ledger) | `factory/trust_ledger.py` (new); `tests/factory/test_trust_ledger.py` | P2 job store | REQ-01: schema, `record_outcome`, `read_rows`, `trust-ledger.md` mirror writer, `derive_task_type` |
 | **P1b-b** (policy+compute) | `docs/factory/trust-policy.md` (new, ring); `factory/trust_policy.py` (new); `tests/factory/test_trust_policy.py` | P1b-a (row shape) | REQ-02: policy loader, `compute_tier` pure fn + 3 hard gates, ring-membership assertion |
 | **P1b-c** (profiles+decision) | `factory/trust_profile.py` (new); `tests/factory/test_trust_profile.py`; extend `factory/merge_policy.py` `trust:` block + its test | P1b-b | REQ-03: profile ceiling, `merge_disposition`, `repo_class` load |
-| **P1b-d** (gate retrofit + feed wiring) | edit `factory/supervisor.py` (`_enqueue_merge_card`, `approve_merge`, `_park` outcome hook); edit `factory/job_store.py` (`record_terminal_outcome`); broker-side auto-approver; `tests/factory/test_supervisor_trust.py` | P1b-a,b,c; P2-7 merge gate | REQ-03 retrofit + REQ-01 feed + §4.4 auto-approver |
+| **P1b-d** (feed wiring + capability provenance) | edit `factory/supervisor.py` (`approve_merge`/`_park` outcome hook + record trusted `capability`/`task_type` at job creation, §V2.4); edit `factory/job_store.py` (`record_terminal_outcome`); `tests/factory/test_supervisor_trust.py` | P1b-a,b,c; P2-7 merge gate | REQ-01 feed + REQ-03 trusted-classification provenance (§V2.4) |
+| **P1b-e** (broker auto-merge gate) **— BROKER MAINTAINER EDIT** | new `broker/merge_gate.py` (broker-owned ring path-list + `never-graduates` reader + tier recompute, §V2.1); edit `broker/server.py` (new `auto_merge` RPC + fail-closed gate on the `merge` path, §V2.2); edit `broker/executors/merge_executor.py` OR the gate to compute `git diff base...branch` for `check_diff`; `tests/broker/test_auto_merge_gate.py` | P1b-b (policy/tier fn), P1b-c (`merge_disposition`), P2 broker | REQ-01 broker-side re-check + REQ-02 auto-merge-over-socket + no-mint-in-supervisor |
 
-Disjointness: a/b/c each create their own new module + test file (no shared edits). Only **d** edits existing files, and it depends on a/b/c, so it runs last and alone — no two tasks edit the same file concurrently.
+Disjointness: a/b/c each create their own new module + test file (no shared edits). **d** edits existing `factory/` files; **e** edits `broker/` files. d and e touch disjoint packages (factory vs broker) so they can run in parallel; both depend on a/b/c. **e is a broker-maintainer change** — it edits the enforcement boundary (`broker/`, a ring path itself) and must be authored by a maintainer, never a factory worker (immutable-ring boundary, server.py:5-7). No two tasks edit the same file concurrently.
+
+**Why the gate lives in the broker, not by importing `factory.immutable_ring`** (REQ-01 `escalate_if`): the broker currently imports **nothing** from `factory/` (verified — `grep 'from factory' broker/` = 0 hits). The dependency runs factory→broker, never the reverse; the broker is the lower, credential-holding trust root. Importing `factory.immutable_ring` into the broker would (a) invert that layering and (b) make the broker's own security depend on worker-guard code that lives *outside* the broker's ring boundary. **Resolution:** the broker owns its own ring path-list in `broker/merge_gate.py` (a small verbatim copy of the ring path tuple + the `never-graduates.md` capability list, both re-read at gate time from the on-disk files the ring already protects). A test asserts `broker/merge_gate.py`'s path list is a **superset** of `factory.immutable_ring.RING_PATHS` (AT-RING-2) so the two can never drift with the broker checking *less*.
 
 ### 5.2 Per-gate RED acceptance tests (each falsifiable; map 1:1 to the P1b exit gate)
 
@@ -254,14 +259,18 @@ Exit gate clauses → tests (all committed RED first, TDD):
 | **AT-GRAD-1** | Seed the ledger with **exactly 10** consecutive `merged_clean` rows for `(repoP, feature)`, `repo_class=personal`, spanning a **mocked** `now` ≥30 days after the first, profile `auto-merge-personal-non-prod` → `merge_disposition` returns `("auto", 1)`. With **9** rows → `("held", 0)`. | graduate held→auto after ≥10 |
 | **AT-GRAD-2** | Same 10-clean seed but `now` only 29 days out → still `("held", 0)` (the 30-day wall-clock gate binds; **time is injected**, real gate STAGED). | ≥30-day window |
 | **AT-DEMOTE-1** | Graduated `(repoP, feature)` at tier-1; inject **one** `rejected` row (newest) → next `compute_tier` returns **0** (streak reset = automatic demotion). Same with an injected `reverted` row. | demote on injected bad outcome |
-| **AT-NEVER-1** | At a *fully graduated* tier-1 state, call `merge_disposition` with `capability` ∈ never-graduates (prod-deploy / deletion / financial) → `("held", 0)`. Proves a graduated repo still cannot auto-merge a forbidden capability. | "what never graduates" unbypassable |
+| **AT-NEVER-1** | At a *fully graduated* tier-1 state, drive the **real** `auto_merge` broker path (§V2.2) for a job whose **trusted** `capability` (recorded at job creation, §V2.4) ∈ never-graduates → the broker returns **held**, the merge does **not** execute. Must feed the capability through the trusted job-creation field, NOT a hand-passed arg (closes B5 theater risk). | "what never graduates" unbypassable, server-side |
 | **AT-NEVER-2** | A worker diff that edits `docs/factory/trust-policy.md` (or `never-graduates.md`) is rejected by `immutable_ring.check_diff` → `RingViolation` (reuses P2 gate; asserts P1b's new file is genuinely ring-covered). | ring-protection of the policy |
 | **AT-WORK-1** | `(repoW, feature)` with `repo_class=work` (or a Diligent org prefix) AND 20 `merged_clean` rows over 90 days → `compute_tier` returns **0**. Work repos never graduate regardless of record. | work/Diligent tier-0 regardless |
 | **AT-OTHER-1** | `task_type='other'` (or any non-graduatable) with 20 clean rows → tier **0** (misclassification fails safe). | fail-safe hard gate |
 | **AT-PROFILE-1** | Graduatable tier-1 record under `ask-for-everything` profile → `("held", 0)` (ceiling caps); flip to `auto-merge-personal-non-prod` → `("auto", 1)`. Profile only caps, never lifts. | profile switch changes ceiling |
-| **AT-PATH-1** | The retrofitted `_enqueue_merge_card` still enqueues exactly **one** held-or-auto card via the **same** `HeldStore.enqueue` call for both tier-0 and tier-1 inputs (assert no second/forked enqueue path). | single parameterized path |
-| **AT-NONCE-1** | A tier-1 `auto_sent` merge runs the **same** `merge_executor` under a **broker-minted** nonce; the supervisor, given no nonce, still **cannot** call `approve` successfully (`ApprovalRejected`). Auto-merge ≠ self-approval. | §4.4 safety invariant |
+| **AT-PATH-1** | `_enqueue_merge_card` enqueues exactly **one** card via the **same** `HeldStore.enqueue` call, always `state="held"`, for both tier-0 and tier-1 inputs (v2: the supervisor no longer emits `auto_sent`; release is a *separate* broker `auto_merge` request, not a forked enqueue). Assert no second/forked enqueue path and no `auto_sent` in the emitted `safe_lane_json`. | single parameterized path (v2: held-only enqueue) |
+| **AT-NONCE-1** | Drive the real `BrokerServer` over a **socketpair** (server.py:181-183 — the real dispatch, not a mock). Assert `mint`/`mint_approval_nonce`/`auto_merge`-self-approve verbs are **not in `_CLIENT_METHODS`** (server.py:28-36) so no client — including a compromised supervisor — can obtain a nonce over the socket. A `_dispatch` frame naming any mint verb returns an error frame. Proves the self-approval wall is the **socket boundary**, not an in-process check. | §V2 no-mint-over-socket |
+| **AT-NOMINT-1** | Construct the **production** `Supervisor` and assert it is built with **no real `ApprovalAuthority`** (the prod factory passes `authority=None` / a request-only `BrokerClient`, §V2.3); assert `getattr(sup, "_authority", None)` cannot `mint_nonce`. A test may inject a fake authority; production must not. Fails RED against today's wiring (supervisor.py:113/:134/:446 hold a real authority). | REQ-02 no-mint-in-supervisor |
+| **AT-BROKER-GATE-1** | **The load-bearing server-side test.** Enqueue a tier-1-eligible `merge` whose **diff touches a ring path** (e.g. edits `broker/x` or `docs/factory/trust-policy.md`); request `auto_merge` over the socket. The broker's `merge_gate` (§V2.1) runs `check_diff` on `git diff base...branch`, finds the ring hit, and returns **held** (falls back to human) — the merge does **not** execute. Fails RED today (no broker-side check exists; the auto path would run the executor blindly). | REQ-01 broker-side re-check, fail-closed |
+| **AT-BROKER-GATE-2** | `auto_merge` request where `merge_gate` recomputes tier from the ledger and gets tier-0 (streak broken since the supervisor's stamp) → **held**. Proves the broker recomputes, never trusts the requested tier on the card. Also: gate unavailable (ledger/policy unreadable) → **held** (fail-closed), asserted. | REQ-01/REQ-03 recompute + fail-closed |
 | **AT-RING-1** | Unit: assert `{"trust-policy.md","docs/factory/trust-policy.md","docs/factory/never-graduates.md"} ⊆ RING_PATHS`. Guards against a refactor silently dropping a policy file from the ring. | ring coverage regression guard |
+| **AT-RING-2** | Unit: assert `broker/merge_gate.py`'s ring path-list ⊇ `factory.immutable_ring.RING_PATHS`. Guards the broker checking *less* than the worker-side gate after a ring-path edit (§V2.1 drift guard). | broker ring-list parity |
 
 All time-dependent tests inject `now`/`outcome_ts` (mockable ms-epoch parameters on `compute_tier` and the ledger writer) — **no test waits real wall-clock**; the real 30-day gate is STAGED (§6).
 
@@ -309,3 +318,102 @@ The synthetic-outcome tests (AT-GRAD/DEMOTE with injected time) satisfy the P1b 
 **Escalations:** (1) no `workflow` table — use a dedicated `trust_ledger` in the jobs DB; (2) no `task_type`/outcome column — derive + record-at-transition; (3) `reverted` has no live producer until P5.4 — column+logic built, injected in tests. All in §7.
 
 **Branch verified:** `factory`. **Output:** `docs/plans/harness/fable/p1b/P1b-design.md`. Zero code/commits made.
+
+---
+
+## Revision v2 — red-team P0 closures
+
+**Why:** `P1b-review.md` (SHIP-WITH-FIXES) found two P0s that make tier-1 auto-merge unsafe as v1 wrote it, plus two P1s. This section is the **binding** design for the auto-merge authority; it supersedes §4.4 and revises §4.3, §5.1, §5.2. Every claim below is re-verified against the `factory` branch (file:line cited; `git rev-parse` = `factory`).
+
+**The two holes, restated in one sentence each.** (P0-1) The "broker re-checks the ring server-side" that v1 §4.4 promised **does not exist** — `check_diff` is called only from `factory/gauntlet.py:339` (worker-side); the broker's `auto_sent` branch (`broker/server.py:277-286`) runs `executor(row)` with **no ring / never-graduates / tier check**. (P0-2) The supervisor is handed a **live in-process `ApprovalAuthority`** (constructor param `factory/supervisor.py:113`, stored `:134`, `self._authority.approve(...)` in-process `:446`) built with the real `broker_secret`; that object also exposes `mint_nonce()` (`broker/approval.py:48`) — **any holder can self-mint + self-approve**. The nonce wall only holds across the **socket** (`_CLIENT_METHODS` = `{health, enqueue_action, list_pending, approve, reject, resolve_model_key}`, `server.py:28-36`; `mint_approval_nonce` is explicitly *not* an RPC, `server.py:342-350`).
+
+### V2.1 — REQ-01: the broker-side auto-merge gate (`broker/merge_gate.py`)
+
+A **new broker-owned module** `broker/merge_gate.py`. It is the server-side wall v1 only claimed. It exposes one pure-ish function:
+
+```
+def evaluate_auto_merge(row, *, ledger_reader, policy, trusted_capability, trusted_task_type,
+                        repo_class, git_runner, now_ms) -> ("auto"|"held", tier, reason):
+    # Runs INSIDE the broker process, over the merge card the supervisor enqueued.
+    # 1. RING RE-CHECK (the P0-1 fix). Compute the diff the merge would land:
+    #       diff = git_runner(["diff", f"{base}...{branch}"], worktree)   # card.base, card.branch, card.worktree
+    #    then check_ring(diff, worktree_root=worktree)  # broker-owned copy, §V2.1 note
+    #    → on RingViolation OR on ANY error/unavailability → return ("held", 0, "ring") [FAIL CLOSED]
+    # 2. NEVER-GRADUATES RE-CHECK. if trusted_capability in read_never_graduates():  return ("held", 0, "never")
+    # 3. TIER RECOMPUTE from the ledger (never trust a tier stamped on the card):
+    #       t = compute_tier(repo, trusted_task_type, ledger_reader.read_rows(...), now_ms,
+    #                        policy=policy, repo_class=repo_class, capability=trusted_capability)
+    #    if t < 1: return ("held", 0, "tier")
+    # 4. all passed → ("auto", t, "ok")
+```
+
+**Fail-closed is total:** any exception, missing file, unreadable ledger, unparseable diff, or `git diff` failure → `("held", 0, ...)`. The broker never auto-merges on a check it could not run.
+
+**Broker owns its own ring list (REQ-01 `escalate_if` resolution).** The broker imports **nothing** from `factory/` today (`grep 'from factory' broker/*.py broker/executors/*.py` = 0 hits); the layering is factory→broker and must stay that way — the broker is the credential-holding trust root and must not depend on worker-guard code outside its own boundary. So `broker/merge_gate.py` carries a **verbatim copy of the ring path tuple** and its own `check_ring(diff, worktree_root=...)` (a small port of `immutable_ring.check_diff`'s path-canonicalize-and-match logic, `immutable_ring.py:184-258`), plus a reader for `docs/factory/never-graduates.md`. The on-disk policy files are the same ones the ring already protects (they cannot be edited by a worker — `RING_PATHS`, `immutable_ring.py:45-60`). **AT-RING-2** asserts the broker's list ⊇ `factory.immutable_ring.RING_PATHS` so the broker can never silently check *less*.
+
+**Hook point (concrete):** `broker/server.py`. Add an `auto_merge` RPC method `_rpc_auto_merge` and add `"auto_merge"` to `_CLIENT_METHODS` (`server.py:28-36`). It is the ONLY new client verb; it takes an `action_id` (the already-enqueued held merge card) and **no nonce** (the client has none). Its body:
+1. `row = self._store.get(action_id)`; require `row["type"] == "merge"` and `row["state"] == "held"` (else error).
+2. `disp, tier, reason = self._merge_gate.evaluate_auto_merge(row, ...)` — the broker reads the trusted `capability`/`task_type` from the card payload (§V2.4), the ledger (a broker-opened **read-only** connection to the jobs DB path), the pinned policy, and computes the diff via the card's worktree.
+3. If `disp == "auto"`: the **broker** mints+burns a nonce internally (`self._approval.mint_nonce(action_id)` then `self._approval.approve(action_id, nonce, executor=self._executor_for(row))`), `decided_by="trust:auto"`. This reuses the *identical* nonce+executor path as human approval (`_rpc_approve`, `server.py:292-308`) — the mint stays broker-internal, never crosses the socket.
+4. If `disp == "held"`: leave the card held (a human still approves it via the normal Telegram nonce button); return `{"disposition":"held","reason":reason}`.
+
+This closes P0-1: the ring/never-graduates/tier re-check now runs **in the broker, over the diff**, and fails closed. It is a **broker-maintainer edit** (task P1b-e), never worker-authored (`broker/` is itself a ring path, `immutable_ring.py:47`).
+
+### V2.2 — REQ-02: auto-merge is a socket request; the broker decides + executes
+
+The full flow, with the trust boundary marked:
+
+```
+SUPERVISOR (holds NO mint-capable authority in prod)                BROKER (holds broker_secret + tier policy + ring list)
+  1. enqueue merge card, state="held", payload stamps            ─►  HeldStore.enqueue(... state="held")   [unchanged seam]
+     trusted {capability, task_type, requested_tier(advisory)}
+  2. broker_client.auto_merge(action_id)          ── SOCKET ──►   _rpc_auto_merge:
+                                                                     evaluate_auto_merge()  ← ring+never+tier RE-CHECK (V2.1)
+                                                                       held  → stays held (human approves later)
+                                                                       auto  → broker mints+burns nonce INTERNALLY,
+                                                                               runs merge_executor, decided_by="trust:auto"
+  3. ◄── {disposition, tier, reason} ────────────────────────────   (supervisor never saw a nonce)
+```
+
+**The supervisor requests; the broker decides.** The decision (tier + ring + never-graduates) and the execution (nonce mint + executor) both live in the broker, which holds the secret and the policy. The supervisor's only new capability is `BrokerClient.auto_merge(action_id)` — a request verb with **no nonce and no mint**. Add `auto_merge` to `broker_client.py`'s method set (it is a ring path, `immutable_ring.py:46` — maintainer edit) mirroring the existing `approve`/`reject` request stubs.
+
+**Why this is not a bypass:** the executor, the nonce mechanism, and now the ring gate are all on the critical path exactly as for a human approval — the only difference from a human tap is *who* decided (the broker's tier policy vs. the owner's thumb), and that decision is itself gated by the server-side re-check. Auto-merge is "the broker approves it for you after re-verifying," never "the assistant approves itself."
+
+### V2.3 — REQ-02: the supervisor must NOT hold a mint-capable authority in production
+
+Today `Supervisor.__init__` takes `authority: ApprovalAuthority` (`supervisor.py:113`) and calls `self._authority.approve(...)` in-process (`:446`). **This is the self-mint surface** — `approve` and `mint_nonce` sit on the same object. v2 rule:
+
+- **Production wiring:** the factory that constructs the prod `Supervisor` passes **no real `ApprovalAuthority`**. Human approval and auto-merge both route over the socket via `BrokerClient` (`approve` for the human path, `auto_merge` for the trust path). The supervisor's `approve_merge` (`:429`) is rewritten to call `broker_client.approve(action_id, nonce)` — where the *nonce came from the broker's out-of-band Telegram mint*, never from an in-process `mint_nonce`. The supervisor holds no secret and no mint.
+- **Test wiring:** tests MAY inject a fake authority (a stub with a no-op `approve` and no `mint_nonce`, or a socketpair-backed real `BrokerServer`). The prod constructor path must accept `authority=None` and refuse to run the in-process approve branch when it is None (fail-closed: no authority ⇒ must go over the socket).
+- **Guard test AT-NOMINT-1:** assert the production `Supervisor` is constructed without a mint-capable authority; this fails RED against today's `test_supervisor.py:144,162` wiring (which passes a real `ApprovalAuthority(held, broker_secret=...)`).
+
+This closes P0-2: in production the only holder of `mint_nonce` is the broker process; the supervisor can request but never mint.
+
+### V2.4 — REQ-03: merge-specific auto conditions + trusted capability/task-type provenance
+
+**P1-A4 (merge not mapped to safe-lane conditions).** The message-oriented SafeLane conditions (C2 recipient allow-list, C3 2000-char/strategic-marker cap, C5 `irreversible_types`) are **not** the trust gate for a `merge` and must not decide it. Two changes:
+1. The merge card is **always enqueued `held`** (§4.3 revised) — SafeLane never auto-sends a merge. The *only* path that releases a merge without a human is `_rpc_auto_merge` (§V2.2), whose binding condition is the **trust tier** recomputed server-side, not C2/C3/C4/C5.
+2. Add `"merge"` to the broker's `irreversible_types` set (`server.py:57`, currently `{"git_push_force"}`) so that even if some future code widened `allowed_origins`, a `merge` can never auto-send through the *SafeLane* path — it is held-by-default and only the tier-gated `auto_merge` RPC can release it. **Merge joins the held-by-default/irreversible set; only explicit tier-1 auto releases it.**
+
+**P1-B5 (capability/task-type provenance).** `never-graduates` keys off **capability**; if capability were derived from mislabelable worker/spec text, a prod-deploy relabeled "docs" would dodge the gate. v2 rule: **capability and task-type are classified by trusted intake/supervisor code at job creation and recorded on the `jobs` row** (and mirrored onto the merge card payload the broker reads in §V2.1) — never taken from worker output. The worker's return contract stays `{status, branch, summary, test_result}` (no capability field). `derive_task_type` (§2.2) runs in the **supervisor** at job-creation/enqueue time over the *intake spec* (trusted), and the classification is frozen at that point (recorded, immutable thereafter). The broker consumes the recorded value from the card; it does not re-derive from free text. A test (folded into AT-NEVER-1) drives the capability through this trusted field, not a hand-passed arg, so it cannot pass against a stubbed capability.
+
+### V2.5 — Revised task + test summary
+
+- **Tasks (§5.1 revised):** P1b-a/b/c unchanged (new modules). **P1b-d** = factory-side feed wiring + trusted capability/task-type recording at job creation. **P1b-e (NEW, broker-maintainer edit)** = `broker/merge_gate.py` + `broker/server.py` `auto_merge` RPC + `broker_client.py` `auto_merge` verb + the `merge`→`irreversible_types` add. d (factory) and e (broker) are package-disjoint → parallelizable; both depend on a/b/c. **Task count: 5** (a, b, c, d, e).
+- **New/changed RED tests (§5.2 revised):** `AT-NONCE-1` rewritten to drive the **socketpair** and assert no mint verb in `_CLIENT_METHODS`; **AT-NOMINT-1** (prod supervisor has no mint-capable authority); **AT-BROKER-GATE-1** (tier-1 merge whose diff touches the ring is STILL held by the broker's server-side `check_ring` — the load-bearing catch); **AT-BROKER-GATE-2** (broker recomputes tier-0 → held; gate unavailable → held, fail-closed); **AT-NEVER-1** rewritten to drive the real `auto_merge` path with a **trusted** capability; **AT-RING-2** (broker ring-list ⊇ `RING_PATHS`). AT-WORK-1 (work/Diligent tier-0) unchanged and now also asserted server-side via AT-BROKER-GATE-2's recompute. All crown-jewel tests drive the **socket boundary**, not an in-process stub authority.
+
+### V2.6 — Re-verified seams (v2)
+
+| Claim | File:line | Verdict |
+|---|---|---|
+| Broker `auto_sent` branch runs `executor(row)` with no ring/tier/never check | `broker/server.py:277-286` | CONFIRMED — this is the P0-1 gap |
+| `check_diff` called only worker-side | `factory/gauntlet.py:339` (sole caller; `immutable_ring.py:194` is a docstring) | CONFIRMED |
+| Supervisor holds in-process `ApprovalAuthority`, calls `.approve` in-process | `factory/supervisor.py:113` (param), `:134` (store), `:446` (call) | CONFIRMED — P0-2 |
+| `ApprovalAuthority.mint_nonce` exists on the same object as `approve` | `broker/approval.py:48` (mint), `:78` (approve) | CONFIRMED |
+| Socket exposes no mint; `_CLIENT_METHODS` is the wall | `broker/server.py:28-36`; `mint_approval_nonce` not an RPC `:342-350` | CONFIRMED |
+| `irreversible_types` = `{"git_push_force"}` only (merge absent) | `broker/server.py:57` | CONFIRMED — merge must be added (§V2.4) |
+| Broker imports nothing from `factory/` (layering to preserve) | `grep 'from factory' broker/` = 0 | CONFIRMED — broker owns its own ring list |
+| Merge card carries `{repo, branch, base, worktree, remote}` → broker can `git diff base...branch` for the ring re-check | `broker/executors/merge_executor.py` payload fields; `factory/supervisor.py:407-416` card build | CONFIRMED — diff is computable server-side |
+| `HeldStore.enqueue` has no `capability` param → trusted capability rides in the `payload` JSON | `broker/held_store.py:76-115` | CONFIRMED |
+
+**v2 verdict:** the two P0s are closed by moving the auto-merge decision+execution into the broker (`auto_merge` RPC over the socket + `broker/merge_gate.py` server-side re-check, fail-closed), and by forbidding a mint-capable authority in the production supervisor. The two P1s are closed by making the trust tier the sole binding condition for a merge (held-by-default + `merge` ∈ `irreversible_types`) and by sourcing capability/task-type from trusted job-creation code. Task count rises 4→5 (P1b-e is the broker-maintainer edit). Zero code/commits made; design doc only.
