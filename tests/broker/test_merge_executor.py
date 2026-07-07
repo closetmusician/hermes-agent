@@ -348,3 +348,61 @@ def test_ring_touching_diff_rejected_before_merge(tmp_path):
         "--- a/app/x.py\n+++ b/app/x.py\n@@ -1 +1 @@\n-x\n+y\n"
     )
     check_diff(app_diff, worktree_root=str(tmp_path))  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# REQ-01 REGRESSION — checkout failure must NOT produce a false 'merged'.
+#
+# This test demonstrates (RED) the silent-failure bug: if `git checkout <base>`
+# returns non-zero (e.g. base is checked out in the primary worktree, which git
+# refuses), the old executor ignored the rc and fell through to merge+push,
+# returning status='merged' even though HEAD was never on <base>.
+# After the fix (REQ-02) the executor must return needs_attention/error and
+# name the failing step — 'merged' must be unreachable on a failed checkout.
+# ---------------------------------------------------------------------------
+
+def test_checkout_failure_returns_needs_attention_not_merged(tmp_path):
+    """REQ-01 REGRESSION: a failed `git checkout <base>` must NOT produce 'merged'.
+
+    A git runner whose checkout step fails (rc=1) is injected so we can isolate
+    the exact step without a real worktree-lock scenario.  Fetch and rebase
+    succeed; checkout fails; the executor MUST return needs_attention or error
+    rather than silently falling through to a false 'merged'.
+    """
+    # Build a real repo so the card payload is valid.
+    work, _remote = _make_repo(tmp_path, feature_edits={"feature.txt": "x\n"})
+
+    def _failing_checkout_git(args, cwd):
+        """Succeed on everything except `checkout <base>` — that fails."""
+        if args[0] == "checkout" and "--abort" not in args:
+            # Simulate git refusing to checkout base because it is in use elsewhere.
+            result = subprocess.CompletedProcess(
+                args=["git"] + args, returncode=1,
+                stdout="", stderr="fatal: 'main' is already checked out"
+            )
+            return result
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+    executor = build_merge_executor(
+        _dummy_cred, git_runner=_failing_checkout_git, test_runner=_pass_test
+    )
+    row = {"payload": json.dumps(
+        {"repo": "acme", "branch": "feature", "base": "main",
+         "worktree": str(work), "remote": "origin"}
+    )}
+    result = executor(row)
+
+    # After the fix: must NOT be 'merged' — must be needs_attention or error
+    # naming the checkout step.
+    assert result["status"] != "merged", (
+        "BUG REPRODUCED: executor returned 'merged' even though "
+        "'git checkout main' failed — silent false-merge detected"
+    )
+    assert result["status"] in ("needs_attention", "error"), (
+        f"unexpected status {result['status']!r}"
+    )
+    # The reason/error must name the failing command so the caller can triage.
+    detail = str(result.get("reason", "")) + str(result.get("detail", "")) + str(result.get("error", ""))
+    assert "checkout" in detail.lower() or "main" in detail.lower(), (
+        f"result doesn't name the failing step: {result}"
+    )

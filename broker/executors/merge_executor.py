@@ -204,7 +204,22 @@ def build_merge_executor(
             # 4. Merge the rebased branch into the base with --ff-only. After a
             #    clean rebase this fast-forwards; if it cannot ff (someone moved
             #    base underneath us) → needs_attention, still never a force.
-            _git(["checkout", base], worktree)
+            #
+            #    IMPORTANT: check the checkout return code explicitly. git refuses
+            #    `git checkout <base>` when <base> is already checked out in a
+            #    linked worktree (the primary tree), returning rc!=0 with a fatal
+            #    message. If we ignore rc here we proceed to merge+push while HEAD
+            #    is still on the job branch — producing a false 'merged' that never
+            #    moved the protected ref. Any non-zero rc here is needs_attention.
+            checkout = _git(["checkout", base], worktree)
+            if checkout.returncode != 0:
+                return {
+                    "status": "needs_attention",
+                    "reason": "checkout_failed",
+                    "detail": (checkout.stderr or checkout.stdout)[-1000:],
+                    "command": f"git checkout {base}",
+                    "forced": False,
+                }
             merge = _git(["merge", "--ff-only", branch], worktree)
             if merge.returncode != 0:
                 return {
