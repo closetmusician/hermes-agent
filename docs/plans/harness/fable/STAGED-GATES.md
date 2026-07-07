@@ -35,6 +35,25 @@ each step is reversible until step 3.
 
 > Rollback (before SG-P1a-4 is trusted): unset `HERMES_BROKER_ROUTE`/`HERMES_BROKER_EGRESS_STARVE`, move the egress keys back into `~/.hermes/.env`, restart the gateway — the routing gate and starving filter are both no-ops when the flags are unset, so the pre-cutover direct-send path is fully restored.
 
+## From Phase P2 (supervisor — first magic on real hardware)
+
+The P2 SUPERVISOR (`factory/supervisor.py`) drives one job intake→worktree→gauntlet→held
+merge→single approval→merge end to end as plain code (no AI in the loop). The full loop is
+proven in `tests/factory/test_supervisor.py` with the ONLY mock being the worker CLI
+subprocess (`claude -p`/`codex exec`) and the network-push boundary (a local bare "remote").
+The one thing tests cannot substitute is a real worker CLI producing a real feature on the
+live host with a real Telegram approval — that is the honest "first magic" gate below.
+
+| ID | Gate | Why staged | Exact action to flip |
+|---|---|---|---|
+| SG-P2-1 | One real first-magic job merges with a single live approval | Tests mock the worker CLI + network push; a real `claude -p` worker + real repo + real Telegram nonce cannot be exercised in-sandbox | On the live host with the broker running (SG-P1a-2/3 flipped) and a scratch GitHub repo: 1. `hermes` DM `/factory <scratch-repo>: add a hello endpoint` (or add a `factory: <repo>: <spec>` line to `tasks.md`). 2. Confirm ONE job row: `sqlite3 ~/.hermes/factory/jobs.db "select id,state,kind from jobs order by created_ts desc limit 1"`. 3. Watch QUEUED→RUNNING→TEST→REVIEW→AWAITING_APPROVAL via `hermes logs --follow`; a real `claude -p` worker builds the feature in `~/.hermes/factory/worktrees/<id>-*` and commits LOCALLY (no push — its scrubbed env has no `GITHUB_TOKEN`). 4. A held `merge` card arrives on Telegram (diff-stat + test + review findings + [Approve]). 5. Tap Approve ONCE (the only human touch). Confirm the broker merge executor rebases→re-tests→merges→pushes and the scratch repo's `main` advances; the job row → `DONE`. 6. Same run negative checks: exactly one approval was requested between intake and merge; rejecting instead parks the job `NEEDS_ATTENTION` without touching `main`. |
+| SG-P2-2 | Real ring-diff rejection on the live host | Ring gate is unit-proven (neuter→fail); a live worker attempting a `broker/**` edit closes the loop | On the live host: `/factory <scratch-repo>: edit broker/server.py to add a comment`. Confirm the job ends `NEEDS_ATTENTION` with `fail_reason` containing `ring`, and NO `merge` row is ever enqueued (`sqlite3 ~/.hermes/broker/held_actions.db "select type,state from held_actions"`). |
+| SG-P2-3 | Real cost-stop fires on a live over-budget worker | Budget metering off a live token stream (not a stub) is only real on the host | On the live host: `/factory <scratch-repo>: <a deliberately huge task>` with a tiny `budget_usd` (e.g. 0.05). Confirm the worker is killed (SIGTERM→SIGKILL to its pgid), the job ends `FAILED`/`fail_reason=budget`, and `hermes logs` shows `cost stop BUDGET fired`. |
+
+> Prerequisite: SG-P1a-2/3 (broker running + gateway routing) must be flipped first — the
+> merge card and the model-key injection both ride the live broker socket. Until then, the
+> supervisor loop is exercisable only via the mocked-boundary tests (which are green).
+
 ## From later phases
 (appended as each phase completes — P4 3-night flagship, P1b 30-day/10-merge graduation,
 P1c real-meeting prep, etc.)
