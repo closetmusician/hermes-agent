@@ -61,6 +61,10 @@ STATES = frozenset(
         # P4-a (Revision v2 §R1) — additive crash-resume + residency-wait states.
         "RESUMABLE",
         "WAITING_CAPACITY",
+        # P5-d (design §5.1) — drift-watchdog pause; distinguishable from a QA
+        # failure in the morning card.  Forward-only: RUNNING→PAUSED_DRIFT;
+        # PAUSED_DRIFT→{ADMITTED, NEEDS_ATTENTION} when the owner clears it.
+        "PAUSED_DRIFT",
     }
 )
 
@@ -96,10 +100,11 @@ STATES = frozenset(
 # forward exits. Both flow ONLY forward to ADMITTED or the terminal NEEDS_ATTENTION,
 # so the machine stays a DAG toward terminals (bounded by MAX_RESUMES per job).
 _ALLOWED: Dict[str, frozenset] = {
-    "QUEUED": frozenset({"ADMITTED", "RUNNING", "FAILED"}),
-    "ADMITTED": frozenset({"RUNNING", "FAILED", "NEEDS_ATTENTION", "RESUMABLE"}),
+    "QUEUED": frozenset({"ADMITTED", "RUNNING", "FAILED", "PAUSED_DRIFT"}),
+    "ADMITTED": frozenset({"RUNNING", "FAILED", "NEEDS_ATTENTION", "RESUMABLE", "PAUSED_DRIFT"}),
     "RUNNING": frozenset(
-        {"TEST", "FAILED", "NEEDS_ATTENTION", "RESUMABLE", "WAITING_CAPACITY"}
+        {"TEST", "FAILED", "NEEDS_ATTENTION", "RESUMABLE", "WAITING_CAPACITY",
+         "PAUSED_DRIFT"}
     ),
     "TEST": frozenset({"REVIEW", "RUNNING", "NEEDS_ATTENTION", "RESUMABLE"}),
     "REVIEW": frozenset({"AWAITING_APPROVAL", "RUNNING", "NEEDS_ATTENTION", "RESUMABLE"}),
@@ -107,6 +112,9 @@ _ALLOWED: Dict[str, frozenset] = {
     "MERGING": frozenset({"DONE", "NEEDS_ATTENTION"}),
     "RESUMABLE": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
     "WAITING_CAPACITY": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
+    # P5-d: drift-paused jobs can be re-admitted by the owner (cleared) or
+    # escalated to terminal NEEDS_ATTENTION if the drift proves unrecoverable.
+    "PAUSED_DRIFT": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
     "DONE": frozenset(),
     "FAILED": frozenset(),
     "NEEDS_ATTENTION": frozenset(),
