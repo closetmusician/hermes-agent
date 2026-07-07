@@ -132,3 +132,14 @@ class BrokerClient:
 
     def reject(self, action_id: str, *, nonce: Optional[str] = None, reason: Optional[str] = None) -> Dict[str, Any]:
         return self._call("reject", {"action_id": action_id, "nonce": nonce, "reason": reason})
+
+    def resolve_model_key(self, *, provider: str) -> Dict[str, Any]:
+        """
+        Purpose: ask the broker for the model-inference key for the given provider.
+        Usage: result = client.resolve_model_key(provider="anthropic").
+        Gotchas: the broker returns ONLY the key name (and optionally the value for
+        the worker env); it NEVER returns an egress credential (GITHUB_TOKEN etc.).
+        This is the P2-g-maint REQ-03 RPC — used by the supervisor to build the
+        scrubbed worker env without holding credentials itself.
+        """
+        return self._call("resolve_model_key", {"provider": provider})

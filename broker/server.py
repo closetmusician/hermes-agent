@@ -1,31 +1,47 @@
 # ABOUTME: The broker server — a unix-domain-socket JSON-RPC listener that runs
 # ABOUTME: as its own process and owns all egress. Dispatches enqueue_action (runs
 # ABOUTME: the safe-lane, auto-sends or holds), list_pending, approve (nonce-gated
-# ABOUTME: — self-approval-proof), reject, and health. The socket is created 0600,
-# ABOUTME: owner-only, no network listener ever. main() is the __main__ entrypoint
-# ABOUTME: so the broker can run as a separate PID under its own launchd service.
+# ABOUTME: — self-approval-proof), reject, health, and resolve_model_key (REQ-03).
+# ABOUTME: Uses an ExecutorRegistry for by-type dispatch so new action types (merge,
+# ABOUTME: git_push) can be added without editing this file. Maintainer-authored per
+# ABOUTME: P2-g-maint; never produced by a factory worker (immutable-ring boundary).
 from __future__ import annotations
 
 import os
 import socket
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 from broker.approval import ApprovalAuthority, ApprovalRejected
 from broker.credentials import BrokerCredentials
+from broker.executors import ExecutorRegistry, UnknownActionType
 from broker.held_store import HeldStore
 from broker.jsonrpc import decode_frames, encode_error, encode_response
 from broker.safe_lane import SafeLane
 
-# The message executor performs the real send. Injected (P1a-h owns the real one)
-# so the server's routing/safe-lane/approval logic is testable without egress.
-MessageExecutor = Callable[[Dict[str, Any]], Dict[str, Any]]
-
 # Methods the client stub is allowed to call. `send`/`git_push` are internal
 # executor verbs and are deliberately NOT in this set — the assistant has exactly
 # one entry point (enqueue_action), so there is one policy funnel.
-_CLIENT_METHODS = {"health", "enqueue_action", "list_pending", "approve", "reject"}
+# resolve_model_key is read-only: the supervisor uses it to fetch its worker's
+# inference key without the broker handing over egress credentials.
+_CLIENT_METHODS = {
+    "health",
+    "enqueue_action",
+    "list_pending",
+    "approve",
+    "reject",
+    "resolve_model_key",
+}
+
+# Provider → inference key name.  Only *_API_KEY names — no egress credentials.
+# The broker resolves the VALUE from its own env (the only process that holds it).
+_PROVIDER_KEY_MAP: Dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "cohere": "COHERE_API_KEY",
+}
 
 
 def _default_safe_lane() -> SafeLane:
@@ -47,11 +63,13 @@ def _default_safe_lane() -> SafeLane:
 class BrokerServer:
     """
     Purpose: the credential-holding broker process — sole egress path.
-    Usage: BrokerServer(socket_path, db_path, credentials, message_executor).serve_forever().
+    Usage: BrokerServer(socket_path, db_path, credentials, executors={...}).serve_forever().
     Gotchas: single accept loop, one worker thread per connection; the socket is
     unlinked+recreated 0600 on bind. approve is nonce-gated by ApprovalAuthority —
     a client cannot self-approve. serve_forever blocks; run it in a thread or as a
     process. shutdown() stops the loop and removes the socket.
+    The executors dict maps action-type strings to their executor callables; unknown
+    types are rejected fail-closed (never dispatched to a wrong executor).
     """
 
     def __init__(
@@ -60,17 +78,38 @@ class BrokerServer:
         socket_path: Path,
         db_path: Path,
         credentials: BrokerCredentials,
-        message_executor: MessageExecutor,
+        executors: Dict[str, Any],
         safe_lane: Optional[SafeLane] = None,
     ):
+        """
+        Purpose: wire the server with a per-type executor registry.
+        Usage: BrokerServer(socket_path=..., db_path=..., credentials=...,
+               executors={"message": msg_exec, "git_push": push_exec}).
+        Gotchas: `executors` is the authoritative type→callable map; passing an
+        unknown action type through enqueue+approve fails closed (UnknownActionType
+        surfaced as a JSON-RPC error).  The old `message_executor=` kwarg is gone —
+        callers must use `executors={"message": ...}` (P2-g-maint clean break).
+        """
         self._socket_path = Path(socket_path)
         self._store = HeldStore(db_path)
         self._creds = credentials
-        self._executor = message_executor
+        self._registry = ExecutorRegistry(executors)
         self._safe_lane = safe_lane or _default_safe_lane()
         self._approval = ApprovalAuthority(self._store, credentials.broker_secret())
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
+
+    def _executor_for(self, row: Dict[str, Any]) -> Any:
+        """
+        Purpose: resolve the executor for the given held-action row by its type.
+        Usage: internal — called in enqueue (auto_sent path) and approve paths.
+        Gotchas: raises UnknownActionType if the row's type has no registered executor;
+        this is the fail-closed guarantee — an unrecognised type never runs a wrong
+        executor.  The exception propagates up to _dispatch() which encodes it as an
+        error frame so the client sees an explicit failure.
+        """
+        action_type = row.get("type") or ""
+        return self._registry.get(action_type)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -182,6 +221,8 @@ class BrokerServer:
         Gotchas: only _CLIENT_METHODS are reachable over the socket; unknown or
         internal-only verbs return a method-not-found error. ApprovalRejected is
         surfaced as an error frame so the assistant's self-approve attempt fails loud.
+        UnknownActionType is surfaced as an error frame so callers see a clear
+        failure when they supply an unregistered action type.
         """
         req_id = frame.get("id")
         method = frame.get("method")
@@ -194,6 +235,8 @@ class BrokerServer:
             return encode_response(result, req_id)
         except ApprovalRejected as exc:
             return encode_error(-32001, f"approval rejected: {exc}", req_id)
+        except UnknownActionType as exc:
+            return encode_error(-32002, f"unknown executor type: {exc}", req_id)
         except Exception as exc:  # defensive: never leak a stack over the socket
             return encode_error(-32000, str(exc), req_id)
 
@@ -210,6 +253,8 @@ class BrokerServer:
         Gotchas: the row is committed BEFORE this returns (commit-before-ack). On
         auto_sent the executor runs and the row is recorded executed; on held the
         row waits for a nonce-gated approve. This is the assistant's ONLY egress verb.
+        Fail-closed: if the action type has no registered executor on the auto_sent
+        path, UnknownActionType is raised — surfaced as error -32002.
         """
         action = {
             "type": params.get("type"),
@@ -231,10 +276,11 @@ class BrokerServer:
         )
         if decision.disposition == "auto_sent":
             row = self._store.get(aid)
+            executor = self._executor_for(row)
             self._store.transition(aid, "held", "approved", decided_by="safe_lane")
             import json
 
-            result = self._executor(row)
+            result = executor(row)
             self._store.record_result(aid, json.dumps(result, default=str))
             self._store.transition(aid, "approved", "executed", decided_by="safe_lane")
             return {"action_id": aid, "disposition": "auto_sent"}
@@ -249,15 +295,47 @@ class BrokerServer:
         Usage: (gateway Telegram-callback) client.approve(action_id, nonce).
         Gotchas: a call without a valid broker-minted nonce raises ApprovalRejected
         → error frame → the assistant cannot self-approve. Idempotent by action_id.
+        The executor is resolved from the registry at approval time (by row type),
+        not stored at enqueue time, so future executor changes take effect immediately.
         """
         aid = params.get("action_id")
         nonce = params.get("nonce")
-        result = self._approval.approve(aid, nonce, executor=self._executor)
+        row = self._store.get(aid)
+        if row is None:
+            raise ApprovalRejected(f"unknown action {aid}")
+        executor = self._executor_for(row)
+        result = self._approval.approve(aid, nonce, executor=executor)
         return {"status": "executed", "result": result}
 
     def _rpc_reject(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._approval.reject(params.get("action_id"), reason=params.get("reason"))
         return {"status": "rejected"}
+
+    def _rpc_resolve_model_key(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Purpose: return the inference key name (and value) for the given provider.
+        Usage: client.resolve_model_key(provider="anthropic") — used by the supervisor
+        to build the scrubbed worker env (§2.3(A) P2-g-maint REQ-03).
+        Gotchas: the broker is the SOLE credential holder.  This RPC returns ONLY
+        a model-inference key (*_API_KEY) — it NEVER returns an egress credential
+        (GITHUB_TOKEN, GH_TOKEN, TELEGRAM_BOT_TOKEN, etc.).  If the broker process
+        does not have the key in its env, it returns None for the value so the caller
+        can fail-closed rather than launching a worker with no model key.
+        The key_name is always returned so the caller can name the env var correctly
+        even when the value is absent.
+        """
+        provider = (params.get("provider") or "").lower()
+        key_name = _PROVIDER_KEY_MAP.get(provider)
+        if key_name is None:
+            # Unknown provider — fail with a clear message rather than silently
+            # returning None.  The caller should use a known provider name.
+            raise ValueError(
+                f"unknown provider {provider!r}; known: {sorted(_PROVIDER_KEY_MAP)}"
+            )
+        # Read the value from the broker's own env.  The broker process is the sole
+        # holder of credentials; the supervisor calling this RPC has no direct access.
+        value = os.environ.get(key_name)
+        return {"key_name": key_name, "value": value}
 
     # -- broker-side only (never over the client socket) --------------------
 
@@ -283,17 +361,22 @@ def main() -> None:
     home = Path(os.path.expanduser("~/.hermes/broker"))
 
     creds = BrokerCredentials(secret_dir=home)
-    # P1a-h wires the REAL message executor here: the broker process holds the
-    # egress tokens (relocated out of the assistant env by the starving mechanism),
-    # so the send engine it invokes actually delivers. This is the only place a
-    # real message send happens after the cutover.
+    # P1a-h wires the REAL executors here: the broker process holds the egress tokens
+    # (relocated out of the assistant env by the starving mechanism), so the send and
+    # push engines actually deliver.  This is the only place real egress happens.
+    from broker.executors.git_push_executor import build_git_push_executor
+    from broker.executors.merge_executor import build_merge_executor
     from broker.executors.message_executor import build_message_executor
 
     server = BrokerServer(
         socket_path=home / "broker.sock",
         db_path=home / "held_actions.db",
         credentials=creds,
-        message_executor=build_message_executor(creds.egress_cred),
+        executors={
+            "message": build_message_executor(creds.egress_cred),
+            "git_push": build_git_push_executor(creds.egress_cred),
+            "merge": build_merge_executor(),
+        },
     )
     server.serve_forever()
 

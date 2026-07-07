@@ -49,7 +49,7 @@ def broker(tmp_path):
         socket_path=tmp_path / "broker.sock",
         db_path=tmp_path / "held_actions.db",
         credentials=creds,
-        message_executor=lambda row: executed.append(row["action_id"]) or {"status": "sent"},
+        executors={"message": lambda row: executed.append(row["action_id"]) or {"status": "sent"}},
     )
     return server, executed
 
@@ -79,7 +79,7 @@ def test_socket_mode_is_0600(tmp_path):
         socket_path=tmp_path / "broker.sock",
         db_path=tmp_path / "held_actions.db",
         credentials=creds,
-        message_executor=lambda row: {"status": "sent"},
+        executors={"message": lambda row: {"status": "sent"}},
     )
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
