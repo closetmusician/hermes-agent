@@ -110,7 +110,8 @@ class Supervisor:
         repo_root: str,
         worktrees_root: str,
         held_store: HeldStore,
-        authority: ApprovalAuthority,
+        authority: Optional[ApprovalAuthority] = None,
+        broker_client: Optional[Any] = None,
         merge_executor: Callable[[Dict[str, Any]], Dict[str, Any]],
         worker_impl: Any = None,
         git_env: Optional[Dict[str, str]] = None,
@@ -120,18 +121,30 @@ class Supervisor:
     ) -> None:
         """
         Purpose: wire the (already-built) pieces the supervisor drives.
-        Usage: see the class docstring.
+        Usage: see the class docstring. In PRODUCTION use build_production_supervisor
+        (authority=None + a request-only BrokerClient); the direct constructor with a
+        real ``authority`` is the TEST path only.
         Gotchas: worker_impl is the worker CLI backend (a stub at the subprocess
         boundary in tests; the real ReplacementEnvWorker in production). merge_executor
-        is the broker's real merge executor — approve_merge runs it via the nonce-gated
-        ApprovalAuthority. test_verdict/codex_review are the gauntlet's injectable
-        stage functions (real suite / codex CLI in production).
+        is the broker's real merge executor — used only by the in-process TEST path.
+        NO-MINT (design §V2.3, review P0-2): in production ``authority`` is None and the
+        supervisor holds NO mint-capable object. approve_merge then routes the human
+        approval over the socket via ``broker_client.approve(action_id, nonce)`` — the
+        nonce came from the broker's out-of-band Telegram mint, never an in-process
+        mint. The supervisor can request auto-merge (request_auto_merge) but can never
+        mint or self-approve. A test MAY inject a fake ``authority`` to exercise the
+        legacy in-process path; production must not.
+        test_verdict/codex_review are the gauntlet's injectable stage functions.
         """
         self._store = store
         self._repo_root = repo_root
         self._worktrees_root = worktrees_root
         self._held = held_store
+        # NO-MINT: authority is None in production (the supervisor holds no secret and
+        # no mint). The broker_client is the request-only socket path (approve /
+        # auto_merge carry no mint capability).
         self._authority = authority
+        self._broker_client = broker_client
         self._merge_executor = merge_executor
         self._git_env = git_env
 
@@ -430,22 +443,34 @@ class Supervisor:
         """
         Approve the held merge with a broker-minted nonce → run the merge → DONE.
 
-        Purpose: the ONLY human touch in the happy path. The nonce-gated
-        ApprovalAuthority runs the real broker merge executor (rebase → re-test →
-        merge → push under a per-repo lock). On a merged result the job → DONE; a
-        conflict / re-test fail from the executor → NEEDS_ATTENTION (never forced).
-        Usage: sup.approve_merge(job_id, action_id, nonce=authority.mint_nonce(action_id)).
+        Purpose: the ONLY human touch in the happy path. In PRODUCTION the approval
+        routes over the socket via broker_client.approve(action_id, nonce) — the broker
+        (which holds the secret) validates the nonce and runs the merge executor; the
+        supervisor holds NO mint (design §V2.3, review P0-2). In the TEST path a fake
+        in-process ApprovalAuthority may be injected instead. On a merged result the
+        job → DONE; a conflict / re-test fail → NEEDS_ATTENTION (never forced).
+        Usage: sup.approve_merge(job_id, action_id, nonce=<broker-minted nonce>).
         Gotchas:
-          * WITHOUT a valid nonce, ApprovalAuthority.approve raises ApprovalRejected —
-            the merge never runs and the remote never moves (the self-approval wall).
-          * The supervisor passes the merge executor to the authority; it does not
-            merge itself and holds no nonce.
+          * WITHOUT a valid nonce the broker rejects — the merge never runs and the
+            remote never moves (the self-approval wall lives in the broker).
+          * FAIL-CLOSED: a production supervisor (authority=None) with NO broker_client
+            cannot approve at all — it raises rather than silently merging.
         """
-        # The nonce wall lives in ApprovalAuthority.approve — an invalid/missing nonce
-        # raises ApprovalRejected here, before the executor ever runs.
-        result = self._authority.approve(
-            action_id, nonce, executor=self._merge_executor
-        )
+        # NO-MINT routing: production has no in-process authority → go over the socket.
+        # The broker validates the nonce and runs the executor; the supervisor never
+        # holds a mint. A test may inject a fake authority to take the legacy path.
+        if self._authority is not None:
+            result = self._authority.approve(
+                action_id, nonce, executor=self._merge_executor
+            )
+        elif self._broker_client is not None:
+            result = self._broker_client.approve(action_id, nonce=nonce)
+        else:
+            # Fail-closed: no authority and no broker client ⇒ no way to approve.
+            raise RuntimeError(
+                "approve_merge: no ApprovalAuthority and no broker_client — "
+                "the supervisor cannot approve a merge (fail-closed no-mint posture)"
+            )
 
         if result.get("status") == "merged":
             self._store.transition(job_id, "AWAITING_APPROVAL", "MERGING")
@@ -455,6 +480,30 @@ class Supervisor:
             reason = result.get("reason") or result.get("status") or "merge_failed"
             self._park(job_id, "AWAITING_APPROVAL", f"merge: {reason}")
         return result
+
+    def request_auto_merge(self, action_id: str) -> Dict[str, Any]:
+        """
+        Request a tier-1 auto-merge of a held merge card — the supervisor NEVER mints.
+
+        Purpose: the trust-path release (design §V2.2). The supervisor only REQUESTS;
+        the broker decides + executes. It sends broker_client.auto_merge(action_id) —
+        a no-nonce request verb. The broker re-runs its own server-side gate (ring +
+        never-graduates + tier recompute over the diff, fail-closed) and, only on
+        AUTO-OK, mints+burns a nonce INTERNALLY and runs the merge. The supervisor
+        holds no secret, no mint, and cannot self-approve.
+        Usage: res = sup.request_auto_merge(action_id)  # {'disposition':'auto'|'held',…}
+        Gotchas:
+          * FAIL-CLOSED: no broker_client ⇒ the supervisor cannot request auto-merge
+            (raises) — it never falls back to an in-process approve.
+          * a 'held' result means the broker declined; the card still awaits a human
+            tap (the normal nonce-gated approval). The supervisor does not retry-mint.
+        """
+        if self._broker_client is None:
+            raise RuntimeError(
+                "request_auto_merge: no broker_client — the supervisor cannot request "
+                "an auto-merge (it holds no mint and there is no socket path)"
+            )
+        return self._broker_client.auto_merge(action_id)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -524,3 +573,52 @@ class Supervisor:
         words = re.sub(r"[^a-z0-9]+", "-", (spec_text or "").lower()).strip("-")
         slug = "-".join(words.split("-")[:4])
         return slug or "job"
+
+
+def build_production_supervisor(
+    *,
+    store: JobStore,
+    repo_root: str,
+    worktrees_root: str,
+    held_store: HeldStore,
+    broker_client: Any,
+    merge_executor: Callable[[Dict[str, Any]], Dict[str, Any]],
+    worker_impl: Any = None,
+    git_env: Optional[Dict[str, str]] = None,
+    test_verdict: Optional[Callable[[str], str]] = None,
+    codex_review: Optional[Callable[[str, str], List[str]]] = None,
+    fix_worker: Optional[Callable[[str, str, str], None]] = None,
+) -> "Supervisor":
+    """
+    Construct the PRODUCTION supervisor with NO mint-capable authority (design §V2.3).
+
+    Purpose: the only sanctioned way to build a prod Supervisor — it passes
+    authority=None so the supervisor holds no ApprovalAuthority, no broker secret,
+    and no mint. Human approval and tier-1 auto-merge both route over the socket via
+    the request-only ``broker_client`` (approve carries a broker-minted nonce from
+    Telegram; auto_merge carries no nonce and the broker gates it server-side). This
+    closes review P0-2: in production the ONLY holder of mint_nonce is the broker
+    process.
+    Usage:
+        sup = build_production_supervisor(store=..., repo_root=..., worktrees_root=...,
+                  held_store=..., broker_client=BrokerClient(sock), merge_executor=...)
+    Gotchas:
+      * NEVER pass an ApprovalAuthority here — that reopens the self-mint hole. The
+        direct Supervisor(...) constructor with a real authority is the TEST path only.
+      * broker_client is REQUIRED — without it the supervisor cannot approve or
+        request an auto-merge (fail-closed), which is the intended prod posture.
+    """
+    return Supervisor(
+        store=store,
+        repo_root=repo_root,
+        worktrees_root=worktrees_root,
+        held_store=held_store,
+        authority=None,  # NO-MINT: production holds no mint-capable authority.
+        broker_client=broker_client,
+        merge_executor=merge_executor,
+        worker_impl=worker_impl,
+        git_env=git_env,
+        test_verdict=test_verdict,
+        codex_review=codex_review,
+        fix_worker=fix_worker,
+    )

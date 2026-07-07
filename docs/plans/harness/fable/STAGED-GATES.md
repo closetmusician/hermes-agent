@@ -54,6 +54,26 @@ live host with a real Telegram approval — that is the honest "first magic" gat
 > merge card and the model-key injection both ride the live broker socket. Until then, the
 > supervisor loop is exercisable only via the mocked-boundary tests (which are green).
 
+## From Phase P1b-d (tier-1 auto-merge wiring)
+
+The composition root (`factory/broker_launch.py`) injects the REAL factory `compute_tier` +
+trust-ledger reader + owner-profile ceiling into the broker's `MergeGate`; the production
+supervisor holds NO mint authority and REQUESTS auto-merge over the socket
+(`BrokerClient.auto_merge`). The full path — graduated clean job auto-merges without a human,
+ring-touching/tier-0 jobs stay held server-side — is proven over a real socketpair in
+`tests/factory/test_broker_launch.py` (+ the no-mint contract in
+`tests/factory/test_supervisor_trust.py`). The one thing tests cannot substitute is a REAL
+graduated repo with a live worker producing a real diff that the broker auto-merges with NO
+human tap — that is the honest gate below.
+
+| ID | Gate | Why staged | Exact action to flip |
+|---|---|---|---|
+| SG-P1b-3 | A real graduated (repo×task-type) auto-merges with NO human tap on the live host | Auto-merge is unit+socket-proven with injected diff/ledger; a real graduated repo + live worker diff + broker-internal nonce mint can only be exercised on the host after SG-P1b-1 (30-day/10-clean record) is real | Prereq: SG-P1a-2/3 (broker+gateway live), SG-P2-1 (first-magic loop works), and SG-P1b-1 (a real `(repo,task_type)` has ≥10 consecutive `merged_clean` / 0 reverts / ≥30 days in `~/.hermes/factory/jobs.db` trust_ledger). 1. Set the owner profile: `echo auto-merge-personal-non-prod > ~/.hermes/factory/trust-profile.txt`. 2. Wire the prod supervisor with `build_production_supervisor(..., broker_client=BrokerClient(sock))` and construct the broker with `merge_gate=build_merge_gate(ledger=TrustLedger(jobs.db), repo_class_for=<classify>, profile=load_trust_profile())`. 3. `/factory <graduated-personal-repo>: <a clean feature of the graduated task-type>`. 4. Watch the loop reach a held `merge` card; the supervisor then calls `request_auto_merge(action_id)`. 5. Confirm the broker's server-side gate re-runs (ring + never-graduates + tier recompute over the diff), returns `auto`, mints+burns a nonce INTERNALLY, and the merge lands with `decided_by="trust:auto"` and NO Telegram tap. `sqlite3 ~/.hermes/broker/held_actions.db "select type,state,decided_by from held_actions order by created_ts desc limit 1"` → `merge|executed|trust:auto`. 6. Negative checks in the same session: a job whose diff touches a ring path (e.g. edits `broker/**`) → the `auto_merge` request returns `held` (reason `ring`), the executor NEVER runs, the card stays held for a human; a tier-0 (ungraduated) repo → `held` (reason `tier`); flipping the profile back to `ask-for-everything` → every request returns `held` regardless of record. |
+
+> Prerequisite chain: SG-P1a-2/3 → SG-P2-1 → SG-P1b-1 (the 30-day/10-merge graduation, still
+> pending real wall-clock) must all be real before SG-P1b-3 can be observed live. Until then
+> the auto-merge path is exercisable only via the socketpair-driven tests (which are green).
+
 ## From later phases
-(appended as each phase completes — P4 3-night flagship, P1b 30-day/10-merge graduation,
-P1c real-meeting prep, etc.)
+(appended as each phase completes — P4 3-night flagship, P1b 30-day/10-merge graduation
+SG-P1b-1/2 above, P1c real-meeting prep, etc.)
