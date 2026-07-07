@@ -375,7 +375,7 @@ def main() -> None:
         executors={
             "message": build_message_executor(creds.egress_cred),
             "git_push": build_git_push_executor(creds.egress_cred),
-            "merge": build_merge_executor(),
+            "merge": build_merge_executor(creds.egress_cred),
         },
     )
     server.serve_forever()
