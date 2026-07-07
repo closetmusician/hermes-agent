@@ -449,6 +449,14 @@ def main() -> None:
             # apply door re-checks the ring over the exact hash-pinned bytes before
             # git-apply. The registry dispatches by type — no _rpc_approve edit.
             "retro_diff": build_retro_diff_executor(),
+            # P6-a mission-control control types (job_reject / job_rescope /
+            # queue_reprioritize) are deliberately NOT wired in this standalone
+            # launch — their control_executor needs a factory-side RECONCILER, and
+            # the broker imports nothing from factory (same rule as merge_gate). The
+            # SUPERVISOR builds build_control_executor(reconciler) and passes the
+            # three control types in via `executors=` when it constructs the server.
+            # Absent here ⇒ any control card fails CLOSED (UnknownActionType) — a
+            # standalone broker can never mutate the fleet.
         },
         # merge_gate is deliberately NOT wired here (fail-closed): the auto_merge RPC
         # holds every request until P1b-d injects a MergeGate whose compute_tier +
