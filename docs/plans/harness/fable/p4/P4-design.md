@@ -42,7 +42,9 @@ logic is plain code; the only AI is inside the workers (unchanged from P2/P3).
 | `assert_openrouter_allowed(repo, worker, policy)` — pure fail-closed predicate | `factory/residency_guard.py:57` | The router calls the SAME predicate as a *pre-flight* to skip a disallowed rung (so it waits instead of erroring); the runner's call is the hard wall. §13.2 | ✅ raises `ResidencyViolation` for `worker in THIRD_PARTY_WORKERS` unless `policy.allow_openrouter`; `None`→denied (`:78-88`) |
 | `WorkerRunSpec` (worker, model, model_key, policy, budget_usd, timeout_min) | `factory/worker_runner.py:144` | The router populates `worker`/`model` per rung; `model_key` is the broker-injected key; `policy` carries residency. §2.2 | ✅ `policy: Optional[MergePolicy] = None` → fail-closed (`:173`) |
 | `MergePolicy.allow_openrouter` (default `False`) + `load_merge_policy` / `default_policy` | `factory/merge_policy.py:78`,`:154`,`:169` | Residency source of truth per repo; the router reads it to pick the ladder. | ✅ defaults `False` at `:78` |
-| `JobStore.transition(job_id, expected, target, *, extra=)` — one-way CAS | `factory/job_store.py:288` | P4 writes phase-checkpoint + confidence via the `extra` dict on existing transitions (additive columns, no new states needed for checkpoint). §3, §8 | ✅ CAS `UPDATE … WHERE id=? AND state=?` |
+| `JobStore.transition(job_id, expected, target, *, extra=)` — one-way CAS | `factory/job_store.py:288` | P4 writes phase-checkpoint + confidence via the `extra` dict on existing transitions (additive columns). **Two ADDITIVE states are added to `_ALLOWED` for crash-resume — see Revision v2 §R1; the original "no new states needed" claim was WRONG and is retracted.** §3, §8 | ✅ CAS `UPDATE … WHERE id=? AND state=?` |
+| `_ALLOWED` one-way state machine + `_reclaim_dead_job` | `factory/job_store.py:85`,`:672` | **`NEEDS_ATTENTION` is terminal (empty frozenset); `_reclaim_dead_job` hardcodes `state='NEEDS_ATTENTION'` at `:700`.** Revision v2 §R1 adds `RESUMABLE`/`WAITING_CAPACITY` states + edges and routes dead-pgid-WITH-valid-checkpoint jobs to `RESUMABLE` instead of terminal. | ✅ verified: `NEEDS_ATTENTION": frozenset()` at `:96`; reclaim UPDATE at `:700` |
+| `capabilities.json` — `zhipuai/GLM-5.2` IS present (`live_catalog:false, ping_ok:false`) | `capabilities.json:40` | **Correction: GLM-5.2 is NOT absent from the catalog.** The phantom guard keys on `live_catalog && ping_ok`, not name-absence. Revision v2 §R4 corrects the prose + the test. | ✅ verified `"zhipuai/GLM-5.2"` at `:40`, all flags `false` |
 | `jobs.confidence REAL` column (nullable, reserved for P4.6) | `factory/job_store.py:134` | P4-6 populates it at AWAITING_APPROVAL. **Already exists — no migration.** | ✅ `confidence REAL, -- NULL until P4.6` |
 | `jobs.model`, `jobs.worker` columns | `factory/job_store.py:122-123` | The ladder records which tier finished each job (P4.2). | ✅ |
 | `DailyBudgetLedger.try_reserve / commit_spend / release_reservation` | `factory/cost_stops.py:206`,`:262`,`:305` | Cost accounting per worker folds `actual_spend_usd` back at completion; the trend board reads `daily_budget` + a new per-job cost log. §5, §6 | ✅ atomic CAS reserve at `:262`; `commit_spend` overshoot-tolerant at `:305` |
@@ -50,7 +52,7 @@ logic is plain code; the only AI is inside the workers (unchanged from P2/P3).
 | `Gauntlet` → `GauntletResult{test_result, review_findings}` | `factory/gauntlet.py:75` | Confidence reads `test_result` + `review_findings` (severity/count). §7 | ✅ |
 | `two_stage.persist_spec_artifact` / phase-brief pattern (fresh worker per stage) | `factory/two_stage.py` | The checkpoint brief generalizes the two-stage handoff (spec→implement) to every phase boundary. §3 | ✅ two-stage already does fresh-agent-per-stage + persisted artifact |
 | `tools/checkpoint_manager.py` — **within-worker** per-turn file rollback by commit hash | `tools/checkpoint_manager.py` | **REUSED AS-IS, NOT EXTENDED.** It stays the within-a-worker undo tool; the P4 phase-checkpoint is a *new disjoint layer on top* (job-level, not turn-level). See REQ-01 escalation below. | ✅ lives at `tools/`, not `factory/`; knows nothing about factory phases |
-| `capabilities.json` — probe-confirmed live model catalog (P0-4) | repo root `capabilities.json` | The ladder rungs are drawn ONLY from probe-confirmed models; a phantom (`GLM-5.2`) never enters. §2.3 | ✅ `openrouter.models{}` with `live_catalog`/`ping_ok` flags |
+| `capabilities.json` — probe-confirmed live model catalog (P0-4) | repo root `capabilities.json` | The ladder rungs are drawn ONLY from probe-confirmed models (`live_catalog && ping_ok`). A "phantom" = ANY name failing that predicate — NOT a name absent from the file (`GLM-5.2` IS in the file but fails the predicate). §2.3, Revision v2 §R4 | ✅ `openrouter.models{}` with `live_catalog`/`ping_ok` flags; all 7 currently `false` |
 | `pm_os/bin/run-morning.js` — the briefing generator | `~/Code/pm_os/bin/run-morning.js` | Reused as the morning-packet renderer (factory digest section). §4.3 | ✅ present |
 | `trust_policy.compute_tier` (consumes `min_confidence`, `hist`) | `factory/trust_policy.py:210` | Confidence feeds the P1b graduation floor (`min_confidence` AND-gate). §7 | ✅ |
 
@@ -208,7 +210,10 @@ so the job *waits* rather than erroring.
   overflow (tier-2+: `zhipuai/glm-5` → Kimi → DeepSeek, in the order `capabilities.json` confirms
   live)**. Names are **candidates**; the actual rungs are read from `capabilities.json`
   (`openrouter.models[*].live_catalog && ping_ok`). A rung whose model is not probe-confirmed is
-  **not in the ladder** (the phantom-`GLM-5.2` guard from P0-4).
+  **not in the ladder** (the P0-4 phantom guard). **A "phantom" is any name failing
+  `live_catalog && ping_ok` — NOT a name absent from `capabilities.json`. `GLM-5.2` IS in the file
+  (`capabilities.json:40`) but fails the predicate (`live_catalog:false`), so it is excluded on the
+  predicate, not on absence.** See Revision v2 §R4.
 - **Residency pre-filter:** the router filters the ladder to `[rung for rung in ladder if
   _rung_admissible(rung, repo, policy)]`, where `_rung_admissible` returns `False` for a
   third-party rung when `assert_openrouter_allowed(repo, "openrouter", policy)` would raise (it
@@ -245,9 +250,10 @@ posture (P3 §4.6, stagger 30–60s); failover adds the *tier step-down* on top.
 
 When `next_rung` returns `WAIT_FOR_CAPACITY` for an `allow_openrouter:false` job, the job does
 **not** fail and does **not** spill to OpenRouter. Instead:
-- The job is parked in a new **`WAITING_CAPACITY`** sub-status (a job-store `extra` field
-  `wait_reason="subscription-capacity"`; the state stays a live scheduler-visible state so the tick
-  re-checks it). It holds its phase checkpoint + brief.
+- The job is parked in the **`WAITING_CAPACITY`** state — a **first-class `_ALLOWED` state**
+  (Revision v2 §R1), NOT the v1 "`extra` field sub-status" hack. It carries `extra`
+  `wait_reason="subscription-capacity"` and stays scheduler-visible so the tick re-checks it. It
+  holds its phase checkpoint + brief. (The v1 sub-status framing below is superseded by §R1.)
 - The scheduler's tick re-evaluates waiting jobs each cadence: when a first-party rung is admissible
   again (429 backoff elapsed / quota window reset per `compute.md`), the job resumes from its
   checkpoint on the first-party rung.
@@ -269,8 +275,10 @@ Codex + OpenRouter workers are enabled this phase (P2 was Claude-only). Cost per
   per `capabilities.json` `codex.budget_flag:false`, so the cost stop is wall-clock + post-hoc
   metering, not a pre-cap; the daily-ceiling CAS still bounds the night).
 - **openrouter:** parse the response `usage` block × the OpenRouter model price → usd; the separate
-  **OpenRouter ≤$2/day** sub-ceiling is a second `DailyBudgetLedger`-style CAS keyed to a
-  `provider="openrouter"` row (independent of the $5 nightly ceiling).
+  **OpenRouter ≤$2/day** sub-ceiling lives in a **composite-PK `daily_budget` `(day, provider)` row**
+  (`provider='openrouter'`), reserved via the **two-CAS-in-one-transaction** ordering — Revision v2
+  §R2 (this supersedes the v1 "second ledger / no migration" claim, which was WRONG: `daily_budget`
+  PK was `day` alone at `cost_stops.py:62`).
 
 Each job's actual spend folds back via `DailyBudgetLedger.commit_spend(job_cap_usd, actual_spend_usd)`
 (`cost_stops.py:305`, overshoot-tolerant) and is appended to a **per-job cost log** (`job_id, phase,
@@ -348,8 +356,9 @@ The north-star number. `cost_trend.compute(window_a, window_b)`:
 - Surfaced in the morning briefing (a trend arrow beside cost) and in the weekly retro (P5/P7).
 
 `cost accounting matches provider spend within tolerance` (the P4 gate) is verified by reconciling
-the per-job cost log Σ against `daily_budget.spent_today_usd` (`cost_stops.py`) for a synthetic
-night — §13.
+the per-job cost log Σ against a **synthetic provider-reported usage figure computed OUTSIDE the
+ledger**, within a **defined `TOLERANCE`** — Revision v2 §R3 (this supersedes the v1 line, which
+reconciled the ledger against itself and could not catch drift).
 
 ---
 
@@ -537,8 +546,9 @@ STAGED GATE — P4 flagship "3 consecutive nights on p4-gate-queue.md"
     reconciliation, ranked batch-approvable packet).
   Promotion criteria (owner-run, off-CI): 3 consecutive nights, each: ≥5 tasks intake→PR-ready
     with zero human before 7am; total cost < $5 nightly ceiling; ≥1 failover to a lower tier via
-    the handoff brief; ≥1 crashed worker resumes from a phase checkpoint; morning packet
-    confidence-ranked + batch-approvable; cost accounting matches provider spend within tolerance.
+    the handoff brief; ≥1 crashed worker resumes from a phase checkpoint (now IMPLEMENTABLE via the
+    RESUMABLE state — Revision v2 §R1; was unimplementable in v1); morning packet confidence-ranked
+    + batch-approvable; cost accounting matches provider spend within tolerance (defined, §R3).
   Seed queue: docs/plans/harness/fable/p4/p4-gate-queue.md — committed BEFORE the run (no
     cherry-picking).
 ```
@@ -566,9 +576,15 @@ repo → assert (a) the router pre-filter never produced it in normal flow, and 
 runner guard raises before any dispatch. A `false` repo can reach OpenRouter through **neither**
 path. `policy=None` (unknown residency) is treated as `false` at both walls — fail-closed.
 
-**Cost-residency interaction:** the OpenRouter ≤$2/day sub-ceiling (a `provider="openrouter"`
-`DailyBudgetLedger` CAS) only ever applies to `true` repos — a `false` repo has no OpenRouter spend
-by construction, so the sub-ceiling and the residency wall are orthogonal (no double-counting).
+**Cost-residency interaction:** the OpenRouter ≤$2/day sub-ceiling (the composite-PK
+`(day, 'openrouter')` row, two-CAS reserved — Revision v2 §R2) only ever applies to `true` repos —
+a `false` repo has no OpenRouter spend by construction, so the sub-ceiling and the residency wall
+are orthogonal (no double-counting).
+
+**Wall-3 (F7, Revision v2 §R4):** P4-b adds `_PROVIDER_MODEL_KEY["openrouter"]` (`worker_runner.py:52`),
+which removes the *accidental* third wall (a missing key). To avoid making `assert_openrouter_allowed`
+the sole barrier, P4-b keeps an explicit "no OR key placed unless `policy.allow_openrouter`" check at
+the key-injection site — a deliberate wall-3 replacing the accidental one.
 
 ---
 
@@ -583,6 +599,292 @@ by construction, so the sub-ceiling and the residency wall are orthogonal (no do
 
 ---
 
-**Verdict:** design complete, file-disjoint, TDD-first; the crown residency behavior is closed by
-two independent walls (the second already in production at `worker_runner.py:362`). Zero code
-written. Adversarial review + verifier follow.
+---
+
+## Revision v2 — red-team closures
+
+**Date:** 2026-07-07. Closes the P1s from `P4-review.md` (F1–F12). The load-bearing one is **F11**
+(crash-resume was unimplementable → the flagship gate would be theater). All state-machine changes
+here are **ADDITIVE** — every existing edge in `_ALLOWED` (`job_store.py:85-96`, verified this
+session) is preserved unchanged. Where this section conflicts with §1–§13 above, **this section
+wins** (the earlier text is the v1 draft the review critiqued).
+
+### §R1 — F11: crash-resume made real (the load-bearing fix)
+
+**The defect (verified).** `_ALLOWED` (`job_store.py:85`) makes `NEEDS_ATTENTION` terminal
+(`frozenset()` at `:96`). `_reclaim_dead_job` (`:672`) hardcodes `state='NEEDS_ATTENTION'` in its
+UPDATE (`:700`). `scheduler.tick` runs `check_integrity` as step 0 (`scheduler.py:205`). So a
+crashed worker is parked **terminal** before any resume branch could run — "crashed worker resumes
+from a phase checkpoint" (the flagship gate headline) is impossible on the machine v1 cited as
+"no new states needed." That claim is **retracted**.
+
+**The fix — two additive states + defined edges.** Add to `_ALLOWED`:
+
+```python
+# ADDITIVE — existing edges above are unchanged.
+"RESUMABLE":        frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
+"WAITING_CAPACITY": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
+```
+
+and add these **inbound** edges to the existing active states (append to their frozensets — the
+targets already listed stay):
+
+```
+RUNNING → {…, RESUMABLE, WAITING_CAPACITY}
+TEST    → {…, RESUMABLE}
+REVIEW  → {…, RESUMABLE}
+ADMITTED→ {…, RESUMABLE}          # an ADMITTED spawn that died before RUNNING
+```
+
+- `RESUMABLE` = a job whose worker is gone (dead pgid) **but a valid phase checkpoint exists**. It
+  is NOT terminal: the scheduler re-admits it (`RESUMABLE → ADMITTED`) and resumes from the last
+  cleared phase via the brief. If resume itself is impossible (checkpoint invalid / self-heal
+  exhausted) → `RESUMABLE → NEEDS_ATTENTION` (terminal, unchanged semantics).
+- `WAITING_CAPACITY` = the residency wait-for-capacity park (§4.3). Previously v1 hand-waved this
+  as an "`extra` field on a live state"; it is now a **first-class state** with the same two exits
+  (`→ ADMITTED` when a first-party rung frees up; `→ NEEDS_ATTENTION` on the bounded-wait cap).
+  This replaces the v1 "sub-status" hack — a real state is what makes the tick's re-check and the
+  `WorkerRunner.launch`-never-called assertion (§10-P4b-#3) checkable.
+
+**Why the one-way invariant survives.** The machine stays a DAG toward terminals: `RESUMABLE` and
+`WAITING_CAPACITY` only flow **forward** to `ADMITTED` (re-entering the normal pipeline) or to the
+terminal `NEEDS_ATTENTION`. There is **no** `NEEDS_ATTENTION → RUNNING` edge (that would break the
+terminal invariant); instead the crash is routed to `RESUMABLE` *instead of* `NEEDS_ATTENTION` at
+reclaim time. A job can loop `RUNNING → RESUMABLE → ADMITTED → RUNNING` at most `MAX_RESUMES`
+times (a per-job counter in the checkpoint, default 3), then `RESUMABLE → NEEDS_ATTENTION` — so
+the graph cannot cycle unboundedly.
+
+**`_reclaim_dead_job` becomes checkpoint-aware** (`job_store.py:672`, additive edit):
+
+```
+on dead pgid for a RUNNING/TEST/REVIEW/ADMITTED job:
+    ckpt = phase_checkpoint.read(job_id)           # §3.1
+    if ckpt is valid AND job.resume_count < MAX_RESUMES:
+        target = "RESUMABLE"                        # NOT terminal
+        extra  = {"fail_reason": f"integrity: dead pgid {pgid}",
+                  "forensic_bundle": <post-mortem bundle path>,  # §R5 / F10
+                  "resume_count": ckpt.resume_count}
+    else:
+        target = "NEEDS_ATTENTION"                  # unchanged terminal path
+    # budget release ordering (the existing budget_settled idempotency) is UNCHANGED,
+    # EXCEPT: on RESUMABLE we do NOT release the reservation (the job will re-run and
+    # re-spend) — instead we commit the pre-crash metered tokens (§R3 / F5) and keep
+    # a fresh reservation for the resume. On NEEDS_ATTENTION the reservation is
+    # released exactly as today.
+```
+
+**The tick resume branch** (`scheduler.tick`, the one additive scheduler edit, §5.1): after step 0
+`check_integrity`, the admission loop treats `RESUMABLE` and `WAITING_CAPACITY` jobs as
+**re-admission candidates** alongside `QUEUED` — each is transitioned `→ ADMITTED` under the same
+atomic slot reservation (`CONCURRENCY_CAP=3` unchanged), then `phase_checkpoint.resume(job_id)`
+builds the fresh `WorkerRunSpec` from the brief (§3.2) and the router **recomputes the rung**
+(§R4/F2). A `WAITING_CAPACITY` job is only re-admitted when `next_rung` yields an admissible
+first-party rung.
+
+**The REAL crash-resume test (replaces the theatrical v1 §11 entry):**
+
+```
+test_crashed_worker_goes_resumable_then_relaunches_from_checkpoint
+  1. Drive a job to IMPLEMENT cleared (checkpoint.json has gates_cleared=["SPEC"]).
+  2. Simulate a CRASH: kill the worker pgid (kill -9 / drop the process group) mid-IMPLEMENT
+     — NOT a supervised stop. The pgid is dead before the tick runs.
+  3. Run one scheduler tick → assert check_integrity routes the job to state RESUMABLE
+     (NOT NEEDS_ATTENTION) because a valid checkpoint exists.
+  4. Run the next tick → assert the job is re-admitted (RESUMABLE→ADMITTED) and
+     phase_checkpoint.resume builds a WorkerRunSpec whose extra_prompt == the brief and
+     whose start phase == IMPLEMENT (the last cleared boundary), NOT SPEC.
+  5. Assert resume_count incremented; after MAX_RESUMES crashes the job parks
+     RESUMABLE→NEEDS_ATTENTION (bounded, no infinite relaunch loop).
+```
+
+This is falsifiable and exercises a genuine crash (dead pgid), not a supervised `TEST→RUNNING`
+rewind. It fails RED today (there is no `RESUMABLE` state) and only passes once §R1 lands.
+
+### §R2 — F6: the $2 OpenRouter sub-ceiling gets a home + a two-CAS ordering
+
+**The defect (verified).** `daily_budget` is `day TEXT PRIMARY KEY, spent_today_usd, reserved_usd`
+(`cost_stops.py:62`) — **no provider column, `day` is the sole PK.** Two rows for one day (nightly
++ OpenRouter) are impossible. v1's "keyed to a `provider="openrouter"` row … no migration" is
+**wrong and retracted.**
+
+**The fix — composite PK migration (option a, chosen over a second ledger).** Migrate:
+
+```sql
+CREATE TABLE IF NOT EXISTS daily_budget (
+  day              TEXT NOT NULL,
+  provider         TEXT NOT NULL DEFAULT '__nightly__',   -- '__nightly__' = the $5 ceiling
+  spent_today_usd  REAL NOT NULL DEFAULT 0,
+  reserved_usd     REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, provider)
+);
+```
+
+`'__nightly__'` is the existing $5 ceiling row (back-compat: existing single-PK rows migrate to
+`provider='__nightly__'`); `'openrouter'` is the ≤$2 sub-ceiling row. **One table, one connection,
+one write lock** — this is why option (a) beats a second ledger: it keeps both CASes under SQLite's
+*single* `BEGIN IMMEDIATE` write lock, eliminating the cross-connection TOCTOU the review flagged
+(F6/C4). `try_reserve(cap, jid, provider='__nightly__')` gains a `provider` arg; the CAS predicate
+becomes `WHERE spent+reserved+cap <= ceiling(provider)` scoped to `(day, provider)`.
+
+**Two-CAS reservation ordering (closes the cross-ceiling TOCTOU).** An OpenRouter dispatch must
+pass BOTH the $5 nightly ceiling AND the $2 sub-ceiling. Defined order (both atomic, same
+connection, in a single `BEGIN IMMEDIATE` transaction so they commit or roll back together):
+
+```
+reserve_openrouter(cap, jid):
+    BEGIN IMMEDIATE                          # one txn, one write lock
+    ok_nightly = CAS reserve (day,'__nightly__') cap    # $5 ceiling
+    ok_sub     = CAS reserve (day,'openrouter')  cap    # $2 sub-ceiling
+    if ok_nightly and ok_sub:
+        COMMIT        → dispatch
+    else:
+        ROLLBACK      → neither row moved; return WAIT_FOR_CAPACITY (residency-safe park)
+```
+
+Because both CASes are inside one transaction on one connection, there is **no window** where the
+nightly reservation exists without the sub-ceiling one (or vice-versa) — the ROLLBACK is the
+compensating release, for free. First-party (claude/codex) dispatches reserve only
+`'__nightly__'` (single CAS, unchanged path). Commit/release mirror the same
+`(day, provider)` scoping.
+
+**Concurrent test (F6 gate):**
+
+```
+test_openrouter_subceiling_two_cas_never_exceeds_either_ceiling
+  Fan out N concurrent OpenRouter reservations (each cap C) against nightly=$5, sub=$2.
+  Assert: (a) sum of COMMITTED openrouter reservations <= $2 (sub-ceiling never breached);
+          (b) sum of ALL committed reservations <= $5 (nightly never breached);
+          (c) every rejected reserve rolled BOTH rows back (no orphaned nightly reservation);
+          (d) the reserve that would push sub past $2 returns WAIT_FOR_CAPACITY, not a partial commit.
+```
+
+### §R3 — F5/F8: cost tolerance defined + provider-reconciliation (not self-reconciliation)
+
+**The defects (verified).** (F5) Codex is post-hoc metered (`capabilities.json` `codex.budget_flag:false`),
+`commit_spend` is overshoot-tolerant (`cost_stops.py:314`), and a crash+resume re-spends a phase
+while v1's reclaim only returned the *reservation* — so real provider spend can drift **above** the
+ledger, unbounded. (F8) v1's `test_cost_accounting_reconciles_synthetic_night` compares the cost-log
+Σ to `daily_budget.spent_today_usd` — **the ledger against itself**, which can never catch drift.
+
+**Fix 1 — numeric tolerance (defined).** `TOLERANCE = max($0.25, 15% × per_job_cap × MAX_RESUMES)`
+per job, summed per night. Rationale: the drift sources are (i) Codex post-hoc overshoot of at most
+one phase's tokens, and (ii) crash re-spend of at most `MAX_RESUMES` (=3) phases. The absolute
+floor ($0.25) absorbs rounding across token-price tables. A reconciliation gap **exceeding**
+tolerance is a hard test failure (a real accounting bug), not "softer post-hoc."
+
+**Fix 2 — resume re-spend is COUNTED as real spend (not just reservation-returned).** On reclaim to
+`RESUMABLE` (§R1), `worker_cost` meters the pre-crash tokens burned at the provider and calls
+`commit_spend(cap, pre_crash_actual_usd)` **before** the resume re-reserves. The resumed phase's
+re-run tokens are *also* real spend and are committed normally at its completion. So the ledger
+counts BOTH the pre-crash burn AND the re-run — matching what the provider actually billed. (v1
+under-counted by returning the reservation and ignoring the burn.) Per-job failover/resume is
+**capped at `MAX_RESUMES`** so the re-spend is bounded, which is what makes the tolerance formula
+finite.
+
+**Fix 3 — the reconciliation test hits a SYNTHETIC PROVIDER figure, not the ledger.** Replace v1's
+self-referential test:
+
+```
+test_cost_accounting_reconciles_against_synthetic_provider_usage
+  1. Run a synthetic night: claude + codex + openrouter workers with KNOWN token counts,
+     including ONE job that crashes mid-phase and resumes (so pre-crash burn + re-run both occur).
+  2. Build a SYNTHETIC provider-reported usage total independently: sum the KNOWN tokens ×
+     the price table — this is the "what the provider billed" number, computed OUTSIDE the ledger.
+  3. Assert |provider_reported_usd − ledger.spent_today_usd| <= TOLERANCE.
+  4. Specifically assert the crashed job's pre-crash tokens ARE in the ledger (not just the
+     reservation returned) — i.e. the resume re-spend is counted, so provider ≈ ledger.
+```
+
+The provider figure is derived from the injected token counts, NOT read back from `daily_budget` —
+so the two sides are genuinely independent and the test can fail if drift exceeds tolerance.
+
+**Fix 4 — bound `commit_spend` overshoot.** `commit_spend` stays overshoot-tolerant (don't reject a
+real spend that already happened), but the reconciliation gate above is the *check* on it: any
+overshoot beyond `TOLERANCE` fails the night's reconciliation. Codex's post-hoc meter is folded via
+`commit_spend` the instant its `--json` usage is parsed, minimizing the unmetered window.
+
+### §R4 — cheap P1s (F1/F2/F3) + F12 prose, closed inline
+
+- **F1 — pre-filter on EVERY rung.** `next_rung(current, repo, policy, catalog)` re-derives the
+  admissible ladder from `(repo, policy, catalog)` **on every call** — it must NOT reuse a
+  `select_tier`-cached admissible list. Spec: `next_rung` calls `_admissible_ladder(repo, policy,
+  catalog)` fresh, then returns the first rung strictly below `current`, or `WAIT_FOR_CAPACITY`.
+  Test (added to §10-P4b): `test_next_rung_refilters_every_step` — a false repo's `next_rung`
+  returns `WAIT_FOR_CAPACITY` at every step and NEVER an OpenRouter rung, across the whole ladder.
+- **F3 — unknown/missing policy → WAIT, fail-closed.** `load_merge_policy` raises `FileNotFoundError`
+  on a missing `merge-policy.md` (`merge_policy.py:169`). Spec: `model_router` wraps the load in
+  `try: policy = load_merge_policy(repo) except (FileNotFoundError, ParseError): policy =
+  default_policy(repo)` (openrouter-OFF). A missing/unparseable policy therefore yields a
+  first-party-only ladder → `WAIT_FOR_CAPACITY` on exhaustion, NEVER a naive `except: pass` that
+  would leave OR rungs. Test: `test_missing_policy_fails_closed_to_wait`.
+- **F2 — resume/failover RECOMPUTES the rung, never replays the checkpoint's cached rung.** The
+  checkpoint persists `rung:{worker,model,tier}` (§3.1) for forensics ONLY. `phase_checkpoint.resume`
+  and `failover.on_429` call `select_tier(repo, task_type, load-fresh policy, catalog)` and **ignore
+  the checkpoint's `rung` for admissibility** — so a repo whose policy flipped true→false since the
+  checkpoint gets a fresh first-party-only ladder. Test: `test_resume_recomputes_rung_from_live_policy`
+  — flip a repo false after a true-tier checkpoint → resume picks a first-party rung, never the
+  stale OR tier.
+- **F7 (P2, noted).** P4-b adds `_PROVIDER_MODEL_KEY["openrouter"]` (`worker_runner.py:52`), which
+  removes the *third accidental* wall (a missing key that made `.get("openrouter")→None`). After
+  P4-b, `assert_openrouter_allowed` (`:362`) is the SOLE barrier for OR. Mitigation: keep an
+  explicit "no OR key placed unless `policy.allow_openrouter`" assertion at the key-injection site
+  as a belt-and-suspenders wall-3, rather than relying on the accident. Documented; §13 updated.
+- **F10 (P1) — forensic capture splits supervised vs crash.** "Capture BEFORE kill" (§3.3) holds
+  only for *supervised* kills (cost-stop SIGTERM, stall detector). For a **crash** (dead pgid via
+  OOM/`kill -9`), there is no "before" — `_reclaim_dead_job` captures **post-mortem**: transcript
+  tail from `.factory/worker.out` (may be truncated — accepted), the last committed phase diff, and
+  `meta.json` from the checkpoint (model/prompt_hash/phase/rung/cost_so_far). The design now has TWO
+  capture paths: `forensics.capture_pre_kill(...)` (supervised) and `forensics.capture_post_mortem(...)`
+  (crash, called inside `_reclaim_dead_job`). The gate test §10-P4a-#4 is scoped to the supervised
+  path it actually exercises; a new `test_post_mortem_bundle_on_dead_pgid` covers the crash path.
+- **F12 — GLM-5.2 prose corrected** (done inline in §1/§2.3/§4.1 above): a "phantom" is any name
+  failing `live_catalog && ping_ok`, NOT a name absent from `capabilities.json`. `GLM-5.2` IS in the
+  file (`:40`) but fails the predicate. `test_phantom_model_never_enters_ladder` keys on the
+  predicate (uses GLM-5.2 as a `ping_ok:false` exclusion) AND a genuinely-absent fabricated name for
+  the absence case.
+
+### §R5 — revised task & test breakdown (deltas to §9/§10/§11)
+
+**Task-table deltas** (§9 rows, additive scope):
+
+| Task | Added scope (Revision v2) |
+|---|---|
+| **P4-a** | ADD `_ALLOWED` states `RESUMABLE`/`WAITING_CAPACITY` + inbound edges (`job_store.py:85`); make `_reclaim_dead_job` checkpoint-aware (`:672`, route to RESUMABLE w/ valid ckpt); `MAX_RESUMES` counter; `forensics.capture_post_mortem` (crash path, F10); pre-crash-token `commit_spend` on reclaim (F5). |
+| **P4-b** | `next_rung` re-filters every call (F1); `model_router` fail-closes missing policy to `default_policy` (F3); resume/failover recompute rung, ignore checkpoint `rung` (F2); `daily_budget` composite-PK migration `(day, provider)` + two-CAS `reserve_openrouter` in one txn (F6); tolerance-bounded cost + provider reconciliation (F5/F8); keep explicit key-injection wall-3 (F7). |
+| **P4-c** | tick re-admits `RESUMABLE`/`WAITING_CAPACITY` alongside QUEUED under the atomic slot (replaces the v1 "extra field" park). |
+
+**Test-table deltas** (the theatrical/blocked v1 tests are REPLACED; new tests ADDED):
+
+| v1 test | Disposition in v2 |
+|---|---|
+| `test_midjob_kill_resumes_from_checkpoint` (§11) | **REPLACED** by `test_crashed_worker_goes_resumable_then_relaunches_from_checkpoint` (§R1) — real dead-pgid crash, asserts RESUMABLE (not terminal) + relaunch from last cleared phase + bounded by MAX_RESUMES. |
+| `test_cost_accounting_reconciles_synthetic_night` (§11) | **REPLACED** by `test_cost_accounting_reconciles_against_synthetic_provider_usage` (§R3) — provider figure computed OUTSIDE the ledger; asserts `|provider − ledger| ≤ TOLERANCE`; asserts resume re-spend counted. |
+| `test_phantom_model_never_enters_ladder` (§10-P4b-#5) | **AMENDED** — keys on `live_catalog && ping_ok` (GLM-5.2 excluded on the predicate) PLUS a genuinely-absent name for the absence case. |
+| `test_cost_accounting_matches_synthetic_spend` (§10-P4b-#6) | **AMENDED** — the OR sub-ceiling assertion uses the two-CAS `(day,provider)` path; assert the 3rd dispatch that would breach $2 returns `WAIT_FOR_CAPACITY` and rolls BOTH rows back. |
+| `test_false_repo_429_waits_never_openrouter` (§10-P4b-#3) | **KEPT** — now asserts the job parks in the first-class `WAITING_CAPACITY` state (not a sub-status). |
+| *(new)* `test_next_rung_refilters_every_step` | ADDED (F1). |
+| *(new)* `test_missing_policy_fails_closed_to_wait` | ADDED (F3). |
+| *(new)* `test_resume_recomputes_rung_from_live_policy` | ADDED (F2). |
+| *(new)* `test_openrouter_subceiling_two_cas_never_exceeds_either_ceiling` | ADDED (F6, concurrent). |
+| *(new)* `test_post_mortem_bundle_on_dead_pgid` | ADDED (F10, crash-path forensics). |
+| *(new)* `test_resumable_state_edges_additive` | ADDED — assert every pre-v2 `_ALLOWED` edge is intact (one-way invariant preserved) and the new states only flow forward to ADMITTED/NEEDS_ATTENTION. |
+
+**Revised gate-test count:** §11 flagship-proxy set grows from 6 → 6 (two replaced in place), plus
+6 new component tests in §10 (F1/F2/F3/F6/F10 + the additive-edges guard). The staged 3-night gate
+(§12) is unchanged in intent, but its "≥1 crashed worker resumes from a phase checkpoint" clause is
+now **actually implementable** because `RESUMABLE` exists.
+
+**Deferred (P2, logged not fixed here):** F9 (checkpoint version/checksum field — add a `"version":1`
++ sha to `checkpoint.json`, resume rejects a mismatched/stale-branch checkpoint → fresh) and
+F-schema (`transition(extra=)` column-name f-string — whitelist `extra` keys against known columns).
+Both are cleanups that don't block BUILD; tracked in `docs/backlog.md` at implementation time.
+
+---
+
+**Verdict (v2):** design complete, file-disjoint, TDD-first. The crown residency behavior is closed
+by two independent walls (the second already in production at `worker_runner.py:362`). **The
+flagship crash-resume gate is now REAL** — `RESUMABLE`/`WAITING_CAPACITY` are additive states with
+defined forward-only edges, the crash test drives a genuine dead pgid, the $2 OpenRouter sub-ceiling
+has a home (composite-PK `daily_budget`) and a TOCTOU-free two-CAS ordering, and cost reconciliation
+hits a synthetic provider figure within a defined tolerance instead of itself. Zero code written.
+Verifier follows.
