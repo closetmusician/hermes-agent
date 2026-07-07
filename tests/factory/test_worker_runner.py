@@ -478,29 +478,41 @@ def test_personal_openrouter_admitted_at_seam(monkeypatch):
 # --- REQ-04: anti-weakening — removing the guard call must break a test -------
 def test_antiweakening_guard_call_is_load_bearing(monkeypatch):
     """
-    Neutralize the guard (make it a no-op) and stub in an openrouter key mapping:
-    build_worker_env would then wrongly build a work-repo OpenRouter env. This
-    test asserts that WITH the guard active the work job is refused — so if the
-    guard call is ever deleted from build_worker_env, test_work_openrouter_job_
-    gets_no_key_at_the_seam flips to returning a key and FAILS. This test proves
-    the guard, not its bypass, is what blocks the key.
+    Two independent walls block a work-repo OpenRouter key (design §13 F7).
+
+    Wall 2 is the unconditional residency guard at build_worker_env's top. Wall 3
+    (added when P4-b mapped _PROVIDER_MODEL_KEY["openrouter"], removing the accidental
+    "no key" wall) is an EXPLICIT key-injection check that refuses an OR key unless
+    the policy permits it. This test proves BOTH are load-bearing:
+      * guard active → refused (wall 2);
+      * guard neutralized on a FALSE-policy repo → STILL no key (wall 3 holds);
+      * guard neutralized on a TRUE-policy repo → key flows (proves wall 3 keys on
+        policy, not on the accidental missing-entry — F7 defense-in-depth).
     """
-    monkeypatch.setattr(
-        "factory.worker_runner._PROVIDER_MODEL_KEY",
-        {"claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
-    )
     runner = _runner_no_git()
-    spec = _run_spec(
+    false_spec = _run_spec(
         None,
         repo="diligent-platform",
         worker="openrouter",
         model_key="sk-or-fake",
-        policy=default_policy("diligent-platform"),
+        policy=default_policy("diligent-platform"),  # allow_openrouter=False
     )
-    # Guard active → refused (the load-bearing behavior).
+    # Wall 2 active → refused.
     with pytest.raises(ResidencyViolation):
-        runner.build_worker_env(spec)
-    # Guard neutralized → a key WOULD be injected (documents what the guard prevents).
+        runner.build_worker_env(false_spec)
+
+    # Wall 2 neutralized → wall 3 STILL blocks the false-policy OR key.
     monkeypatch.setattr("factory.worker_runner.assert_openrouter_allowed", lambda *a, **k: None)
-    env = runner.build_worker_env(spec)
-    assert env["OPENROUTER_API_KEY"] == "sk-or-fake"
+    env = runner.build_worker_env(false_spec)
+    assert "OPENROUTER_API_KEY" not in env, "wall-3 must refuse an OR key for a false repo"
+
+    # A TRUE-policy repo (guard also a no-op) → the OR key flows (wall 3 keys on policy).
+    true_spec = _run_spec(
+        None,
+        repo="acme",
+        worker="openrouter",
+        model_key="sk-or-fake",
+        policy=MergePolicy(repo="acme", allow_openrouter=True),
+    )
+    env2 = runner.build_worker_env(true_spec)
+    assert env2["OPENROUTER_API_KEY"] == "sk-or-fake"
