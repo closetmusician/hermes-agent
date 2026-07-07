@@ -45,6 +45,10 @@ BROKER_RING_PATHS: Tuple[str, ...] = (
     # The retro propose-gate wrapper (P5 v2-C2). Mirrors the factory RING_PATHS
     # addition so AT-RING-2 (BROKER_RING_PATHS ⊇ factory RING_PATHS) stays green.
     "factory/retro_ring_gate.py",
+    # The quiet-by-default proactive nudge contract (P6-c). Mirrors the factory
+    # RING_PATHS addition so AT-RING-2 stays green — a worker weakening
+    # nudge_max or repeat would be caught here too, not just at submission.
+    "docs/factory/proactive-contract.md",
 )
 
 _DEV_NULL = "/dev/null"
