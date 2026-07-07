@@ -75,14 +75,24 @@ class ApprovalAuthority:
             return False
         return hmac.compare_digest(live, nonce)
 
-    def approve(self, action_id: str, nonce: Optional[str], *, executor: Executor) -> Dict[str, Any]:
+    def approve(
+        self,
+        action_id: str,
+        nonce: Optional[str],
+        *,
+        executor: Executor,
+        decided_by: str = "telegram",
+    ) -> Dict[str, Any]:
         """
         Purpose: validate the nonce, then execute the real egress exactly once.
         Usage: result = auth.approve(aid, nonce, executor=message_executor).
         Gotchas: (1) rejects any call without a valid action-bound nonce — this is
         the self-approval wall. (2) idempotent by action_id: if the action is
         already executed, returns the cached result WITHOUT re-sending, even with a
-        fresh nonce. (3) burns the nonce on use so replay is rejected.
+        fresh nonce. (3) burns the nonce on use so replay is rejected. `decided_by`
+        labels the decision on the row: the human path passes "telegram" (default);
+        the P1b-e broker auto-merge passes "trust:auto" (still nonce-gated — the
+        broker minted the nonce internally after its server-side gate passed).
         """
         import json
 
@@ -106,15 +116,15 @@ class ApprovalAuthority:
             return json.loads(row["result_json"]) if row["result_json"] else {"status": "executed"}
 
         # Move held -> approved (also guards against a racing decision).
-        self._store.transition(action_id, "held", "approved", decided_by="telegram")
+        self._store.transition(action_id, "held", "approved", decided_by=decided_by)
         try:
             result = executor(row)
         except Exception as exc:  # executor failed — mark failed, surface the error
-            self._store.transition(action_id, "approved", "failed", decided_by="telegram")
+            self._store.transition(action_id, "approved", "failed", decided_by=decided_by)
             raise
 
         self._store.record_result(action_id, json.dumps(result, default=str))
-        self._store.transition(action_id, "approved", "executed", decided_by="telegram")
+        self._store.transition(action_id, "approved", "executed", decided_by=decided_by)
         return result
 
     def reject(self, action_id: str, *, reason: Optional[str] = None) -> None:

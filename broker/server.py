@@ -32,6 +32,10 @@ _CLIENT_METHODS = {
     "approve",
     "reject",
     "resolve_model_key",
+    # auto_merge (P1b-e) carries NO nonce: the broker mints+burns the nonce
+    # INTERNALLY after its own server-side gate passes. The mint verb is NEVER an
+    # RPC — a client can request an auto-merge but can never obtain a nonce.
+    "auto_merge",
 }
 
 # Provider → inference key name.  Only *_API_KEY names — no egress credentials.
@@ -54,7 +58,11 @@ def _default_safe_lane() -> SafeLane:
     return SafeLane(
         allow_list=set(),
         strategic_markers={"board", "exec", "legal", "pricing", "confidential"},
-        irreversible_types={"git_push_force"},
+        # 'merge' joins the held-by-default/irreversible set (design §V2.4): a merge
+        # to a protected branch can NEVER auto-send through the SafeLane path — the
+        # ONLY release path is the tier-gated auto_merge RPC, whose binding condition
+        # is the trust tier recomputed server-side (not C2/C3/C4/C5).
+        irreversible_types={"git_push_force", "merge"},
         operational_cap=2000,
         allowed_origins=set(),
     )
@@ -80,15 +88,20 @@ class BrokerServer:
         credentials: BrokerCredentials,
         executors: Dict[str, Any],
         safe_lane: Optional[SafeLane] = None,
+        merge_gate: Optional[Any] = None,
     ):
         """
         Purpose: wire the server with a per-type executor registry.
         Usage: BrokerServer(socket_path=..., db_path=..., credentials=...,
-               executors={"message": msg_exec, "git_push": push_exec}).
+               executors={"message": msg_exec, "git_push": push_exec},
+               merge_gate=MergeGate(...)).
         Gotchas: `executors` is the authoritative type→callable map; passing an
         unknown action type through enqueue+approve fails closed (UnknownActionType
         surfaced as a JSON-RPC error).  The old `message_executor=` kwarg is gone —
         callers must use `executors={"message": ...}` (P2-g-maint clean break).
+        `merge_gate` is the P1b-e server-side auto-merge gate: when absent, the
+        auto_merge RPC fails CLOSED (every request → held) — a broker with no gate
+        never auto-merges. Set it via the attribute or this kwarg to enable auto.
         """
         self._socket_path = Path(socket_path)
         self._store = HeldStore(db_path)
@@ -96,6 +109,8 @@ class BrokerServer:
         self._registry = ExecutorRegistry(executors)
         self._safe_lane = safe_lane or _default_safe_lane()
         self._approval = ApprovalAuthority(self._store, credentials.broker_secret())
+        # The P1b-e auto-merge gate (design §V2.1). None ⇒ auto_merge fails closed.
+        self._merge_gate = merge_gate
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
 
@@ -307,6 +322,59 @@ class BrokerServer:
         result = self._approval.approve(aid, nonce, executor=executor)
         return {"status": "executed", "result": result}
 
+    def _rpc_auto_merge(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Purpose: the tier-gated auto-merge RPC (P1b-e, design §V2.2) — the ONLY
+        no-nonce release path, and it is gated server-side. Given a held 'merge'
+        action_id (NO nonce from the caller), the broker runs its own merge_gate
+        (ring re-check + never-graduates + tier recompute over the diff, fail-closed);
+        on AUTO-OK the broker MINTS+BURNS a nonce INTERNALLY and runs the SAME
+        nonce+executor path as a human approval (decided_by="trust:auto"); on HELD it
+        leaves the card held for a human tap.
+        Usage: (supervisor) client.auto_merge(action_id).
+        Gotchas: the caller carries NO nonce and cannot obtain one — the mint stays
+        broker-internal, never crossing the socket. Fail-closed everywhere: no gate
+        configured, non-merge/non-held row, or any gate 'held' → the merge does NOT
+        execute. This closes review P0-1 (server-side re-check) and P0-2 (self-mint).
+        """
+        import time
+
+        aid = params.get("action_id")
+        row = self._store.get(aid)
+        if row is None:
+            raise ApprovalRejected(f"unknown action {aid}")
+        # auto_merge only ever releases a HELD 'merge' card — anything else is a
+        # fail-closed rejection (never let a message/push slip through this verb).
+        if row.get("type") != "merge":
+            raise ApprovalRejected(f"auto_merge only applies to 'merge' actions, not {row.get('type')!r}")
+        if row.get("state") != "held":
+            raise ApprovalRejected(f"action {aid} is not held (state={row.get('state')!r})")
+
+        # No gate configured ⇒ fail closed (leave held). A broker that cannot
+        # re-check never auto-merges.
+        if self._merge_gate is None:
+            return {"action_id": aid, "disposition": "held", "reason": "no_gate"}
+
+        import json as _json
+
+        try:
+            card = _json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError):
+            return {"action_id": aid, "disposition": "held", "reason": "bad_payload"}
+
+        disposition, tier, reason = self._merge_gate.evaluate(card, now_ms=int(time.time() * 1000))
+        if disposition != "auto":
+            # Held: the card stays held; a human still approves it via the normal
+            # nonce-gated Telegram button. The merge does NOT execute here.
+            return {"action_id": aid, "disposition": "held", "reason": reason, "tier": tier}
+
+        # AUTO-OK: the broker mints+burns a nonce INTERNALLY and runs the identical
+        # nonce+executor path as a human approval — the mint never crosses the socket.
+        nonce = self._approval.mint_nonce(aid)
+        executor = self._executor_for(row)
+        result = self._approval.approve(aid, nonce, executor=executor, decided_by="trust:auto")
+        return {"action_id": aid, "disposition": "auto", "tier": tier, "result": result}
+
     def _rpc_reject(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._approval.reject(params.get("action_id"), reason=params.get("reason"))
         return {"status": "rejected"}
@@ -377,6 +445,11 @@ def main() -> None:
             "git_push": build_git_push_executor(creds.egress_cred),
             "merge": build_merge_executor(creds.egress_cred),
         },
+        # merge_gate is deliberately NOT wired here (fail-closed): the auto_merge RPC
+        # holds every request until P1b-d injects a MergeGate whose compute_tier +
+        # ledger reader come from the factory side (the broker imports nothing from
+        # factory — the gate is constructed by the supervisor and passed in). A
+        # standalone broker launch therefore never auto-merges — it holds for a human.
     )
     server.serve_forever()
 

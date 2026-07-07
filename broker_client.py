@@ -133,6 +133,20 @@ class BrokerClient:
     def reject(self, action_id: str, *, nonce: Optional[str] = None, reason: Optional[str] = None) -> Dict[str, Any]:
         return self._call("reject", {"action_id": action_id, "nonce": nonce, "reason": reason})
 
+    def auto_merge(self, action_id: str) -> Dict[str, Any]:
+        """
+        Purpose: request a tier-gated auto-merge of a held 'merge' card (P1b-e).
+        Usage: res = client.auto_merge(action_id)  # the supervisor's trust path.
+        Gotchas: carries NO nonce — the caller has none and cannot obtain one. The
+        BROKER re-runs its own server-side gate (ring + never-graduates + tier over
+        the diff, fail-closed) and, ONLY on AUTO-OK, mints+burns a nonce internally
+        and runs the same executor as a human approval. Returns {disposition:
+        'auto'|'held', ...}; 'held' means the broker declined to auto-merge and the
+        card still awaits a human tap. This is the ONLY no-nonce release verb and it
+        is gated — it is NOT a self-approval bypass.
+        """
+        return self._call("auto_merge", {"action_id": action_id})
+
     def resolve_model_key(self, *, provider: str) -> Dict[str, Any]:
         """
         Purpose: ask the broker for the model-inference key for the given provider.
