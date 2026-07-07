@@ -59,6 +59,10 @@ RING_PATHS: Tuple[str, ...] = (
     # The retro's propose-gate wrapper (P5 v2-C2): the crown self-modification wall
     # lives here, so a retro editing skills/prompts must not be able to edit the gate.
     "factory/retro_ring_gate.py",
+    # The quiet-by-default proactive nudge contract (P6-c): a worker weakening
+    # "nudge_max: 1" to "nudge_max: 100" or "repeat: true" is a self-serving
+    # loosening — same posture as trust-policy.md.
+    "docs/factory/proactive-contract.md",
 )
 
 # git's "/dev/null" placeholder for an added/deleted side of a diff — not a path.
