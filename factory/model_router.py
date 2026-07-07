@@ -148,6 +148,9 @@ def admissible_ladder(
     repo: str,
     policy: Optional[MergePolicy],
     catalog: Optional[Dict[str, Any]],
+    *,
+    scorecard: Optional[Any] = None,
+    task_type: Optional[str] = None,
 ) -> List[RungSpec]:
     """
     Build the residency-filtered failover ladder for a repo, top rung first.
@@ -157,18 +160,35 @@ def admissible_ladder(
     false/unknown-policy repo the returned ladder contains ZERO openrouter rungs at
     ANY depth — there is no OR rung to fall to.
     Usage: ladder = admissible_ladder(repo, policy, catalog)
+    P5-a additive: when ``scorecard`` is provided, the ordering of first-party tiers
+    and OpenRouter candidates is derived from routing_view (scorecard-driven,
+    best-and-cheapest-first per task_type) instead of the hard-coded module-level
+    tuples.  The residency pre-filter (_rung_admissible) and the WAIT_FOR_CAPACITY
+    sentinel are UNCHANGED — only the ordering source changes.
     Gotchas:
       * Called fresh by ``select_tier`` and by ``next_rung`` on EVERY step (F1) — no
         caller may cache and re-index it, or a stale list could reintroduce an OR rung.
       * Tier numbers are assigned across the FULL candidate ladder before filtering,
         so a rung's tier is a stable ladder position independent of what was filtered.
+      * scorecard=None → falls back to the original hand-written order (cold start /
+        pre-P5 callers); the residency invariant is unchanged in both paths.
     """
+    # P5-a: derive ordering from the routing view when a scorecard is injected.
+    if scorecard is not None:
+        from factory.routing_view import ranked_first_party, ranked_openrouter
+
+        fp_order = ranked_first_party(catalog, scorecard, task_type=task_type)
+        or_models = ranked_openrouter(catalog, scorecard, task_type=task_type)
+    else:
+        fp_order = _FIRST_PARTY_LADDER
+        or_models = _probe_confirmed_openrouter_models(catalog)
+
     full: List[RungSpec] = []
     tier = 0
-    for worker, model in _FIRST_PARTY_LADDER:
+    for worker, model in fp_order:
         full.append(RungSpec(worker=worker, model=model, tier=tier))
         tier += 1
-    for model in _probe_confirmed_openrouter_models(catalog):
+    for model in or_models:
         full.append(RungSpec(worker="openrouter", model=model, tier=tier))
         tier += 1
     return [r for r in full if _rung_admissible(r.worker, repo, policy)]
@@ -179,6 +199,8 @@ def select_tier(
     task_type: str,
     policy: Optional[MergePolicy],
     catalog: Optional[Dict[str, Any]],
+    *,
+    scorecard: Optional[Any] = None,
 ) -> RungOrWait:
     """
     Pick the top admissible (probe-confirmed, residency-allowed) rung for a job.
@@ -187,11 +209,11 @@ def select_tier(
     For a false/unknown-policy repo this is always a first-party rung; if somehow no
     admissible rung exists, returns WAIT_FOR_CAPACITY (never OpenRouter).
     Usage: rung = select_tier(repo, "feature", policy, catalog)
-    Gotchas: task_type is accepted for future per-task routing (feature vs quick) and
-    is currently informational — the ladder order is task-independent. Residency is
-    enforced by the admissible_ladder filter, not by task_type.
+    P5-a additive: pass ``scorecard`` to enable per-task-type data-driven ordering via
+    routing_view.  When absent the ladder is task-order-independent (original behavior).
+    Gotchas: residency is enforced by the admissible_ladder filter, not by task_type.
     """
-    ladder = admissible_ladder(repo, policy, catalog)
+    ladder = admissible_ladder(repo, policy, catalog, scorecard=scorecard, task_type=task_type)
     if not ladder:
         return WAIT_FOR_CAPACITY
     return ladder[0]
@@ -202,6 +224,9 @@ def next_rung(
     repo: str,
     policy: Optional[MergePolicy],
     catalog: Optional[Dict[str, Any]],
+    *,
+    scorecard: Optional[Any] = None,
+    task_type: Optional[str] = None,
 ) -> RungOrWait:
     """
     The 429 step-down: the next admissible rung strictly below ``current``, or WAIT.
@@ -213,6 +238,7 @@ def next_rung(
     only sees first-party rungs when choosing the next one → WAIT_FOR_CAPACITY once
     the first-party tiers are exhausted.
     Usage: nxt = next_rung(current_rung, repo, policy, catalog)
+    P5-a additive: pass ``scorecard`` + ``task_type`` to enable data-driven ordering.
     Gotchas:
       * "strictly below" is by tier number: the first admissible rung whose tier >
         current.tier. A false repo has no admissible OR rung, so once past the last
@@ -220,7 +246,7 @@ def next_rung(
       * Returns WAIT_FOR_CAPACITY (not None, not an error) so the scheduler parks the
         job WAITING_CAPACITY rather than dispatching a residency-violating fallback.
     """
-    ladder = admissible_ladder(repo, policy, catalog)
+    ladder = admissible_ladder(repo, policy, catalog, scorecard=scorecard, task_type=task_type)
     for rung in ladder:
         if rung.tier > current.tier:
             return rung
