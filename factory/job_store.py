@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   trust_tier_at_spawn   INTEGER,                -- NULLABLE; reserved for P1b
   fail_reason           TEXT,                   -- populated on FAILED/NEEDS_ATTENTION
   intake_source_hash    TEXT,                   -- idempotency key for intake (§1.6)
+  intake_source         TEXT,                   -- 'jira'|'voice'|NULL — origin label (P6-d panel surfacing)
   budget_settled        INTEGER NOT NULL DEFAULT 0,  -- P3 §13.5: reservation released?
   resume_count          INTEGER NOT NULL DEFAULT 0,   -- P4-a §R1: crash-resume count (≤MAX_RESUMES)
   created_ts            INTEGER NOT NULL,
@@ -264,6 +265,11 @@ class JobStore:
             self._conn.execute(
                 "ALTER TABLE jobs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0"
             )
+        if "intake_source" not in cols:
+            # P6-d: origin label for the panel surface; NULL for pre-P6 jobs.
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN intake_source TEXT"
+            )
 
     # ------------------------------------------------------------------
     # Job lifecycle
@@ -289,14 +295,14 @@ class JobStore:
                     worktree_path, branch, pgid,
                     cost_so_far_usd, test_result, review_findings_path,
                     log_tail, confidence, trust_tier_at_spawn, fail_reason,
-                    intake_source_hash, created_ts, updated_ts
+                    intake_source_hash, intake_source, created_ts, updated_ts
                 ) VALUES (
                     :id, :repo, :base_branch, :spec, :kind, :worker, :model,
                     :budget_usd, :timeout_min, 'QUEUED',
                     NULL, NULL, NULL,
                     0, NULL, NULL,
                     NULL, NULL, NULL, NULL,
-                    :intake_source_hash, :created_ts, :updated_ts
+                    :intake_source_hash, :intake_source, :created_ts, :updated_ts
                 )
                 """,
                 {
@@ -310,6 +316,7 @@ class JobStore:
                     "budget_usd": spec.get("budget_usd", 1.0),
                     "timeout_min": spec.get("timeout_min", 30),
                     "intake_source_hash": spec.get("intake_source_hash"),
+                    "intake_source": spec.get("intake_source"),
                     "created_ts": now,
                     "updated_ts": now,
                 },
