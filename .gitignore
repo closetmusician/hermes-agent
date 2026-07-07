@@ -149,3 +149,8 @@ infographic/
 # pytest temp
 pytest-of-*/
 tmp*.env
+hermes_media_test*/
+kanban_*_test_*/
+kanban_cli_passthrough_*/
+tmp*.sh
+tmp*/
