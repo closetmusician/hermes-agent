@@ -114,6 +114,9 @@ class Scheduler:
         throttled_fn: Optional[Callable[[], bool]] = None,
         mirror_path: Optional[Path] = None,
         clock: Callable[[], float] = time.time,
+        checkpoint_reader: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ):
         self._store = store
         self._ledger = ledger
@@ -123,6 +126,11 @@ class Scheduler:
         self._throttled_fn = throttled_fn
         self._mirror_path = Path(mirror_path) if mirror_path else None
         self._clock = clock
+        # P4-a (§R1): the checkpoint reader that lets check_integrity route a
+        # crashed job WITH a valid checkpoint to RESUMABLE, and that the tick uses
+        # to re-admit RESUMABLE/WAITING_CAPACITY jobs. None ⇒ P3 behaviour (a
+        # crashed job parks terminal; no resume candidates surface).
+        self._checkpoint_reader = checkpoint_reader
 
     # ------------------------------------------------------------------
     # Enqueue — the node-scan-at-enqueue owner (§13.4)
@@ -201,8 +209,21 @@ class Scheduler:
           * A spawn is issued ONLY after reserve_slot succeeds; the spawn itself is
             outside the lock so a slow launch does not stall other writers.
         """
+        # P4-a (§R1): snapshot the RESUMABLE jobs that existed BEFORE this tick's
+        # integrity sweep. A job the sweep newly routes to RESUMABLE is re-admitted
+        # on the NEXT tick, not the same one — so the RESUMABLE park is observable
+        # (mirror + forensics) for one cadence and the crash→resume path is two
+        # distinct steps (design §R1's "run one tick … run the next tick").
+        resume_candidates = (
+            self._store.resumable_jobs() if self._checkpoint_reader is not None else []
+        )
+
         # 0/1. Reconcile: park dead-pgid jobs and release their reservations.
-        self._store.check_integrity(ledger=self._ledger)
+        #      A crashed job WITH a valid checkpoint is routed to RESUMABLE (not
+        #      terminal) when a checkpoint_reader is configured.
+        self._store.check_integrity(
+            ledger=self._ledger, checkpoint_reader=self._checkpoint_reader
+        )
 
         # 2/3. Count live slots; bail if at the cap.
         capacity = self._cap - self._count_live()
@@ -215,11 +236,30 @@ class Scheduler:
             self._write_mirror()
             return []
 
-        # 5. Ready = QUEUED & all deps DONE, oldest first.
+        admitted: List[str] = []
+
+        # 5a. RESUME first (P4-a §R1): a crashed job re-enters the pipeline from its
+        #     last cleared phase BEFORE fresh QUEUED work, so overnight progress is
+        #     recovered ahead of starting new jobs. Re-admission holds the SAME
+        #     atomic slot (reserve_resume_slot CAS) and counts toward the cap. The
+        #     resume budget is already reserved (never released on the RESUMABLE
+        #     reclaim), so there is no try_reserve here.
+        if self._checkpoint_reader is not None:
+            for job in resume_candidates:
+                if len(admitted) >= capacity:
+                    break
+                if not self._store.reserve_resume_slot(job["id"]):
+                    continue  # lost the race this tick — try next tick
+                if admitted:
+                    self._stagger_fn()
+                # Re-read so the spawn seam sees state='ADMITTED'.
+                self._spawn_fn(self._store.get(job["id"]))
+                admitted.append(job["id"])
+
+        # 5b. Ready = QUEUED & all deps DONE, oldest first.
         ready = self._store.ready_jobs()
 
-        # 6. Admit up to capacity, each behind both atomic gates.
-        admitted: List[str] = []
+        # 6. Admit up to remaining capacity, each behind both atomic gates.
         for node in ready:
             if len(admitted) >= capacity:
                 break

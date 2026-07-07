@@ -36,7 +36,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Import ULID generation from the shared broker utility so job IDs are the
 # same stable, time-sortable format as action IDs.
@@ -58,6 +58,9 @@ STATES = frozenset(
         "DONE",
         "FAILED",
         "NEEDS_ATTENTION",
+        # P4-a (Revision v2 §R1) — additive crash-resume + residency-wait states.
+        "RESUMABLE",
+        "WAITING_CAPACITY",
     }
 )
 
@@ -82,14 +85,28 @@ STATES = frozenset(
 # scheduler ALWAYS reserves the slot via QUEUED→ADMITTED and never uses the direct
 # edge, and the cap count includes ADMITTED.  Making ADMITTED mandatory is a P3-b
 # follow-up (drop RUNNING here + edit supervisor in the same change).
+# P4-a (design Revision v2 §R1) — ADDITIVE crash-resume states. RESUMABLE and
+# WAITING_CAPACITY are new, forward-only states; the inbound edges to them are
+# APPENDED to the existing live states (every pre-P4 target below is preserved, so
+# the one-way invariant and all P2/P3 transitions still hold). RESUMABLE = a job
+# whose worker died (dead pgid) but a VALID phase checkpoint exists — the scheduler
+# re-admits it (RESUMABLE→ADMITTED) and resumes from the last cleared phase; if
+# resume is impossible/exhausted it parks terminal (RESUMABLE→NEEDS_ATTENTION).
+# WAITING_CAPACITY = the residency wait-for-capacity park (P4-b §4.3), same two
+# forward exits. Both flow ONLY forward to ADMITTED or the terminal NEEDS_ATTENTION,
+# so the machine stays a DAG toward terminals (bounded by MAX_RESUMES per job).
 _ALLOWED: Dict[str, frozenset] = {
     "QUEUED": frozenset({"ADMITTED", "RUNNING", "FAILED"}),
-    "ADMITTED": frozenset({"RUNNING", "FAILED", "NEEDS_ATTENTION"}),
-    "RUNNING": frozenset({"TEST", "FAILED", "NEEDS_ATTENTION"}),
-    "TEST": frozenset({"REVIEW", "RUNNING", "NEEDS_ATTENTION"}),
-    "REVIEW": frozenset({"AWAITING_APPROVAL", "RUNNING", "NEEDS_ATTENTION"}),
+    "ADMITTED": frozenset({"RUNNING", "FAILED", "NEEDS_ATTENTION", "RESUMABLE"}),
+    "RUNNING": frozenset(
+        {"TEST", "FAILED", "NEEDS_ATTENTION", "RESUMABLE", "WAITING_CAPACITY"}
+    ),
+    "TEST": frozenset({"REVIEW", "RUNNING", "NEEDS_ATTENTION", "RESUMABLE"}),
+    "REVIEW": frozenset({"AWAITING_APPROVAL", "RUNNING", "NEEDS_ATTENTION", "RESUMABLE"}),
     "AWAITING_APPROVAL": frozenset({"MERGING", "NEEDS_ATTENTION"}),
     "MERGING": frozenset({"DONE", "NEEDS_ATTENTION"}),
+    "RESUMABLE": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
+    "WAITING_CAPACITY": frozenset({"ADMITTED", "NEEDS_ATTENTION"}),
     "DONE": frozenset(),
     "FAILED": frozenset(),
     "NEEDS_ATTENTION": frozenset(),
@@ -136,6 +153,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   fail_reason           TEXT,                   -- populated on FAILED/NEEDS_ATTENTION
   intake_source_hash    TEXT,                   -- idempotency key for intake (§1.6)
   budget_settled        INTEGER NOT NULL DEFAULT 0,  -- P3 §13.5: reservation released?
+  resume_count          INTEGER NOT NULL DEFAULT 0,   -- P4-a §R1: crash-resume count (≤MAX_RESUMES)
   created_ts            INTEGER NOT NULL,
   updated_ts            INTEGER NOT NULL
 );
@@ -212,17 +230,19 @@ class JobStore:
         # a momentary write-lock waits up to 5s instead of raising SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
-        self._migrate_budget_settled()
+        self._migrate_columns()
         self._conn.commit()
 
-    def _migrate_budget_settled(self) -> None:
+    def _migrate_columns(self) -> None:
         """
-        Purpose: add the budget_settled column to a pre-P3 jobs table that was
-        created before the column existed (CREATE IF NOT EXISTS never alters an
-        existing table).  Idempotent — a no-op once the column is present.
+        Purpose: add additive columns to a jobs table created before they existed
+        (CREATE IF NOT EXISTS never alters an existing table).  Idempotent — a
+        no-op once each column is present.  Covers budget_settled (P3 §13.5) and
+        resume_count (P4-a §R1).
         Usage: called once from __init__ after the schema script runs.
         Gotchas: ALTER TABLE ADD COLUMN is the only safe in-place migration in
-        SQLite; wrapped so a fresh DB (column already present) does not error.
+        SQLite; each add is guarded so a fresh DB (column already present) does not
+        error.  A default is required because the column is NOT NULL.
         """
         cols = {
             r["name"]
@@ -231,6 +251,10 @@ class JobStore:
         if "budget_settled" not in cols:
             self._conn.execute(
                 "ALTER TABLE jobs ADD COLUMN budget_settled INTEGER NOT NULL DEFAULT 0"
+            )
+        if "resume_count" not in cols:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN resume_count INTEGER NOT NULL DEFAULT 0"
             )
 
     # ------------------------------------------------------------------
@@ -469,6 +493,44 @@ class JobStore:
             self._conn.commit()
             return cur.rowcount == 1
 
+    def reserve_resume_slot(self, job_id: str) -> bool:
+        """
+        Purpose: atomically claim a concurrency slot for a RESUMABLE or
+        WAITING_CAPACITY job by CAS-moving it → ADMITTED under the one shared lock,
+        BEFORE the scheduler re-launches it from its checkpoint (P4-a §R1).  Mirrors
+        reserve_slot's atomic-admission guarantee for the crash-resume re-entry.
+        Usage: if store.reserve_resume_slot(jid): resume_spawn(...); else retry.
+        Gotchas: returns True on rowcount==1 (we won the CAS from RESUMABLE or
+        WAITING_CAPACITY); False if the job was no longer in a resumable state
+        (another writer took it, or it already re-admitted).  The forward-only edge
+        RESUMABLE/WAITING_CAPACITY → ADMITTED is enforced by the DB predicate here.
+        """
+        now = _now_ms()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET state='ADMITTED', updated_ts=? "
+                "WHERE id=? AND state IN ('RESUMABLE','WAITING_CAPACITY')",
+                (now, job_id),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def resumable_jobs(self) -> List[Dict[str, Any]]:
+        """
+        Purpose: return jobs parked RESUMABLE (a crashed worker with a valid
+        checkpoint) that the scheduler should re-admit and relaunch, oldest first.
+        WAITING_CAPACITY is intentionally EXCLUDED here — those need a router
+        admissibility re-check (P4-b) before re-admission and are handled separately.
+        Usage: for job in store.resumable_jobs()[:capacity]: re_admit(job).
+        Gotchas: a snapshot; the store may change between calls.  Ordering by
+        updated_ts surfaces the longest-waiting crash first.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE state = 'RESUMABLE' ORDER BY updated_ts"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Supervisor lock
     # ------------------------------------------------------------------
@@ -557,7 +619,11 @@ class JobStore:
     # Per-tick integrity check
     # ------------------------------------------------------------------
 
-    def check_integrity(self, ledger: Optional[Any] = None) -> List[Dict[str, Any]]:
+    def check_integrity(
+        self,
+        ledger: Optional[Any] = None,
+        checkpoint_reader: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Purpose: validate store invariants at the start of each supervisor/scheduler
         tick.  Catches corruption before acting on potentially bad state.  Each
@@ -579,6 +645,15 @@ class JobStore:
         Gotchas: this method WRITES to the store (parks bad rows); call only
         from the supervisor/scheduler tick, not from read-only callers.  Passing
         no ledger keeps the P2 behaviour (state reconciliation only, no release).
+
+        P4-a (Revision v2 §R1): ``checkpoint_reader`` is an optional callback
+        ``(job_row) -> {"valid": bool, "exhausted": bool} | None`` that lets the
+        reclaim path route a dead-pgid job WITH a valid, non-exhausted phase
+        checkpoint to RESUMABLE instead of terminal NEEDS_ATTENTION.  When it is
+        None (every P2/P3 caller), the reclaim behaviour is UNCHANGED — the job
+        parks NEEDS_ATTENTION exactly as before.  The reader is injected (rather
+        than importing phase_checkpoint here) to keep job_store free of a factory
+        module cycle.
         """
         violations: List[Dict[str, Any]] = []
         now = _now_ms()
@@ -613,7 +688,9 @@ class JobStore:
                         "detail": f"pgid {pgid} no longer alive",
                     }
                     violations.append(v)
-                    self._reclaim_dead_job(jid, job, pgid, now, ledger)
+                    self._reclaim_dead_job(
+                        jid, job, pgid, now, ledger, checkpoint_reader
+                    )
 
             # (c) Cost over budget.
             if (
@@ -676,24 +753,55 @@ class JobStore:
         pgid: int,
         now: int,
         ledger: Optional[Any],
+        checkpoint_reader: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         """
-        Purpose: park a dead-pgid job to NEEDS_ATTENTION and release its budget
-        reservation exactly once (P3 §13.5).  The budget_settled flag is set in
-        the SAME UPDATE that changes state, so a second integrity sweep sees the
-        flag already set and does NOT double-release the reservation.
+        Purpose: reclaim a dead-pgid job.  P4-a (Revision v2 §R1) makes the target
+        CHECKPOINT-AWARE: a job with a VALID, non-exhausted phase checkpoint is
+        routed to RESUMABLE (the scheduler re-admits and resumes from the last
+        cleared phase); a job with NO checkpoint, an INVALID one, or one that has
+        exhausted MAX_RESUMES is parked terminal at NEEDS_ATTENTION exactly as
+        before.  The budget_settled flag is set in the SAME UPDATE that changes
+        state so a second sweep never double-settles.
         Usage: called from check_integrity when a live job's process group is gone.
-        Gotchas: the ledger release happens only if budget_settled was 0 BEFORE
-        this reclaim — read the flag first, flip it atomically with the park, then
-        (and only then) return the dollars.  A crash between the park and the
-        release is self-healing: the flag guards against double-release, and a
-        never-flipped flag would be re-reclaimed on the next sweep (the job is
-        still NEEDS_ATTENTION with budget_settled unset only if the park committed
-        but we crashed before flipping — which cannot happen since both are one
-        UPDATE).
+        Gotchas:
+          * RESERVATION ORDERING differs by target.  On the terminal
+            NEEDS_ATTENTION path the reservation is RELEASED (unchanged P3 §13.5)
+            and budget_settled flips to 1.  On the RESUMABLE path the job WILL
+            re-run and re-spend, so the reservation is KEPT and budget_settled
+            stays 0 — releasing it would let a resumed job spend past the ceiling.
+          * The release happens only if budget_settled was 0 BEFORE this reclaim,
+            so the terminal path is idempotent across sweeps.
+          * checkpoint_reader is injected (not imported) to avoid a job_store →
+            phase_checkpoint module cycle.  None ⇒ legacy terminal behaviour.
         """
-        already_settled = bool(job.get("budget_settled", 0))
         expected = job["state"]  # ADMITTED or RUNNING
+
+        # Decide the target: RESUMABLE iff a valid, non-exhausted checkpoint exists.
+        target = "NEEDS_ATTENTION"
+        if checkpoint_reader is not None:
+            try:
+                ckpt = checkpoint_reader(job)
+            except Exception:
+                ckpt = None  # a broken reader must not crash the sweep — fail-closed
+            if ckpt and ckpt.get("valid") and not ckpt.get("exhausted"):
+                target = "RESUMABLE"
+
+        if target == "RESUMABLE":
+            # Keep the reservation (the job re-runs); do NOT flip budget_settled.
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE jobs SET state='RESUMABLE', fail_reason=?, updated_ts=? "
+                    "WHERE id=? AND state=?",
+                    (f"integrity: dead pgid {pgid} (resumable)", now, jid, expected),
+                )
+                self._conn.commit()
+            return
+
+        # Terminal park (unchanged P3 §13.5 settlement path).
+        already_settled = bool(job.get("budget_settled", 0))
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE jobs SET state='NEEDS_ATTENTION', fail_reason=?, "
