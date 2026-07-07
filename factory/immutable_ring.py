@@ -56,6 +56,9 @@ RING_PATHS: Tuple[str, ...] = (
     "factory/injection_scan.py",
     "factory/cost_stops.py",
     "factory/worker_env.py",
+    # The retro's propose-gate wrapper (P5 v2-C2): the crown self-modification wall
+    # lives here, so a retro editing skills/prompts must not be able to edit the gate.
+    "factory/retro_ring_gate.py",
 )
 
 # git's "/dev/null" placeholder for an added/deleted side of a diff — not a path.

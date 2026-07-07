@@ -42,6 +42,9 @@ BROKER_RING_PATHS: Tuple[str, ...] = (
     "factory/injection_scan.py",
     "factory/cost_stops.py",
     "factory/worker_env.py",
+    # The retro propose-gate wrapper (P5 v2-C2). Mirrors the factory RING_PATHS
+    # addition so AT-RING-2 (BROKER_RING_PATHS ⊇ factory RING_PATHS) stays green.
+    "factory/retro_ring_gate.py",
 )
 
 _DEV_NULL = "/dev/null"

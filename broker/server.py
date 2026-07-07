@@ -435,6 +435,7 @@ def main() -> None:
     from broker.executors.git_push_executor import build_git_push_executor
     from broker.executors.merge_executor import build_merge_executor
     from broker.executors.message_executor import build_message_executor
+    from broker.executors.retro_diff_executor import build_retro_diff_executor
 
     server = BrokerServer(
         socket_path=home / "broker.sock",
@@ -444,6 +445,10 @@ def main() -> None:
             "message": build_message_executor(creds.egress_cred),
             "git_push": build_git_push_executor(creds.egress_cred),
             "merge": build_merge_executor(creds.egress_cred),
+            # WALL 2 of the crown self-modification guard (P5 v2-C1): the retro_diff
+            # apply door re-checks the ring over the exact hash-pinned bytes before
+            # git-apply. The registry dispatches by type — no _rpc_approve edit.
+            "retro_diff": build_retro_diff_executor(),
         },
         # merge_gate is deliberately NOT wired here (fail-closed): the auto_merge RPC
         # holds every request until P1b-d injects a MergeGate whose compute_tier +
