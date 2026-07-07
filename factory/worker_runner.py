@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional
 
 from factory.job_schema import WorkerResultInvalid, parse_worker_output
+from factory.merge_policy import MergePolicy
+from factory.residency_guard import assert_openrouter_allowed
 from factory.worker_env import assert_no_egress, scrub_env
 from worker.base import WorkerHandle, WorkerResult, WorkerSpec
 from worker.local_subprocess import LocalSubprocessWorker
@@ -150,7 +152,10 @@ class WorkerRunSpec:
                          budget_usd=2.0, timeout_min=20, slug="add-x")
     Gotchas: model_key is the broker-injected value (inference-only). It is set by
     the supervisor from the broker's resolve_model_key RPC (design §2.3A) and is
-    never read from os.environ here.
+    never read from os.environ here. policy carries the repo's residency posture
+    (allow_openrouter); it defaults None which the residency guard treats as
+    fail-closed (no third-party host) — the supervisor/scheduler populates it via
+    load_merge_policy(repo) with default_policy(repo) as the safe fallback.
     """
 
     job_id: str
@@ -165,6 +170,7 @@ class WorkerRunSpec:
     model_key: Optional[str] = None
     allowed_tools: Optional[List[str]] = None  # per-repo override; default least-priv
     extra_prompt: Optional[str] = None  # e.g. an approved stage-1 spec for stage-2
+    policy: Optional[MergePolicy] = None  # residency posture; None → fail-closed
 
 
 @dataclass
@@ -346,7 +352,15 @@ class WorkerRunner:
         Gotchas: raises EgressKeyLeaked if any egress key or out-of-whitelist key is
         present — which is exactly what happens if scrub_env is ever weakened to
         inherit os.environ. model_key must be the broker-injected inference key.
+        Raises ResidencyViolation FIRST if a third-party (OpenRouter) worker is
+        requested for a work/allow_openrouter:false job — see the wall below.
         """
+        # RESIDENCY WALL (design §13.1) — runs BEFORE the model key is ever looked
+        # up or placed. Unconditional: a future _PROVIDER_MODEL_KEY["openrouter"]
+        # entry cannot leak a key for a work job because the guard raises first and
+        # no env is built. Fail-closed on unknown residency (policy None → denied).
+        assert_openrouter_allowed(run_spec.repo, run_spec.worker, run_spec.policy)
+
         model_key_name = _PROVIDER_MODEL_KEY.get(run_spec.worker)
         model_env: Optional[Mapping[str, str]] = None
         if run_spec.model_key and model_key_name:

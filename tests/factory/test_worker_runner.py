@@ -339,3 +339,168 @@ def test_collect_maps_bad_output_to_error(tmp_path):
     launch = runner.launch(_run_spec(tmp_path))
     with pytest.raises(WorkerResultInvalid):
         runner.collect(launch.handle, expected_branch=launch.branch)
+
+
+# ===========================================================================
+# P3-0: DATA-RESIDENCY WALL (design §6.2 / §13.1). The residency guard is WIRED
+# into build_worker_env — an OpenRouter key CANNOT be injected for a work/
+# allow_openrouter:false job even if _PROVIDER_MODEL_KEY later maps openrouter.
+# These run against the REAL build_worker_env seam (no git worktree needed, so
+# they execute in the sandbox where the git-init tests cannot).
+# ===========================================================================
+from unittest import mock  # noqa: E402
+
+from factory.merge_policy import MergePolicy, default_policy  # noqa: E402
+from factory.residency_guard import (  # noqa: E402
+    ResidencyViolation,
+    assert_openrouter_allowed,
+)
+
+
+def _runner_no_git():
+    """A WorkerRunner whose build_worker_env we call directly (no worktree)."""
+    return WorkerRunner(repo_root="/nonexistent", worktrees_root="/nonexistent")
+
+
+# --- REQ-01: the guard in isolation (denied / allowed / fail-closed) ----------
+def test_guard_denies_work_openrouter():
+    """work/Diligent + allow_openrouter:false + openrouter provider → denied."""
+    policy = default_policy("diligent-platform")  # allow_openrouter defaults False
+    with pytest.raises(ResidencyViolation):
+        assert_openrouter_allowed("diligent-platform", "openrouter", policy)
+
+
+def test_guard_allows_personal_openrouter_when_opted_in():
+    """personal + allow_openrouter:true + openrouter → allowed (no raise)."""
+    policy = MergePolicy(repo="myproj", allow_openrouter=True)
+    assert_openrouter_allowed("myproj", "openrouter", policy)  # no raise
+
+
+def test_guard_fails_closed_on_unknown_policy():
+    """policy=None (unknown/unmapped residency) + openrouter → denied."""
+    with pytest.raises(ResidencyViolation):
+        assert_openrouter_allowed("mystery-repo", "openrouter", None)
+
+
+def test_guard_ignores_first_party_workers():
+    """claude/codex are first-party — never gated, even with openrouter off."""
+    policy = default_policy("diligent-platform")  # allow_openrouter False
+    assert_openrouter_allowed("diligent-platform", "claude", policy)  # no raise
+    assert_openrouter_allowed("diligent-platform", "codex", policy)  # no raise
+
+
+# --- REQ-02/03: the WIRING — build_worker_env CALLS the guard at the seam -----
+def test_build_worker_env_calls_residency_guard():
+    """
+    The CALL proof (design §13.1, review P0-1): build_worker_env must invoke
+    assert_openrouter_allowed with the run_spec's repo/worker/policy. Spy on the
+    guard as imported by worker_runner and assert it was called.
+    """
+    runner = _runner_no_git()
+    spec = _run_spec(
+        None,
+        repo="diligent-platform",
+        worker="claude",
+        model_key="sk-ant-fake",
+        policy=default_policy("diligent-platform"),
+    )
+    with mock.patch(
+        "factory.worker_runner.assert_openrouter_allowed"
+    ) as spy:
+        runner.build_worker_env(spec)
+    spy.assert_called_once()
+    call = spy.call_args
+    assert call.args[0] == "diligent-platform"  # repo
+    assert call.args[1] == "claude"  # worker
+    assert isinstance(call.args[2], MergePolicy)  # policy
+
+
+def test_work_openrouter_job_gets_no_key_at_the_seam(monkeypatch):
+    """
+    The OUTCOME proof (design §13.1, not theater): even if _PROVIDER_MODEL_KEY is
+    made to map openrouter, a work/allow_openrouter:false job requesting openrouter
+    raises ResidencyViolation from build_worker_env BEFORE any key is placed — so
+    no env with an OpenRouter key can ever be returned.
+    """
+    # Stub the provider→key map to DO carry openrouter (the P4 future state).
+    monkeypatch.setattr(
+        "factory.worker_runner._PROVIDER_MODEL_KEY",
+        {"claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
+    )
+    runner = _runner_no_git()
+    spec = _run_spec(
+        None,
+        repo="diligent-platform",
+        worker="openrouter",
+        model_key="sk-or-fake",
+        policy=default_policy("diligent-platform"),  # allow_openrouter False
+    )
+    with pytest.raises(ResidencyViolation):
+        runner.build_worker_env(spec)
+
+
+def test_work_env_defaults_to_failclosed_policy(monkeypatch):
+    """
+    A WorkerRunSpec with NO policy set (default None) + openrouter worker → the
+    seam treats unknown residency as allow_openrouter:false and refuses the key.
+    """
+    monkeypatch.setattr(
+        "factory.worker_runner._PROVIDER_MODEL_KEY",
+        {"claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
+    )
+    runner = _runner_no_git()
+    spec = _run_spec(None, worker="openrouter", model_key="sk-or-fake")  # policy=None
+    with pytest.raises(ResidencyViolation):
+        runner.build_worker_env(spec)
+
+
+def test_personal_openrouter_admitted_at_seam(monkeypatch):
+    """
+    Positive path: personal repo with allow_openrouter:true + openrouter worker
+    builds a clean env carrying the OpenRouter key (the guard does not over-block).
+    """
+    monkeypatch.setattr(
+        "factory.worker_runner._PROVIDER_MODEL_KEY",
+        {"claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
+    )
+    runner = _runner_no_git()
+    spec = _run_spec(
+        None,
+        repo="myproj",
+        worker="openrouter",
+        model_key="sk-or-fake",
+        policy=MergePolicy(repo="myproj", allow_openrouter=True),
+    )
+    env = runner.build_worker_env(spec)
+    assert env["OPENROUTER_API_KEY"] == "sk-or-fake"
+
+
+# --- REQ-04: anti-weakening — removing the guard call must break a test -------
+def test_antiweakening_guard_call_is_load_bearing(monkeypatch):
+    """
+    Neutralize the guard (make it a no-op) and stub in an openrouter key mapping:
+    build_worker_env would then wrongly build a work-repo OpenRouter env. This
+    test asserts that WITH the guard active the work job is refused — so if the
+    guard call is ever deleted from build_worker_env, test_work_openrouter_job_
+    gets_no_key_at_the_seam flips to returning a key and FAILS. This test proves
+    the guard, not its bypass, is what blocks the key.
+    """
+    monkeypatch.setattr(
+        "factory.worker_runner._PROVIDER_MODEL_KEY",
+        {"claude": "ANTHROPIC_API_KEY", "openrouter": "OPENROUTER_API_KEY"},
+    )
+    runner = _runner_no_git()
+    spec = _run_spec(
+        None,
+        repo="diligent-platform",
+        worker="openrouter",
+        model_key="sk-or-fake",
+        policy=default_policy("diligent-platform"),
+    )
+    # Guard active → refused (the load-bearing behavior).
+    with pytest.raises(ResidencyViolation):
+        runner.build_worker_env(spec)
+    # Guard neutralized → a key WOULD be injected (documents what the guard prevents).
+    monkeypatch.setattr("factory.worker_runner.assert_openrouter_allowed", lambda *a, **k: None)
+    env = runner.build_worker_env(spec)
+    assert env["OPENROUTER_API_KEY"] == "sk-or-fake"
