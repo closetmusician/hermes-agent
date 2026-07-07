@@ -48,6 +48,65 @@ The building blocks are unusually complete. Hermes already has, running in produ
 
 ---
 
+## Key files (read these for detail)
+
+Paths below are relative to the repo root (`~/Code/hermes/`). The build ran on branch `factory` (86 commits over upstream `a05b64d67`, pushed to the `fork` remote = closetmusician/hermes-agent).
+
+| File | What it is | Read it when |
+|---|---|---|
+| `docs/plans/harness/fable/COMPLETION-REPORT.md` | Executive completion report — what shipped per phase, security invariants, staged vs live, honest limitations. | Read first for the whole-run picture. |
+| `docs/plans/harness/fable/FINAL-VERIFICATION.md` | Independent whole-factory verification: full-suite run (8969 pass / 99 env-only), 6 cross-module security invariants, flags-off no-op. | Read for the aggregate proof + final verdict. |
+| `docs/plans/harness/fable/STAGED-GATES.md` | Every gate that needs an owner action or wall-clock event to flip live, with the exact command/procedure per row. | Read to take the run live (broker cutover, launchd, secrets). |
+| `docs/plans/harness/fable/PM-OS-HANDOFF.md` | The R/P1c code that lands in `~/Code/pm_os` (separate repo) — tested green, uncommitted; the commit commands. | Read before committing the pm_os-side changes. |
+| `docs/plans/harness/fable/p{0,1a,1b,1c,2,3,4,5,6}/P*-design.md` | Per-phase architecture designs (what to build + why + file-disjoint task breakdown). | Read for the reasoning behind any phase's implementation. |
+| `docs/plans/harness/fable/p*/P*-review.md` | Per-phase adversarial red-team findings (the P0s caught before code was written). | Read to understand the security constraints that shaped each build. |
+| `docs/plans/harness/fable/p*/P*-verification.md` (+ `p1bc-verification.md`) | Per-phase independent verifier reports (re-run + neuter-and-fail proofs). | Read for the evidence behind any phase's PASS. |
+| `docs/plans/harness/fable/p*/P*-report.md` | Per-task coder reports (RED→GREEN, files, evidence). | Read for task-level implementation detail. |
+| `docs/plans/harness/fable/plan-extraction-full.md` | Full-fidelity extraction of this plan (all phases/tasks/criteria) produced at run start. | Read as a condensed index of the plan itself. |
+
+---
+
+## Completion status (run 2026-07-06 → 07)
+
+All phases P0→P6 built and independently verified — **PASS-WITH-STAGED, 0 BLOCKING at close.** Legend: **`[x]`** = built and independently verified PASS; **`[~]`** = code-complete and verified, but a live-cutover or wall-clock acceptance step remains — the `[~]` items are exactly the deferrals in the Remaining-TODO tables below, honestly instrumented in `STAGED-GATES.md`, not silently dropped. Order shown follows the plan's execution order (`P0 → R → P1a → [P1c ∥ P2] → P1b → P3 → P4 → P5 → P6`).
+
+| Phase | Status | Verification evidence |
+|---|---|---|
+| **P0** Factory-ready host | [~] 26 VERIFIED / 2 STAGED | `p0/P0-verification.md` (launchd bootstrap + OpenRouter key staged) |
+| **R** Fix what's broken | [x] 5 VERIFIED / 1 CONTRADICTED→closed | `r/R-verification.md` (sp-checkout refresh-lock gap closed) |
+| **P1a** Broker + approval + worker launcher | [~] 13 VERIFIED / 3 STAGED | `p1a/P1a-verification.md` (anti-theater reproduced; flags-off no-op; live cutover staged) |
+| **P2** One worker end to end | [x] safety proven + first-magic e2e | `p2/P2-verification.md` (+ supervisor + silent-merge bug fixed) |
+| **P1b** Trust ledger + graduation | [~] 6 VERIFIED (shared w/ P1c) | `p1bc-verification.md` (crown auto-merge P0s closed; 30-day/10-merge graduation staged) |
+| **P1c** Assistant essentials | [~] (shared w/ P1b) | `p1bc-verification.md` (exactly-one-send proven; real inbox/meeting staged) |
+| **P3** Task-splitter + fleet scheduler + intake | [x] 182 tests, 0 BLOCKING | `p3/P3-verification.md` (residency + cap-3 anti-theater fired) |
+| **P4** Overnight autonomy | [~] 117 tests, 0 BLOCKING | `p4/P4-verification.md` (crash-resume real; 3-night flagship staged) |
+| **P5** Learning loops + self-supervision | [x] 124 tests, 0 BLOCKING | `p5/P5-verification.md` (both self-mod walls proven load-bearing) |
+| **P6** Factory mission control | [~] 50 tests, B1 fixed | `p6/P6-verification.md` (no-bypass proven; live steer staged) |
+| **Final** Whole-factory | [x] 8969 pass / 99 env-only / 0 genuine | `FINAL-VERIFICATION.md` — **COHERENT-AND-SAFE-WITH-STAGED** |
+
+### Remaining TODO (open, non-blocking)
+
+**NEEDS-USER — a human action only Yu-Kuan can take (see `STAGED-GATES.md`):**
+
+| # | Item | Unblocks |
+|---|---|---|
+| [ ] | Live broker cutover: migrate egress secrets to broker-only source/keychain → start broker launchd service → restart gateway so egress routes through the broker (SG-P1a-1..4) | going live — until then `HERMES_BROKER_EGRESS_STARVE`/`HERMES_BROKER_ROUTE` default OFF and the running gateway is unchanged |
+| [ ] | In a real Terminal: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.hermes.{caffeinate,prewarm}.plist` (SG-P0-1) | unattended-host keep-awake + ~10pm credential pre-warm |
+| [ ] | Add `OPENROUTER_API_KEY=...` to `~/.hermes/.env`, then re-run `scripts/probe.py` (SG-P0-2) | live OpenRouter catalog + phantom-model (GLM-5.2) fail-loud proof |
+| [ ] | Commit the R/P1c changes in `~/Code/pm_os` (separate repo — tested green, uncommitted) per `PM-OS-HANDOFF.md` | single token-refresh owner, SSO re-auth signal, scheduled preflight, inbox/meeting-prep landing in pm_os |
+| [ ] | Restart the gateway to confirm zombie-platform log silence (SG-P0-3) | live confirmation Discord/WhatsApp reconnect noise is gone |
+
+**Wall-clock-deferred — mechanism built + synthetically verified; verdict accrues over time:**
+
+| # | Item | Evaluate |
+|---|---|---|
+| [ ] | P4 3-consecutive-night flagship overnight run on `p4-gate-queue.md` (≥5 tasks PR-ready before 7am, cost under ceiling) | after 3 real nights (owner authors the seed queue) |
+| [ ] | P1b tier-1 graduation: ≥10 consecutive clean merges + 0 reverts + ≥30 days per repo×task-type | as real merge outcomes accrue (`docs/factory/trust-policy.md`) |
+| [ ] | P1c real meeting-prep · P6 live voice-note → task card · P6 live control-card steering a real job end-to-end | after real inbox/calendar/voice/steer runs |
+| [ ] | P5 2-week cost-per-merged-PR downward trend; P0-5 dedicated ≥20-job metered gauntlet to refine `compute.md` | after 2 weeks of real runs / one metered gauntlet |
+
+---
+
 ## §1 — Locked Decisions
 
 Owner-confirmed on 2026-07-03. These override anything in v1 that conflicts.
