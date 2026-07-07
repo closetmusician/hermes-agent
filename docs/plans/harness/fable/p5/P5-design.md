@@ -22,6 +22,115 @@
 
 ---
 
+## Revision v2 — red-team closures
+
+The adversarial review (`P5-review.md`, verdict SHIP-WITH-FIXES: P0=1, P1=3, P2=2) found the
+crown propose-gate is sound but the design named **only one wall**. A retro diff becomes an
+owner-approved held action and is applied via the broker's human-tap approve path — and that path
+does **not** re-check the ring. So the design as v1 was *one-walled* on the apply door. v2 adds the
+missing second wall and closes the two path-list gaps. All closures were verified against real code
+this session; file:line cited below.
+
+**The load-bearing fact (verified this session).** The broker re-checks the ring server-side ONLY
+on `_rpc_auto_merge` for `type=="merge"` cards (`broker/server.py:328` handler → `merge_gate` →
+`check_ring`, `broker/merge_gate.py:152`). The human-tap `_rpc_approve` (`broker/server.py:308`)
+resolves the executor by row type (`_executor_for`, `:117`) and runs it via
+`ApprovalAuthority.approve` with **no ring re-check**. A `retro_diff` held action, approved by an
+owner Telegram tap, therefore flows through `_rpc_approve` — the propose-time factory gate
+(`check_retro_diff`) is its *only* wall unless the executor itself re-checks. **This is the P0.**
+
+### v2-C1 — [P0 / V1] Second wall: the `retro_diff` broker executor re-checks the ring (apply door)
+
+The fix mirrors how merge auto-approve is walled, but placed to cover the *human-tap* path the retro
+actually uses. A NEW broker executor `broker/executors/retro_diff_executor.py` (a `build_*_executor`
+factory exactly like `merge_executor.py:build_merge_executor`, wired into the `executors={...}` dict
+at `broker/server.py:441-446` — **zero `server.py` edits**, the registry dispatches by type) performs,
+IN THIS ORDER, before it writes a single byte to disk:
+
+```
+retro_diff executor (runs under _rpc_approve, owner-tapped, in the broker process):
+  1. VERIFY BYTES   the payload carries {diff, diff_sha256, target_files}. Recompute
+                    sha256 over the exact diff bytes; MISMATCH ⇒ return ("held"/rejected,
+                    reason="diff_hash_mismatch) — do NOT apply. (closes the TOCTOU, v2-C3.)
+  2. RING RE-CHECK  broker.merge_gate.check_ring(diff, worktree_root=<apply worktree>) over
+                    the EXACT bytes about to be applied. RingViolation ⇒ reject, apply
+                    NOTHING. This reuses the broker's OWN BROKER_RING_PATHS superset
+                    (broker/merge_gate.py:41, AT-RING-2 asserts ⊇ factory RING_PATHS), so
+                    the executor imports nothing from factory — layering (factory→broker)
+                    is preserved exactly as merge_gate does.
+  3. FAIL-CLOSED    any exception, unreadable/empty diff, or path escaping the worktree ⇒
+                    check_ring already raises RingViolation (broker/merge_gate.py:164-166)
+                    ⇒ reject. The executor never applies on a check it could not complete.
+  4. APPLY          only now git-apply the verified, ring-clean diff to the target worktree.
+```
+
+**Two walls, both fail-closed:**
+1. **Propose-gate** — `retro_ring_gate.check_retro_diff` (factory side, §4.2), BEFORE `enqueue_action`.
+   A ring-touching proposal never becomes a held action; the owner never sees it.
+2. **Apply-gate** — the `retro_diff` executor re-checks `check_ring` over the exact bytes it is about
+   to apply, AFTER the owner tap, BEFORE `git apply`. Even if the propose-gate were bypassed, mutated,
+   or buggy, the owner-approved apply **never touches a ring path**.
+
+The single most important consequence: **RT-3 must exercise the EXECUTOR (the apply door), not only
+the propose gate.** A retro diff whose bytes touch `broker/`, `cost_stops.py`, `trust-policy.md`, or
+`never-graduates.md`, fed straight to the executor with a valid hash, must be REJECTED at apply and
+apply nothing. Deleting the executor's `check_ring` call must make that test leak (RED). See §8 RT-3.
+
+> **Escalation resolved (REQ-01 escalate_if).** "Can the broker host a retro_diff executor cleanly?"
+> — YES, verified. The executor registry (`broker/executors/__init__.py:ExecutorRegistry`) dispatches
+> by action-type string and is wired via the constructor `executors={...}` dict; adding `retro_diff`
+> is one factory + one dict entry, **no maintainer edit to `server.py` dispatch logic**. The ring
+> re-check reuses `merge_gate.check_ring` (already in the broker, already superset-tested). No new
+> seam is needed.
+
+### v2-C2 — [P1 / V3] The retro gate protects its own source
+
+`factory/retro_ring_gate.py` (the crown-wall file) is added to `RING_PATHS`, mirroring how
+`immutable_ring.py` already protects its own source (`factory/immutable_ring.py:55`). A retro is
+*permitted* to edit skills/prompts; without this, a retro diff editing the gate wrapper itself would
+NOT be a ring path and the propose-gate would pass it. **Additive one-line ring change** (a sanctioned
+maintainer edit to the ring source). Parity: because `BROKER_RING_PATHS` must stay a superset
+(AT-RING-2, `broker/merge_gate.py:14`), the same path is added to `BROKER_RING_PATHS`
+(`broker/merge_gate.py:41`) in the same change — two one-line edits, keeping the superset invariant
+green. Any future new retro-gate module is added identically. Exact additions in §1 note 3 + §7.1.
+
+### v2-C3 — [P1 / V4] PROPOSE/APPLY TOCTOU: hash-pin the gated bytes
+
+The propose-gate hashes the gated diff (`diff_sha256 = sha256(diff_bytes)`) and stores it in the
+held-action payload alongside the diff. The apply executor (v2-C1 step 1) recomputes the hash over
+the bytes it is about to apply and rejects on mismatch — so the checked artifact and the applied
+artifact are provably identical (no owner-edit, re-render, or stale-worktree divergence can slip a
+different diff past the gate). The apply-gate ring re-check (v2-C1 step 2) then runs on those same
+verified bytes: the diff that was gated at propose == the diff that is ring-checked at apply == the
+diff that is applied. RED test RT-7 (§8) asserts the mismatch is rejected.
+
+### v2-C4 — [P1 / W4] Scorecard inputs are supervisor-observed only (no worker-emitted value)
+
+§3.2 is tightened: EVERY scorecard sample field derives from a supervisor-observed fact, NEVER from
+worker-emitted metadata. `model`/`worker`/`cost_usd`/`wall_ms` come from `job_store` columns the
+supervisor writes; `task_type` from `trust_ledger.derive_task_type(job_row)` (a plain keyword map,
+`trust_ledger.py:244`), never worker free-text; `outcome` from the gauntlet/merge result; and
+`findings_count` from the review artifact the *reviewer* (not the authoring worker) produced —
+parsed by the supervisor, never a worker-supplied count. RED test SC-6 (§8) asserts a worker cannot
+move its own sample by emitting a `test_result`/`findings` string.
+
+### v2-C5 — [P2s] Cheap inline closures
+
+- **[P2 / V6] guard-adjacent skill edits flagged on the owner card.** The retro/skill held-action
+  card summary flags when a proposed diff touches a *guard-adjacent* skill/prompt (one that redefines
+  a heuristic workers read — e.g. an injection-scan or footprint rule), so the owner tap gets extra
+  scrutiny. Non-ring, so not blockable by the gate; the flag is the mitigation. (§4.2, §4.3.)
+- **[P2 / W1,W3,W6] watchdog enforcement is build-contingent** — verify at build that drift transitions
+  `PAUSED_DRIFT` (not a log line), the watchdog-supervisor throttles on unconfirmed (fail-safe), and
+  cold-start falls back deterministically. Already asserted by WD-1/WD-5/SC-3; noted for the verifier.
+
+**v2 net effect on the crown:** V1 (apply-path bypass) → closed by the apply-gate executor. V3
+(gate-source edit) → closed by adding `retro_ring_gate.py` to both ring lists. V4 (TOCTOU) → closed by
+the hash-pin. With the second wall, V1+V3+V4 all collapse to "rejected at apply." The propose-gate and
+the apply-gate are two independent fail-closed walls over the same hash-pinned bytes.
+
+---
+
 ## 1. What already exists (REUSE — verified interfaces)
 
 Every interface below was read from source on branch `factory`. Line numbers are real.
@@ -42,7 +151,7 @@ Every interface below was read from source on branch `factory`. Line numbers are
 | `~/.claude/scripts/synthesize-lessons.py` + `~/.claude/skills/retro/SKILL.md` | Retro discipline to reuse: distill raw run history → curated high-signal entries; NEVER cite raw journal; owner-in-the-loop | verified present |
 | code-review-graph MCP (`cross_repo_search_tool`, `semantic_search_nodes_tool`) | Cross-repo pattern transfer for the pattern bank (5.2) | plugin present this session |
 
-**Two facts that shape the whole design:**
+**Facts that shape the whole design:**
 
 1. **The ring already lists `trust-policy.md` and `never-graduates.md`** (`immutable_ring.py:49-59`).
    So the retro's ring gate is not new policy — it is *routing retro output through an existing
@@ -56,6 +165,17 @@ Every interface below was read from source on branch `factory`. Line numbers are
    (`model_router.py:50-63`) and the fact that task_type is "currently informational"
    (`:190-192`). The scorecard makes that ordering + task_type routing a **view over data**,
    without touching the residency wall (which stays the crown P4 guard).
+
+3. **The retro gate protects its own source (v2-C2).** Two additive one-line ring edits (sanctioned
+   maintainer edits to the ring source) are part of P5-b, made in the SAME change to keep the
+   superset invariant green:
+   - add `"factory/retro_ring_gate.py"` to `RING_PATHS` (`factory/immutable_ring.py:45-59`, next to
+     the existing `factory/immutable_ring.py` self-protection entry at `:55`);
+   - add the identical `"factory/retro_ring_gate.py"` to `BROKER_RING_PATHS`
+     (`broker/merge_gate.py:41`), because AT-RING-2 (`broker/merge_gate.py:14`) asserts
+     `BROKER_RING_PATHS ⊇ factory.RING_PATHS` — adding to the factory list alone would break that
+     parity test. Any future new retro-gate module is added to both lists the same way. A parity RED
+     test (RT-8) asserts `retro_ring_gate.py` is a ring member on both sides.
 
 ---
 
@@ -127,6 +247,13 @@ CREATE TABLE IF NOT EXISTS scorecard_samples (
 CREATE INDEX IF NOT EXISTS idx_sc_model_type ON scorecard_samples(model, task_type, sample_ts);
 ```
 
+> **Supervisor-observed inputs only (v2-C4, closes W4 scorecard-poison).** EVERY column above derives
+> from a supervisor-observed fact, NEVER worker-emitted metadata: `model`/`worker`/`cost_usd`/`wall_ms`
+> from `job_store` columns the supervisor writes; `task_type` from `trust_ledger.derive_task_type`
+> (plain keyword map, `trust_ledger.py:244`), not worker free-text; `outcome` from the gauntlet/merge
+> result; `findings_count` parsed by the supervisor from the REVIEWER's artifact (not the authoring
+> worker's). A worker cannot move its own sample. RED test SC-6 asserts this.
+
 The **scorecard proper** is a derived view (a query, not a table) — a leaderboard rollup:
 `GROUP BY model, task_type` → `n, merged_clean_rate, mean_findings, mean_cost_usd, mean_wall_ms`.
 `scorecard.py` exposes:
@@ -194,16 +321,32 @@ nightly retro tick (scheduler-fired, plain code drives an AI worker for the DIFF
              Output is text, written to a scratch worktree — NOT applied.
   3. RING GATE (retro_ring_gate.check_retro_diff) — THE WALL. §4.2 below. FAIL-CLOSED.
   4. HOLD     surviving diff → broker_client.enqueue_action(type='retro_diff',
-             summary=..., payload={diff, rationale, target_files}) → disposition 'held'.
-             Owner taps Approve on Telegram → broker applies the diff via a
-             human-reviewed apply path. Reject → discarded, logged.
-  5. NEVER    there is no code path from PROPOSE to disk that skips steps 3+4.
+             summary=..., payload={diff, diff_sha256, rationale, target_files}) →
+             disposition 'held'. diff_sha256 = sha256(diff bytes) pins the gated
+             artifact (v2-C3). Reject → discarded, logged.
+  5. APPLY    Owner taps Approve on Telegram → the broker's retro_diff EXECUTOR
+             (broker/executors/retro_diff_executor.py, wired by type in the
+             executors registry) runs under _rpc_approve and, BEFORE git-apply:
+             (a) recomputes sha256 over the payload bytes, rejects on mismatch;
+             (b) RE-CHECKS the ring via broker.merge_gate.check_ring over those
+             EXACT bytes, fail-closed; (c) only then applies. This is the SECOND
+             WALL (v2-C1) — the propose-gate is not the sole wall. Reject/mismatch/
+             RingViolation ⇒ apply NOTHING.
+  6. NEVER    there is no code path from PROPOSE to disk that skips steps 3+4, and
+             no code path from HOLD to disk that skips step 5's re-check.
 ```
+
+> **Two walls (v2).** Step 3 is the propose-gate (factory `check_retro_diff`, before the owner sees
+> the diff). Step 5(b) is the apply-gate (broker `check_ring` in the executor, after the owner tap,
+> before `git apply`). Both fail-closed, over the same hash-pinned bytes. See "Revision v2 → v2-C1".
 
 ### 4.2 The ring gate on retro output (the crown self-modification guard)
 `retro_ring_gate.check_retro_diff(diff, *, worktree_root)` is a **thin, fail-closed wrapper that
 calls `immutable_ring.check_diff` verbatim** (`immutable_ring.py:184`) and, on `RingViolation`,
-*refuses to enqueue the held action at all* — the owner never sees a ring-touching proposal.
+*refuses to enqueue the held action at all* — the owner never sees a ring-touching proposal. This is
+**wall 1 of 2** (propose-gate); wall 2 is the broker `retro_diff` executor's apply-time re-check
+(v2-C1). `retro_ring_gate.py` is ITSELF a ring path (v2-C2, §1 note 3) so a retro cannot edit the
+gate wrapper.
 
 Why reuse `check_diff` rather than re-implement: it already canonicalizes paths (realpath, rename
 old+new, symlink target, `..` traversal) and fails closed on an un-parseable entry
@@ -222,11 +365,13 @@ symlink onto `trust-policy.md` trips the identical hardened checks the worker pa
   scratch worktree — belt (can't even write a ring file) *and* the check_diff wall — the same
   two-layer defense P2 uses.
 
-> **The bypass test that must exist (crown):** a retro proposal whose diff edits
-> `factory/cost_stops.py` (or `broker/`, `trust-policy.md`, `never-graduates.md`) is REJECTED by
-> `check_retro_diff` and produces zero held actions — even when the AI rationale claims the edit
-> "improves" the cost stop. Removing the `check_diff` call makes this test leak (RED). This is
-> `RT-3` in §8.
+> **The bypass tests that must exist (crown, v2 — BOTH doors):** (a) a retro proposal whose diff
+> edits `factory/cost_stops.py` (or `broker/`, `trust-policy.md`, `never-graduates.md`) is REJECTED
+> by `check_retro_diff` at PROPOSE and produces zero held actions; AND (b) a `retro_diff` held action
+> whose bytes touch a ring path, fed straight to the `retro_diff` EXECUTOR with a valid hash
+> (simulating a bypassed/buggy propose-gate), is REJECTED at APPLY and applies nothing. Removing the
+> propose gate's `check_diff` call leaks (a); removing the executor's `check_ring` call leaks (b).
+> This is `RT-3` (parametrized {propose, apply}) in §8.
 
 **Trust-graduation proposals ride this same path.** A retro proposing to graduate a
 (repo × task_type) does so as a held action referencing `trust_policy.compute_tier` inputs — it
@@ -239,9 +384,12 @@ New modules `factory/skill_improve.py` + `factory/pattern_bank.py`.
 
 - **skill_improve.py** — weekly scheduled pass. Reads recent job histories (scorecard + forensics)
   for a recurring failure signature, and produces a **skill-file diff** (add/update a skill). It
-  reuses the retro's ring gate + held-action path (§4.2) — a skill edit is *also* an owner-approved
-  diff, never silent. Discipline borrowed from `~/.claude/scripts/synthesize-lessons.py`: distill
-  high-signal patterns, don't dump raw history.
+  reuses the retro's BOTH walls (§4.2 propose gate + v2-C1 apply-executor re-check) + held-action path
+  — a skill edit is *also* an owner-approved diff, hash-pinned, ring-re-checked at apply, never silent.
+  Discipline borrowed from `~/.claude/scripts/synthesize-lessons.py`: distill high-signal patterns,
+  don't dump raw history. **Guard-adjacent flag (v2-C5):** when the proposed skill/prompt diff touches
+  a skill that redefines a worker-read heuristic (injection-scan/footprint rule), the held-action card
+  summary flags it for extra owner scrutiny — non-ring, so the flag (not the gate) is the mitigation.
 - **pattern_bank.py** — a searchable store (SQLite FTS in the jobs DB, or reuse hermes full-text
   session search) of **distilled merged solutions**: `{task_signature, repo, approach_summary,
   diff_pointer, embedding?}`. `query(task_spec) -> list[PatternHit]` is called **before a new
@@ -251,8 +399,9 @@ New modules `factory/skill_improve.py` + `factory/pattern_bank.py`.
   `merged_clean` outcome (co-transactional with the scorecard sample).
 
 ### REQ-02 done-when
-Retro flow ✔ (§4.1); ring-gate-on-retro-diffs, bypass-tested ✔ (§4.2 + RT-3); pattern bank ✔
-(§4.3); skill-improvement ✔ (§4.3).
+Retro flow ✔ (§4.1); **TWO walls** — propose-gate + apply-executor ring re-check, both fail-closed,
+bypass-tested at BOTH doors ✔ (§4.2 + v2-C1 + RT-3 {propose,apply}); hash-pin closes TOCTOU ✔
+(v2-C3 + RT-7); gate self-protection ✔ (v2-C2 + RT-8); pattern bank ✔ (§4.3); skill-improvement ✔ (§4.3).
 
 ---
 
@@ -374,7 +523,7 @@ file-disjoint so a fan-out is possible; the retro depends on scorecard+forensics
 | Task | Owns (files, all NEW unless noted) | Model | Depends on | Maps to plan |
 |---|---|---|---|---|
 | **P5-a Scorecard + routing view** | `factory/scorecard.py`, `factory/routing_view.py`; additive refactor of `model_router.admissible_ladder` to compose orderings from `routing_view` (surgical, ordering-only) | sonnet | P2 job_store, P4 router (exist) | P5-1 / 5.1 |
-| **P5-b Retro + ring gate (CROWN)** | `factory/retro.py`, `factory/retro_ring_gate.py` | sonnet | P5-a, P5-e, immutable_ring (exists), broker_client (exists) | P5-3 / 5.3 |
+| **P5-b Retro + ring gate (CROWN)** | `factory/retro.py`, `factory/retro_ring_gate.py`, `broker/executors/retro_diff_executor.py` (NEW apply-door wall); **additive ring edits** — `+retro_ring_gate.py` to `factory/immutable_ring.py:RING_PATHS` AND `broker/merge_gate.py:BROKER_RING_PATHS` (one line each, same change, keeps AT-RING-2 superset green); **additive wiring** — one `"retro_diff": build_retro_diff_executor(...)` entry in the `executors={}` dict at `broker/server.py:441-446` (registry dispatches by type; NO server.py dispatch-logic edit) | sonnet | P5-a, P5-e, immutable_ring (exists), broker/merge_gate.check_ring (exists), broker_client (exists) | P5-3 / 5.3 |
 | **P5-c Skill-improve + pattern bank** | `factory/skill_improve.py`, `factory/pattern_bank.py` | opus | P5-a, P5-b (shares ring gate) | P5-2 / 5.2 |
 | **P5-d Watchdogs** | `factory/watchdogs/{drift,regression_sentinel,memory_zone,watchdog_supervisor,worktree_gc}.py`; additive `PAUSED_DRIFT` state in `job_store._ALLOWED_TRANSITIONS`; pass `throttled_fn` into Scheduler (no scheduler edit) | opus | P4 scheduler + forensics (exist) | P5-4 / 5.4 |
 | **P5-e Failure forensics** | `factory/forensics_store.py`; additive to `factory/forensics.py` (new fns only, raw path untouched) | sonnet | P2 job_store (exists) | P5-5 / 5.5 |
@@ -382,6 +531,18 @@ file-disjoint so a fan-out is possible; the retro depends on scorecard+forensics
 **Suggested execution order:** P5-e → P5-a (both feed everyone) → P5-b (crown) → P5-c → P5-d
 (parallelizable with P5-b/c; only shares the additive `job_store` state edit — sequence that one
 edit).
+
+**Broker/maintainer edits inside P5-b (call out for the verifier — these touch the enforcement
+boundary and are sanctioned additive edits, not worker-authored):**
+- `broker/executors/retro_diff_executor.py` — NEW executor (the apply-door wall). A `build_*_executor`
+  factory mirroring `merge_executor.py`; imports `broker.merge_gate.check_ring` (NOT factory) to hold
+  the layering.
+- one line added to `broker/server.py`'s `executors={...}` dict (`:441-446`) — the only `server.py`
+  touch; no dispatch-logic change.
+- one line each added to `RING_PATHS` (`factory/immutable_ring.py`) and `BROKER_RING_PATHS`
+  (`broker/merge_gate.py`) — `retro_ring_gate.py` self-protection (v2-C2), same change to keep AT-RING-2.
+These are additive; they do not weaken any existing check. The retro flow itself (factory side) writes
+NO broker/ring code — it only produces a hash-pinned held action.
 
 ### 7.2 Per-component RED tests (4–6 each; falsifiable; the crown + gate tests bolded)
 
@@ -399,6 +560,10 @@ edit).
   this leak (RED).
 - SC-5: the residency invariant survives the refactor — a `allow_openrouter:false` repo's
   `admissible_ladder` has zero openrouter rungs even after scorecard reordering.
+- SC-6: **scorecard worker-isolation (v2-C4).** A worker-emitted `test_result`/`findings` string
+  cannot move its own sample — `record_sample` derives every field from the supervisor-observed
+  `job_row`/reviewer artifact; a job row carrying a worker-supplied `findings_count` or outcome
+  claim does not alter the recorded sample. Removing the supervisor-only derivation makes this leak.
 
 **P5-b retro + ring gate (RT) — CROWN:**
 - RT-1: the retro emits a proposed diff + rationale and produces a `broker_client.enqueue_action`
@@ -406,22 +571,38 @@ edit).
   writes). **[FRESH-CONTEXT GATE: never applied silently]**
 - RT-2: an approved retro diff (owner tap → broker apply) measurably reduces a seeded recurring
   failure class on the next window (the exit-gate assertion, exercised end-to-end on a fixture).
-- RT-3: **a retro diff touching `factory/cost_stops.py` (and, parametrized, `broker/x.py`,
-  `trust-policy.md`, `docs/factory/never-graduates.md`) is REJECTED by `check_retro_diff` and
-  produces ZERO held actions** — even with a rationale claiming improvement. Deleting the
-  `immutable_ring.check_diff` call makes this leak. **[CROWN FRESH-CONTEXT GATE]**
+- RT-3: **CROWN, TWO-DOOR (v2). Parametrized over {propose-gate, apply-executor} × ring path.** A
+  retro diff touching `factory/cost_stops.py` (and, parametrized, `broker/x.py`, `trust-policy.md`,
+  `docs/factory/never-graduates.md`) is REJECTED at BOTH doors, even with a rationale claiming
+  improvement:
+  - **(a) propose door:** `retro_ring_gate.check_retro_diff` rejects → ZERO held actions. Deleting
+    the factory `immutable_ring.check_diff` call makes (a) leak.
+  - **(b) apply door:** the `retro_diff` EXECUTOR, fed the ring-touching diff with a VALID hash
+    (simulating a bypassed/mutated/buggy propose-gate), rejects via `broker.merge_gate.check_ring`
+    and APPLIES NOTHING (assert zero writes to the target worktree). Deleting the executor's
+    `check_ring` call makes (b) leak. **This is the P0 fix — the apply door must be exercised, not
+    only propose.** **[CROWN FRESH-CONTEXT GATE]**
 - RT-4: ring-gate inherits the hardened evasions — a retro diff that *renames into* `broker/`,
-  or symlinks onto `trust-policy.md`, or uses `../../broker/x`, is rejected (delegates to
-  `check_diff`'s canonicalization).
-- RT-5: an un-parseable / empty proposed diff → rejected, no held action (fail-closed inherited).
-- RT-6: gate runs BEFORE enqueue — assert ordering with a spy (a `RingViolation` means
+  or symlinks onto `trust-policy.md`, or uses `../../broker/x`, is rejected at BOTH doors (propose
+  delegates to `check_diff`'s canonicalization; apply delegates to `check_ring`'s identical port).
+- RT-5: an un-parseable / empty proposed diff → rejected at BOTH doors, no held action, no apply
+  (fail-closed inherited — `check_diff` and `check_ring:164-166` both raise on empty/unparseable).
+- RT-6: propose gate runs BEFORE enqueue — assert ordering with a spy (a `RingViolation` means
   `enqueue_action` was never called).
+- RT-7: **PROPOSE/APPLY hash-pin (v2-C3).** A held `retro_diff` whose applied bytes differ from
+  `payload.diff_sha256` (owner-edit / re-render / stale-worktree simulation) is REJECTED at the
+  executor with `diff_hash_mismatch` and applies nothing. Removing the hash recompute makes this leak.
+- RT-8: **gate self-protection parity (v2-C2).** `factory/retro_ring_gate.py` is a member of BOTH
+  `RING_PATHS` and `BROKER_RING_PATHS`; a retro diff editing `retro_ring_gate.py` is rejected at the
+  propose gate. Removing either list entry makes this leak (and breaks AT-RING-2's superset assert).
 
 **P5-c skill-improve + pattern bank (SK):**
 - SK-1: a weekly run over seeded histories produces a concrete skill-file diff as a held action
   (never silent — shares RT-1's discipline).
-- SK-2: **a skill-improve diff touching a ring path is rejected by the shared ring gate**
-  (the crown wall is not bypassable via the weekly lane either).
+- SK-2: **a skill-improve diff touching a ring path is rejected by the shared ring gate at BOTH
+  doors** (propose gate AND, when the skill lane enqueues via the same `retro_diff`/`skill_diff`
+  held-action type, the apply-executor re-check) — the crown wall is not bypassable via the weekly
+  lane either, at either door.
 - SK-3: `pattern_bank.query(task_spec)` returns a relevant prior `merged_clean` solution for a
   matching new task; no match → empty, no crash.
 - SK-4: pattern bank populates on a `merged_clean` outcome co-transactionally (a rejected job adds
@@ -464,8 +645,9 @@ it needs two weeks of real overnight runs, so it cannot pass at design/build tim
 > approved retro diff reduces a failure class) not the *two-week outcome*.
 
 ### REQ-05 done-when
-File-disjoint P5-a..e task table ✔ (§7.1); 4–6 RED tests/component incl the crown ring-rejection
-test RT-3 ✔ (§7.2); STAGED entry ✔ (§7.3).
+File-disjoint P5-a..e task table ✔ (§7.1); RED tests/component incl the crown TWO-DOOR ring-rejection
+test RT-3 {propose, apply}, the hash-pin RT-7, the gate self-protection RT-8, and scorecard isolation
+SC-6 ✔ (§7.2); STAGED entry ✔ (§7.3).
 
 ---
 
@@ -476,20 +658,34 @@ test RT-3 ✔ (§7.2); STAGED entry ✔ (§7.3).
 - No AI in any control path: scorecard/routing_view/watchdogs/forensics are plain SQLite + git.
   AI appears ONLY inside the retro/skill-improve *proposal* step, and its output is inert text
   until it clears the ring gate and the owner tap.
-- **The crown, one more time:** `retro_ring_gate.check_retro_diff` calls the *identical*
-  `immutable_ring.check_diff` the workers pass. `trust-policy.md`, `never-graduates.md`, `broker/`,
-  `broker_client.py`, `cost_stops.py` are already RING_PATHS (`immutable_ring.py:45-59`), so a
-  retro cannot even *propose* weakening them — the diff is rejected by plain code before the owner
-  sees it. Self-modification is contained to skills, prompts, and non-ring policy, all
-  owner-approved, none silent.
+- **The crown, one more time — now TWO walls (v2):** the retro's self-modification is walled twice,
+  both fail-closed, over the same hash-pinned bytes.
+  - **Wall 1 (propose):** `retro_ring_gate.check_retro_diff` calls the *identical*
+    `immutable_ring.check_diff` the workers pass. `trust-policy.md`, `never-graduates.md`, `broker/`,
+    `broker_client.py`, `cost_stops.py`, and now `retro_ring_gate.py` itself (v2-C2) are RING_PATHS
+    (`immutable_ring.py:45-59`), so a retro cannot even *propose* weakening them — the diff is
+    rejected by plain code before the owner sees it.
+  - **Wall 2 (apply):** the broker `retro_diff` executor re-checks `broker.merge_gate.check_ring`
+    (the broker's own `BROKER_RING_PATHS` superset) over the exact hash-verified bytes, AFTER the
+    owner tap, BEFORE `git apply`. The v1 gap — the owner-approved apply path had no ring re-check
+    because `_rpc_approve` never re-gates (`broker/server.py:308`, unlike `_rpc_auto_merge` at
+    `:328`) — is closed: even a bypassed or mutated propose-gate cannot land a ring-touching diff.
+  Self-modification is contained to skills, prompts, and non-ring policy, all owner-approved, all
+  hash-pinned, all ring-re-checked at apply, none silent.
 
 ## 9. Escalations / open items (UNVERIFIED — flag to verifier)
 - The additive `PAUSED_DRIFT` job_store state (§5.1) is the one shared edit across P5-d;
   alternatively reuse `NEEDS_ATTENTION`. Chose a new state for morning-card distinguishability —
   a maintainer may prefer reuse. **Owner/verifier call.**
-- `cost_stops.py` and `broker/` as ring members were inferred from `RING_PATHS` +
-  `never-graduates.md`; `broker/` dir contents were not opened this session (broker_client.py is at
-  repo root). The ring gate reuse is correct regardless (check_diff owns the list). **UNVERIFIED:
-  broker/ dir layout.**
+- **RESOLVED in v2 (was UNVERIFIED):** `broker/` dir layout is now confirmed (opened this session).
+  `broker/executors/` is a package with a `build_*_executor` factory per type + an `ExecutorRegistry`
+  that dispatches by action-type string (`broker/executors/__init__.py`); `merge_gate.check_ring` +
+  `BROKER_RING_PATHS` live in `broker/merge_gate.py:41,152`; `_rpc_approve` (`server.py:308`) does NOT
+  re-gate, only `_rpc_auto_merge` (`:328`) does — confirming the P0. The `retro_diff` executor hosts
+  cleanly (v2-C1); no maintainer seam beyond the additive factory + one dict entry + two ring lines.
 - The pattern bank's cross-repo transfer depends on a built code-review-graph graph per repo;
   cold repos degrade to same-repo-only. Acceptable; noted for P5-c.
+- **v2 verifier focus:** confirm at build that (1) the `retro_diff` executor's `check_ring` runs
+  BEFORE any `git apply` (order is the contract), (2) the hash recompute rejects on mismatch, (3)
+  `retro_ring_gate.py` lands in BOTH ring lists and AT-RING-2 stays green, and (4) RT-3's apply-door
+  arm genuinely leaks when the executor's `check_ring` is deleted (not just the propose arm).
