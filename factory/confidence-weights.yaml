@@ -1,0 +1,24 @@
+# ABOUTME: Owner-tunable confidence weights for P4-f (compute_confidence).
+# ABOUTME: Change a value here; the score changes predictably on the next run.
+# ABOUTME: All five weights MUST sum to 1.0 — the loader validates this and
+# ABOUTME: raises ValueError if the constraint is violated.
+# ABOUTME: Source of truth: docs/plans/harness/fable/p4/P4-design.md §7 OQ-P4-1.
+
+# Per-job confidence formula (design §7):
+#   conf = w_test·test + w_review·(1−severity) + w_blast·(1−blast)
+#         + w_amb·(1−amb) + w_hist·hist
+#
+# Interpretation:
+#   w_test   — weight on the test-pass signal (pass=1, flaky=0.5, fail=0)
+#   w_review — weight on the inverse-severity signal (clean review = 1.0)
+#   w_blast  — weight on the inverse blast-radius (small change = 1.0)
+#   w_amb    — weight on the inverse ambiguity score (crisp spec = 1.0)
+#   w_hist   — weight on the historical success rate (neutral=0.5, no scorecard)
+#
+# Sum check: 0.35 + 0.25 + 0.15 + 0.10 + 0.15 = 1.00
+
+w_test:   0.35
+w_review: 0.25
+w_blast:  0.15
+w_amb:    0.10
+w_hist:   0.15
