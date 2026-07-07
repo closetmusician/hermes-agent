@@ -3,6 +3,9 @@
 # ABOUTME: signal so morning debugging is 30s) and capture_post_mortem (CRASH / dead
 # ABOUTME: pgid — best-effort snapshot of what survives, never raises). Each bundle
 # ABOUTME: is {transcript-tail, failing-test, phase.diff, meta.json}. Pure I/O, no AI.
+# ABOUTME: P5-e additive hook: record_structured links a completed raw bundle to the
+# ABOUTME: forensics_store structured record (forensics_store.py) without altering the
+# ABOUTME: existing capture paths (no-raise contract preserved on both paths).
 """
 Forensic capture for supervised kills and crashes (P4-a).
 
@@ -145,3 +148,40 @@ def capture_post_mortem(
     except OSError:
         pass
     return bundle
+
+
+# ---------------------------------------------------------------------------
+# P5-e additive hook — structured forensics record linked to the raw bundle.
+# The existing capture_pre_kill / capture_post_mortem paths are UNCHANGED; this
+# is a standalone helper the SUPERVISOR calls after capture returns the bundle.
+# ---------------------------------------------------------------------------
+
+
+def record_structured(
+    conn,
+    job_row: dict,
+    bundle_path: Path,
+) -> None:
+    """
+    Purpose: write a structured ForensicRecord into failure_forensics (P5-e),
+    linking the bundle_path produced by capture_pre_kill / capture_post_mortem.
+    Additive post-capture hook — call after capture returns, before or inside
+    the supervisor's commit for the terminal transition.
+    Usage: bundle = capture_pre_kill(...); record_structured(conn, job_row, bundle).
+    Gotchas: import is deferred to the call site to avoid a circular import
+    (forensics_store imports nothing from forensics; forensics importing store at
+    module level would create a dependency cycle if store ever imports forensics).
+    This path MUST NOT raise — it wraps the classify+record in a bare except and
+    swallows failures so a store error never corrupts the post-mortem capture path.
+    """
+    try:
+        # Deferred import avoids circular dependency:
+        # forensics → forensics_store → (nothing from forensics)
+        from factory.forensics_store import classify, record_failure  # noqa: PLC0415
+
+        rec = classify(job_row, bundle_path=bundle_path)
+        record_failure(conn, rec)
+    except Exception:
+        # Never raise from a forensic path — a broken structured store must not
+        # prevent the raw bundle from being available for debugging.
+        pass
